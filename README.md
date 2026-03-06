@@ -17,7 +17,7 @@ A Chrome extension (MV3) that performs real-time, AST-based taint analysis on we
    - Array method callbacks (`forEach`, `map`, `reduce`, etc.)
    - Sanitizer recognition (DOMPurify, encodeURIComponent, etc.)
 
-5. **Reporting** — Findings appear as badge counts and browser notifications, with full details in the extension popup including source/sink locations and taint flow paths.
+5. **Reporting** — Findings appear as badge counts and browser notifications, with full details in the side panel including source/sink locations, taint flow paths, and remediation advice. Findings persist in IndexedDB across browser restarts.
 
 ## Project Structure
 
@@ -25,11 +25,11 @@ A Chrome extension (MV3) that performs real-time, AST-based taint analysis on we
 src/
   manifest.json          # Chrome MV3 manifest
   background.js          # Service worker — CDP attach, script collection, notifications
-  popup/                 # Extension popup UI (findings viewer, toggle)
+  popup/                 # Side panel UI (findings viewer, toggle, export)
     popup.html
     popup.js
     popup.css
-  offscreen/             # Offscreen document (hosts the web worker)
+  offscreen/             # Offscreen document (hosts the web worker, persists findings to IndexedDB)
     offscreen.html
     offscreen.js
   worker/                # Taint analysis engine (runs in web worker)
@@ -39,10 +39,10 @@ src/
     sources-sinks.js     # Source/sink/sanitizer definitions
     module-graph.js      # Cross-file analysis, import/export resolution
     scope.js             # Scope analysis for variable resolution
-    cache.js             # IndexedDB caching for findings
+    cache.js             # Finding dedup key utilities
   icons/
 test/
-  test.mjs               # Test suite (251 tests)
+  test.mjs               # Test suite (292 tests)
   harness.mjs            # Test harness wrapping the analysis engine
   libs/                  # Minified production libraries for false-positive baseline
 ```
