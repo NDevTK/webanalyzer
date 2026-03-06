@@ -43577,7 +43577,9 @@ ${rootStack}`;
     "document.location.href": { type: "XSS", argIndex: "rhs", navigation: true },
     "document.location": { type: "XSS", argIndex: "rhs", navigation: true },
     "window.location": { type: "XSS", argIndex: "rhs", navigation: true },
-    "location": { type: "XSS", argIndex: "rhs", navigation: true }
+    "location": { type: "XSS", argIndex: "rhs", navigation: true },
+    // Domain manipulation
+    "document.domain": { type: "XSS", argIndex: "rhs" }
   };
   var CALL_SINKS = {
     "eval": { type: "XSS", taintedArgs: [0] },
@@ -43589,6 +43591,7 @@ ${rootStack}`;
     "document.writeln": { type: "XSS", taintedArgs: [0] },
     "Element.prototype.insertAdjacentHTML": { type: "XSS", taintedArgs: [1] },
     "DOMParser.prototype.parseFromString": { type: "XSS", taintedArgs: [0] },
+    "Range.prototype.createContextualFragment": { type: "XSS", taintedArgs: [0] },
     // jQuery
     "$.html": { type: "XSS", taintedArgs: [0] },
     "jQuery.html": { type: "XSS", taintedArgs: [0] },
@@ -44369,6 +44372,17 @@ ${rootStack}`;
         ctx.funcMap.set(node.left.name, refFunc);
       }
     }
+    if (node.operator === "=" && node.right.type === "Identifier" && (node.left.type === "MemberExpression" || node.left.type === "OptionalMemberExpression") && !node.left.computed) {
+      const refFunc = ctx.funcMap.get(node.right.name) || ctx.funcMap.get(resolveId(node.right, ctx));
+      if (refFunc) {
+        const leftStr = nodeToString(node.left);
+        if (leftStr) {
+          ctx.funcMap.set(leftStr, refFunc);
+          const propName = node.left.property?.name;
+          if (propName && !ctx.funcMap.has(propName)) ctx.funcMap.set(propName, refFunc);
+        }
+      }
+    }
     if (node.operator === "=" && node.right.type === "Identifier" && node.left.type === "MemberExpression" && node.left.computed) {
       const refFunc = ctx.funcMap.get(node.right.name) || ctx.funcMap.get(resolveId(node.right, ctx));
       if (refFunc) {
@@ -44704,18 +44718,16 @@ ${rootStack}`;
     const objTaint = evaluateExpr(node.object, env, ctx);
     if (node.computed) {
       const keyTaint = evaluateExpr(node.property, env, ctx);
-      if (keyTaint.tainted) return keyTaint.clone();
-      if (!objTaint.tainted) {
-        const objStr = nodeToString(node.object);
-        if (objStr) {
-          const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
-          if (taintedProps.size > 0) {
-            const merged = TaintSet.empty();
-            for (const [, taint] of taintedProps) merged.merge(taint);
-            return merged;
-          }
+      const objStr = nodeToString(node.object);
+      if (objStr) {
+        const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
+        if (taintedProps.size > 0) {
+          const merged = TaintSet.empty();
+          for (const [, taint] of taintedProps) merged.merge(taint);
+          return merged;
         }
       }
+      if (objTaint.tainted) return objTaint.clone();
     }
     return objTaint;
   }
@@ -44859,6 +44871,17 @@ ${rootStack}`;
       }
       return TaintSet.empty();
     }
+    if (calleeStr === "Reflect.apply" && node.arguments.length >= 3) {
+      const fnNode = node.arguments[0];
+      const argsArrayTaint = argTaints[2] || TaintSet.empty();
+      const funcName = nodeToString(fnNode);
+      const funcRef = fnNode.type === "Identifier" ? ctx.funcMap.get(resolveId(fnNode, ctx)) || ctx.funcMap.get(fnNode.name) : funcName && ctx.funcMap.get(funcName);
+      if (funcRef && funcRef.body) {
+        const synthCall = { ...node, callee: fnNode, arguments: node.arguments.slice(2) };
+        return analyzeCalledFunction(synthCall, funcName, [argsArrayTaint], env, ctx);
+      }
+      return argsArrayTaint.clone();
+    }
     if (calleeStr === "Object.freeze" || calleeStr === "Object.seal" || calleeStr === "Object.preventExtensions") {
       return argTaints[0]?.clone() || TaintSet.empty();
     }
@@ -44983,6 +45006,9 @@ ${rootStack}`;
           if (funcRef) {
             const thisArgNode = node.arguments?.[0];
             if (thisArgNode) funcRef._boundThisArg = nodeToString(thisArgNode);
+            if (node.arguments && node.arguments.length > 1) {
+              funcRef._boundArgs = node.arguments.slice(1);
+            }
             ctx.returnedFuncNode = funcRef;
           }
         }
@@ -45668,6 +45694,13 @@ ${rootStack}`;
       }
       funcNode._boundThisNode = null;
     }
+    if (funcNode._boundArgs) {
+      const boundArgNodes = funcNode._boundArgs;
+      const boundArgTaints = boundArgNodes.map((a) => evaluateExpr(a, env, ctx));
+      argTaints = [...boundArgTaints, ...argTaints];
+      callNode = { ...callNode, arguments: [...boundArgNodes, ...callNode.arguments || []] };
+      funcNode._boundArgs = null;
+    }
     const innerFuncMap = new Map(ctx.funcMap);
     for (let i = 0; i < funcNode.params.length; i++) {
       const param = funcNode.params[i];
@@ -45782,7 +45815,7 @@ ${rootStack}`;
     if (!rhsTaint.tainted) return;
     if (leftNode.type !== "MemberExpression" && leftNode.type !== "OptionalMemberExpression") return;
     const propName = leftNode.property?.name;
-    if (propName !== "src") return;
+    if (propName !== "src" && propName !== "textContent" && propName !== "text") return;
     const objName = nodeToString(leftNode.object);
     if (!objName) return;
     const objKey = leftNode.object.type === "Identifier" ? resolveId(leftNode.object, ctx) : objName;
@@ -45791,10 +45824,10 @@ ${rootStack}`;
     ctx.findings.push({
       type: "Script Injection",
       severity: "critical",
-      title: "Script Injection: tainted data flows to script element src",
-      sink: { expression: `${objName}.src`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
+      title: `Script Injection: tainted data flows to script element ${propName}`,
+      sink: { expression: `${objName}.${propName}`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
       source: rhsTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
-      path: buildTaintPath(rhsTaint, `${objName}.src`)
+      path: buildTaintPath(rhsTaint, `${objName}.${propName}`)
     });
   }
   function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {

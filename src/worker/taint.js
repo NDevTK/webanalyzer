@@ -863,6 +863,21 @@ function processAssignment(node, env, ctx) {
     }
   }
 
+  // MemberExpression assignment of function ref: window.getConfig = createConfig, obj.handler = existingFunc
+  if (node.operator === '=' && node.right.type === 'Identifier' &&
+      (node.left.type === 'MemberExpression' || node.left.type === 'OptionalMemberExpression') && !node.left.computed) {
+    const refFunc = ctx.funcMap.get(node.right.name) || ctx.funcMap.get(resolveId(node.right, ctx));
+    if (refFunc) {
+      const leftStr = nodeToString(node.left);
+      if (leftStr) {
+        ctx.funcMap.set(leftStr, refFunc);
+        // Also register by property name for cross-file method resolution
+        const propName = node.left.property?.name;
+        if (propName && !ctx.funcMap.has(propName)) ctx.funcMap.set(propName, refFunc);
+      }
+    }
+  }
+
   // Computed member assignment of function ref: obj[key] = existingFunc
   if (node.operator === '=' && node.right.type === 'Identifier' &&
       node.left.type === 'MemberExpression' && node.left.computed) {
@@ -1286,20 +1301,21 @@ function evaluateMemberExpr(node, env, ctx) {
   const objTaint = evaluateExpr(node.object, env, ctx);
   if (node.computed) {
     const keyTaint = evaluateExpr(node.property, env, ctx);
-    // If the key is tainted, the attacker controls which property is read — propagate key taint
-    if (keyTaint.tainted) return keyTaint.clone();
     // For computed access obj[key], check if any obj.* properties are tainted
-    if (!objTaint.tainted) {
-      const objStr = nodeToString(node.object);
-      if (objStr) {
-        const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
-        if (taintedProps.size > 0) {
-          const merged = TaintSet.empty();
-          for (const [, taint] of taintedProps) merged.merge(taint);
-          return merged;
-        }
+    // When the key is tainted, the attacker controls which property is selected,
+    // but the VALUE read carries its own taint — don't propagate key taint as value taint.
+    const objStr = nodeToString(node.object);
+    if (objStr) {
+      const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
+      if (taintedProps.size > 0) {
+        const merged = TaintSet.empty();
+        for (const [, taint] of taintedProps) merged.merge(taint);
+        return merged;
       }
     }
+    // If the object itself is tainted (e.g. from JSON.parse), reading any property is tainted
+    if (objTaint.tainted) return objTaint.clone();
+    // If key is tainted but object has no tainted values, the read value is safe
   }
   return objTaint;
 }
@@ -1437,6 +1453,21 @@ function evaluateCallExpr(node, env, ctx) {
       }
     }
     return TaintSet.empty();
+  }
+
+  // Reflect.apply(fn, thisArg, argsArray) — interprocedural call
+  if (calleeStr === 'Reflect.apply' && node.arguments.length >= 3) {
+    const fnNode = node.arguments[0];
+    const argsArrayTaint = argTaints[2] || TaintSet.empty();
+    const funcName = nodeToString(fnNode);
+    const funcRef = fnNode.type === 'Identifier'
+      ? (ctx.funcMap.get(resolveId(fnNode, ctx)) || ctx.funcMap.get(fnNode.name))
+      : (funcName && ctx.funcMap.get(funcName));
+    if (funcRef && funcRef.body) {
+      const synthCall = { ...node, callee: fnNode, arguments: node.arguments.slice(2) };
+      return analyzeCalledFunction(synthCall, funcName, [argsArrayTaint], env, ctx);
+    }
+    return argsArrayTaint.clone();
   }
 
   // Object.freeze/seal/preventExtensions — return the same object, propagate taint
@@ -1582,7 +1613,7 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       return objTaint.clone();
 
     case 'bind': {
-      // fn.bind(thisArg) returns a bound function — register it in funcMap
+      // fn.bind(thisArg, ...prefilled) returns a bound function — register it in funcMap
       // so when the result is called, it resolves to the original function
       const callee = node.callee?.object;
       if (callee) {
@@ -1593,6 +1624,10 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
           // Store the thisArg node so analyzeCalledFunction can bind this.* properties
           const thisArgNode = node.arguments?.[0];
           if (thisArgNode) funcRef._boundThisArg = nodeToString(thisArgNode);
+          // Store pre-filled argument nodes for partial application: fn.bind(null, arg1, arg2)
+          if (node.arguments && node.arguments.length > 1) {
+            funcRef._boundArgs = node.arguments.slice(1);
+          }
           ctx.returnedFuncNode = funcRef;
         }
       }
@@ -2441,6 +2476,16 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     funcNode._boundThisNode = null; // consume
   }
 
+  // Handle pre-filled arguments from fn.bind(thisArg, arg1, arg2)
+  if (funcNode._boundArgs) {
+    const boundArgNodes = funcNode._boundArgs;
+    const boundArgTaints = boundArgNodes.map(a => evaluateExpr(a, env, ctx));
+    // Prepend bound args to call args
+    argTaints = [...boundArgTaints, ...argTaints];
+    callNode = { ...callNode, arguments: [...boundArgNodes, ...(callNode.arguments || [])] };
+    funcNode._boundArgs = null; // consume
+  }
+
   // Store function expression arguments in funcMap so they can be called inside the body
   // Handles: doRender(function(html) { ... }) → fn(x) resolves fn to the passed function
   const innerFuncMap = new Map(ctx.funcMap);
@@ -2601,7 +2646,7 @@ function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
   if (!rhsTaint.tainted) return;
   if (leftNode.type !== 'MemberExpression' && leftNode.type !== 'OptionalMemberExpression') return;
   const propName = leftNode.property?.name;
-  if (propName !== 'src') return;
+  if (propName !== 'src' && propName !== 'textContent' && propName !== 'text') return;
   const objName = nodeToString(leftNode.object);
   if (!objName) return;
   // Check if the object is a known script element
@@ -2611,10 +2656,10 @@ function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
   ctx.findings.push({
     type: 'Script Injection',
     severity: 'critical',
-    title: 'Script Injection: tainted data flows to script element src',
-    sink: { expression: `${objName}.src`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
+    title: `Script Injection: tainted data flows to script element ${propName}`,
+    sink: { expression: `${objName}.${propName}`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
     source: rhsTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
-    path: buildTaintPath(rhsTaint, `${objName}.src`),
+    path: buildTaintPath(rhsTaint, `${objName}.${propName}`),
   });
 }
 

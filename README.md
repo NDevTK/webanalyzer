@@ -44,7 +44,7 @@ src/
     cache.js             # Finding dedup key utilities
   icons/
 test/
-  test.mjs               # Test suite (645 tests)
+  test.mjs               # Test suite
   harness.mjs            # Test harness wrapping the analysis engine
   libs/                  # Minified production libraries for false-positive baseline
 ```

@@ -90,6 +90,8 @@ export const ASSIGNMENT_SINKS = {
   'document.location': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'window.location': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'location': { type: 'XSS', argIndex: 'rhs', navigation: true },
+  // Domain manipulation
+  'document.domain': { type: 'XSS', argIndex: 'rhs' },
 };
 
 // Call sinks: function(taintedArg)
@@ -103,6 +105,7 @@ export const CALL_SINKS = {
   'document.writeln': { type: 'XSS', taintedArgs: [0] },
   'Element.prototype.insertAdjacentHTML': { type: 'XSS', taintedArgs: [1] },
   'DOMParser.prototype.parseFromString': { type: 'XSS', taintedArgs: [0] },
+  'Range.prototype.createContextualFragment': { type: 'XSS', taintedArgs: [0] },
   // jQuery
   '$.html': { type: 'XSS', taintedArgs: [0] },
   'jQuery.html': { type: 'XSS', taintedArgs: [0] },
