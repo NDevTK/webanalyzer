@@ -173,6 +173,8 @@ class AnalysisContext {
     this.returnedFuncNode = null;  // tracks function nodes returned from calls
     this.returnedMethods = null;   // tracks { name → funcNode } for returned objects
     this.scriptElements = new Set(); // tracks variables holding createElement('script') results
+    this.thrownTaint = TaintSet.empty(); // tracks taint from ThrowStatement for catch param
+    this.generatorTaint = new Map(); // maps generator function key → TaintSet from yield expressions
   }
 }
 
@@ -523,6 +525,19 @@ function processNode(node, env, ctx) {
       break;
 
     case '_CatchParam':
+      // Assign taint from ThrowStatement to the catch parameter
+      if (node.param && ctx.thrownTaint.tainted) {
+        assignToPattern(node.param, ctx.thrownTaint.clone(), env, ctx);
+      }
+      break;
+
+    case 'ThrowStatement':
+      if (node.argument) {
+        const throwTaint = evaluateExpr(node.argument, env, ctx);
+        if (throwTaint.tainted) {
+          ctx.thrownTaint.merge(throwTaint);
+        }
+      }
       break;
 
     case 'ExportNamedDeclaration':
@@ -934,8 +949,12 @@ export function evaluateExpr(node, env, ctx) {
     case 'AwaitExpression':
       return evaluateExpr(node.argument, env, ctx);
 
-    case 'YieldExpression':
-      return node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
+    case 'YieldExpression': {
+      const yieldTaint = node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
+      // Track yield taint so generator callers can propagate it through .next().value
+      if (yieldTaint.tainted) ctx.returnTaint.merge(yieldTaint);
+      return yieldTaint;
+    }
 
     case 'ChainExpression':
     case 'ParenthesizedExpression':
@@ -1201,14 +1220,28 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       return TaintSet.empty();
 
     case 'set': {
-      // Map.set(key, value) / WeakMap.set(key, value) — taint the Map if value is tainted
+      // Map.set(key, value) — store taint per-key for precise tracking
       const valueTaint = argTaints[1] || TaintSet.empty();
-      if (valueTaint.tainted && node.callee?.object) {
+      if (node.callee?.object) {
         const objStr = nodeToString(node.callee.object);
-        if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
-        if (node.callee.object.type === 'Identifier') {
-          const key = resolveId(node.callee.object, ctx);
-          env.set(key, env.get(key).clone().merge(valueTaint));
+        const mapKey = node.arguments[0];
+        const keyStr = mapKey && (mapKey.type === 'StringLiteral' || mapKey.type === 'Literal')
+          ? (mapKey.value ?? mapKey.raw) : null;
+        if (objStr && keyStr != null) {
+          // Per-key taint: store as "map.#key_<keyStr>"
+          const perKeyPath = `${objStr}.#key_${keyStr}`;
+          env.set(perKeyPath, valueTaint.clone());
+          if (node.callee.object.type === 'Identifier') {
+            const scopedKey = resolveId(node.callee.object, ctx);
+            env.set(`${scopedKey}.#key_${keyStr}`, valueTaint.clone());
+          }
+        } else if (objStr && valueTaint.tainted) {
+          // Dynamic key: fall back to tainting the whole Map
+          env.set(objStr, env.get(objStr).clone().merge(valueTaint));
+          if (node.callee.object.type === 'Identifier') {
+            const key = resolveId(node.callee.object, ctx);
+            env.set(key, env.get(key).clone().merge(valueTaint));
+          }
         }
       }
       return objTaint.clone(); // Map.set returns the Map itself
@@ -1249,12 +1282,59 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     case 'pop': case 'shift':
       return objTaint.clone();
 
+    case 'next':
+      // Generator iterator .next() — propagate taint from the iterator (which holds yield taint)
+      return objTaint.clone();
+
+    case 'call': {
+      // Function.prototype.call(thisArg, ...args) — invoke with shifted args
+      // e.g. Array.prototype.join.call(arr, sep) → join taint from first arg (the array)
+      const thisArgTaint = argTaints[0] || TaintSet.empty();
+      const restArgTaints = argTaints.slice(1);
+      // Determine the method being called (e.g. "join" from "Array.prototype.join.call")
+      const calleeObj = node.callee?.object;
+      const protoMethod = calleeObj ? nodeToString(calleeObj) : null;
+      if (protoMethod) {
+        const parts = protoMethod.split('.');
+        const method = parts[parts.length - 1];
+        // Delegate to handleBuiltinMethod with the resolved method name and thisArg as objTaint
+        const result = handleBuiltinMethod(method, {
+          ...node,
+          callee: { ...node.callee, object: node.arguments?.[0] || node.callee.object },
+        }, restArgTaints, env, ctx);
+        if (result !== null) return thisArgTaint.clone().merge(result);
+      }
+      return thisArgTaint.clone().merge(restArgTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
+    }
+
+    case 'apply': {
+      // Function.prototype.apply(thisArg, argsArray) — similar to call but args in array
+      const thisArgTaint = argTaints[0] || TaintSet.empty();
+      const argsArrayTaint = argTaints[1] || TaintSet.empty();
+      return thisArgTaint.clone().merge(argsArrayTaint);
+    }
+
     case 'get': case 'getAll': {
+      // Check per-key Map taint first
+      const getObjStr = nodeToString(node.callee?.object);
+      const getKeyArg = node.arguments?.[0];
+      const getKeyStr = getKeyArg && (getKeyArg.type === 'StringLiteral' || getKeyArg.type === 'Literal')
+        ? (getKeyArg.value ?? getKeyArg.raw) : null;
+      if (getObjStr && getKeyStr != null) {
+        const perKeyPath = `${getObjStr}.#key_${getKeyStr}`;
+        const perKeyTaint = env.get(perKeyPath);
+        if (perKeyTaint.tainted) return perKeyTaint.clone();
+        // Also check scope-resolved key
+        if (node.callee?.object?.type === 'Identifier') {
+          const scopedKey = resolveId(node.callee.object, ctx);
+          const scopedPerKey = env.get(`${scopedKey}.#key_${getKeyStr}`);
+          if (scopedPerKey.tainted) return scopedPerKey.clone();
+        }
+      }
       if (objTaint.tainted) return objTaint.clone();
-      const objStr = nodeToString(node.callee?.object);
-      if (objStr === 'localStorage' || objStr === 'sessionStorage') {
+      if (getObjStr === 'localStorage' || getObjStr === 'sessionStorage') {
         const loc = node.loc?.start || {};
-        return TaintSet.from(new TaintLabel(`storage.${objStr === 'localStorage' ? 'local' : 'session'}`, ctx.file, loc.line || 0, loc.column || 0, `${objStr}.getItem()`));
+        return TaintSet.from(new TaintLabel(`storage.${getObjStr === 'localStorage' ? 'local' : 'session'}`, ctx.file, loc.line || 0, loc.column || 0, `${getObjStr}.getItem()`));
       }
       return TaintSet.empty();
     }
@@ -1318,6 +1398,19 @@ function analyzeEventListener(node, argTaints, env, ctx) {
 
   const eventName = eventType.value;
   const childEnv = env.child();
+
+  // Handle hashchange and other EVENT_SOURCES events
+  if (eventName && eventName !== 'message' && EVENT_SOURCES[eventName] && callback.params[0]) {
+    const paramName = callback.params[0].type === 'Identifier' ? callback.params[0].name : null;
+    if (paramName) {
+      const evtSource = EVENT_SOURCES[eventName];
+      const loc = callback.loc?.start || {};
+      const label = new TaintLabel(evtSource.label, ctx.file, loc.line || 0, loc.column || 0, `${paramName}.${evtSource.property}`);
+      childEnv.set(`${paramName}.${evtSource.property}`, TaintSet.from(label));
+      // Also taint the param itself so member access chains work
+      assignToPattern(callback.params[0], TaintSet.from(label), childEnv, ctx);
+    }
+  }
 
   if (eventName === 'message' && callback.params[0]) {
     // Check if the handler validates event.origin — returns 'strong', 'weak', or false

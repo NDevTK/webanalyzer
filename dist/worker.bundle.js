@@ -43562,6 +43562,10 @@ ${rootStack}`;
     "URL": "url.constructed",
     "URLSearchParams": "url.searchParams"
   };
+  var EVENT_SOURCES = {
+    "message": { property: "data", label: "postMessage.data" },
+    "hashchange": { property: "newURL", label: "url.hashchange" }
+  };
   var ASSIGNMENT_SINKS = {
     "innerHTML": { type: "XSS", argIndex: "rhs" },
     "outerHTML": { type: "XSS", argIndex: "rhs" },
@@ -43808,6 +43812,8 @@ ${rootStack}`;
       this.returnedFuncNode = null;
       this.returnedMethods = null;
       this.scriptElements = /* @__PURE__ */ new Set();
+      this.thrownTaint = TaintSet.empty();
+      this.generatorTaint = /* @__PURE__ */ new Map();
     }
   };
   function resolveId(node, ctx) {
@@ -44082,6 +44088,17 @@ ${rootStack}`;
         processForBinding(node, env, ctx);
         break;
       case "_CatchParam":
+        if (node.param && ctx.thrownTaint.tainted) {
+          assignToPattern(node.param, ctx.thrownTaint.clone(), env, ctx);
+        }
+        break;
+      case "ThrowStatement":
+        if (node.argument) {
+          const throwTaint = evaluateExpr(node.argument, env, ctx);
+          if (throwTaint.tainted) {
+            ctx.thrownTaint.merge(throwTaint);
+          }
+        }
         break;
       case "ExportNamedDeclaration":
         if (node.declaration) processNode(node.declaration, env, ctx);
@@ -44396,8 +44413,11 @@ ${rootStack}`;
         return TaintSet.empty();
       case "AwaitExpression":
         return evaluateExpr(node.argument, env, ctx);
-      case "YieldExpression":
-        return node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
+      case "YieldExpression": {
+        const yieldTaint = node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
+        if (yieldTaint.tainted) ctx.returnTaint.merge(yieldTaint);
+        return yieldTaint;
+      }
       case "ChainExpression":
       case "ParenthesizedExpression":
         return evaluateExpr(node.expression, env, ctx);
@@ -44641,12 +44661,23 @@ ${rootStack}`;
         return TaintSet.empty();
       case "set": {
         const valueTaint = argTaints[1] || TaintSet.empty();
-        if (valueTaint.tainted && node.callee?.object) {
+        if (node.callee?.object) {
           const objStr = nodeToString(node.callee.object);
-          if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
-          if (node.callee.object.type === "Identifier") {
-            const key = resolveId(node.callee.object, ctx);
-            env.set(key, env.get(key).clone().merge(valueTaint));
+          const mapKey = node.arguments[0];
+          const keyStr = mapKey && (mapKey.type === "StringLiteral" || mapKey.type === "Literal") ? mapKey.value ?? mapKey.raw : null;
+          if (objStr && keyStr != null) {
+            const perKeyPath = `${objStr}.#key_${keyStr}`;
+            env.set(perKeyPath, valueTaint.clone());
+            if (node.callee.object.type === "Identifier") {
+              const scopedKey = resolveId(node.callee.object, ctx);
+              env.set(`${scopedKey}.#key_${keyStr}`, valueTaint.clone());
+            }
+          } else if (objStr && valueTaint.tainted) {
+            env.set(objStr, env.get(objStr).clone().merge(valueTaint));
+            if (node.callee.object.type === "Identifier") {
+              const key = resolveId(node.callee.object, ctx);
+              env.set(key, env.get(key).clone().merge(valueTaint));
+            }
           }
         }
         return objTaint.clone();
@@ -44683,13 +44714,48 @@ ${rootStack}`;
       case "pop":
       case "shift":
         return objTaint.clone();
+      case "next":
+        return objTaint.clone();
+      case "call": {
+        const thisArgTaint = argTaints[0] || TaintSet.empty();
+        const restArgTaints = argTaints.slice(1);
+        const calleeObj = node.callee?.object;
+        const protoMethod = calleeObj ? nodeToString(calleeObj) : null;
+        if (protoMethod) {
+          const parts = protoMethod.split(".");
+          const method = parts[parts.length - 1];
+          const result = handleBuiltinMethod(method, {
+            ...node,
+            callee: { ...node.callee, object: node.arguments?.[0] || node.callee.object }
+          }, restArgTaints, env, ctx);
+          if (result !== null) return thisArgTaint.clone().merge(result);
+        }
+        return thisArgTaint.clone().merge(restArgTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
+      }
+      case "apply": {
+        const thisArgTaint = argTaints[0] || TaintSet.empty();
+        const argsArrayTaint = argTaints[1] || TaintSet.empty();
+        return thisArgTaint.clone().merge(argsArrayTaint);
+      }
       case "get":
       case "getAll": {
+        const getObjStr = nodeToString(node.callee?.object);
+        const getKeyArg = node.arguments?.[0];
+        const getKeyStr = getKeyArg && (getKeyArg.type === "StringLiteral" || getKeyArg.type === "Literal") ? getKeyArg.value ?? getKeyArg.raw : null;
+        if (getObjStr && getKeyStr != null) {
+          const perKeyPath = `${getObjStr}.#key_${getKeyStr}`;
+          const perKeyTaint = env.get(perKeyPath);
+          if (perKeyTaint.tainted) return perKeyTaint.clone();
+          if (node.callee?.object?.type === "Identifier") {
+            const scopedKey = resolveId(node.callee.object, ctx);
+            const scopedPerKey = env.get(`${scopedKey}.#key_${getKeyStr}`);
+            if (scopedPerKey.tainted) return scopedPerKey.clone();
+          }
+        }
         if (objTaint.tainted) return objTaint.clone();
-        const objStr = nodeToString(node.callee?.object);
-        if (objStr === "localStorage" || objStr === "sessionStorage") {
+        if (getObjStr === "localStorage" || getObjStr === "sessionStorage") {
           const loc = node.loc?.start || {};
-          return TaintSet.from(new TaintLabel(`storage.${objStr === "localStorage" ? "local" : "session"}`, ctx.file, loc.line || 0, loc.column || 0, `${objStr}.getItem()`));
+          return TaintSet.from(new TaintLabel(`storage.${getObjStr === "localStorage" ? "local" : "session"}`, ctx.file, loc.line || 0, loc.column || 0, `${getObjStr}.getItem()`));
         }
         return TaintSet.empty();
       }
@@ -44746,6 +44812,16 @@ ${rootStack}`;
     if (callback.type !== "ArrowFunctionExpression" && callback.type !== "FunctionExpression" && callback.type !== "FunctionDeclaration") return TaintSet.empty();
     const eventName = eventType.value;
     const childEnv = env.child();
+    if (eventName && eventName !== "message" && EVENT_SOURCES[eventName] && callback.params[0]) {
+      const paramName = callback.params[0].type === "Identifier" ? callback.params[0].name : null;
+      if (paramName) {
+        const evtSource = EVENT_SOURCES[eventName];
+        const loc = callback.loc?.start || {};
+        const label = new TaintLabel(evtSource.label, ctx.file, loc.line || 0, loc.column || 0, `${paramName}.${evtSource.property}`);
+        childEnv.set(`${paramName}.${evtSource.property}`, TaintSet.from(label));
+        assignToPattern(callback.params[0], TaintSet.from(label), childEnv, ctx);
+      }
+    }
     if (eventName === "message" && callback.params[0]) {
       const originCheck = callbackChecksOrigin(callback.body, ctx);
       if (originCheck !== "strong") {
