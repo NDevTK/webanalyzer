@@ -4,7 +4,6 @@
    Findings persist until the user clicks the clear button. */
 
 const enableToggle = document.getElementById('enableToggle');
-const statusEl = document.getElementById('status');
 const filterBar = document.getElementById('filterBar');
 const findingsEl = document.getElementById('findings');
 const emptyEl = document.getElementById('empty');
@@ -71,19 +70,11 @@ async function init() {
   const enabled = await sendMessage({ type: 'getEnabled' });
   enableToggle.checked = enabled !== false;
 
-  const tabs = await sendMessage({ type: 'getAttachedTabs' });
-  const attached = tabs && tabs.length > 0;
-
-  updateStatus(enableToggle.checked, attached);
   loadFindings();
 }
 
 enableToggle.addEventListener('change', async () => {
   await sendMessage({ type: 'setEnabled', enabled: enableToggle.checked });
-  updateStatus(enableToggle.checked, false);
-  if (enableToggle.checked) {
-    statusEl.textContent = 'Enabled — will attach on next navigation';
-  }
 });
 
 clearBtn.addEventListener('click', async () => {
@@ -233,7 +224,7 @@ function renderFindings(findings) {
     header.className = 'finding-group-header';
     header.innerHTML = `
       <span class="finding-group-icon">&#9660;</span>
-      <span class="finding-group-label" style="color: ${getTypeColor(meta.cssClass)}">${esc(meta.groupLabel)}</span>
+      <span class="finding-group-label ${meta.cssClass}">${esc(meta.groupLabel)}</span>
       <span class="finding-group-count">(${items.length})</span>
     `;
     header.addEventListener('click', () => groupEl.classList.toggle('collapsed'));
@@ -309,28 +300,6 @@ function renderFindings(findings) {
 
     groupEl.appendChild(itemsEl);
     findingsEl.appendChild(groupEl);
-  }
-}
-
-function getTypeColor(cssClass) {
-  switch (cssClass) {
-    case 'critical': return '#e94560';
-    case 'open-redirect': return '#feca57';
-    case 'proto-pollution': return '#ff6b6b';
-    default: return '#ff9f43';
-  }
-}
-
-function updateStatus(enabled, attached) {
-  if (!enabled) {
-    statusEl.textContent = 'Disabled';
-    statusEl.className = 'status';
-  } else if (attached) {
-    statusEl.textContent = 'Analyzing scripts...';
-    statusEl.className = 'status attached';
-  } else {
-    statusEl.textContent = 'Enabled — waiting for navigation';
-    statusEl.className = 'status';
   }
 }
 

@@ -66,10 +66,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       for (const tabId of [...attachedTabs.keys()]) detachFromTab(tabId);
     }
     persistState();
-  } else if (msg.type === 'getAttachedTabs') {
-    const tabs = [];
-    for (const [id, info] of attachedTabs) tabs.push({ id, origin: info.origin });
-    sendResponse(tabs);
   } else if (msg.type === 'clearFindings') {
     // IndexedDB is cleared by the side panel and/or offscreen worker.
     // We just reset badge counts here.

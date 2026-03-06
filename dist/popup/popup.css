@@ -72,18 +72,6 @@ body {
   background: #fff;
 }
 
-.status {
-  padding: 6px 14px;
-  font-size: 11px;
-  color: #888;
-  background: #121225;
-  border-bottom: 1px solid #0f3460;
-}
-
-.status.attached {
-  color: #53d769;
-}
-
 .empty {
   padding: 30px 14px;
   text-align: center;
@@ -228,6 +216,11 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+
+.finding-group-label.critical { color: #e94560; }
+.finding-group-label.open-redirect { color: #feca57; }
+.finding-group-label.proto-pollution { color: #ff6b6b; }
+.finding-group-label.high { color: #ff9f43; }
 
 .finding-group-count {
   font-size: 10px;
