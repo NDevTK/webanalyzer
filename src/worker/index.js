@@ -199,6 +199,11 @@ function analyzeAST(ast, file, isModule, pageCtx) {
     pageCtx.globalEnv.replaceFrom(env);
   }
 
+  // 9b. Propagate newly discovered functions (e.g. from factory calls) back to globalFuncMap
+  for (const [name, node] of funcMap) {
+    pageCtx.globalFuncMap.set(name, node);
+  }
+
   // 10. For modules, store export taint
   if (isModule) {
     storeExportTaint(ast, env, file, pageCtx);

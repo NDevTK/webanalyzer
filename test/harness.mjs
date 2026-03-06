@@ -75,6 +75,8 @@ export function analyzeMultiple(scripts) {
     allFindings.push(...findings);
 
     globalEnv.replaceFrom(env);
+    // Propagate newly discovered functions (e.g. from factory calls) back to globalFuncMap
+    for (const [k, v] of funcMap) globalFuncMap.set(k, v);
   }
 
   return allFindings;

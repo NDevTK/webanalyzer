@@ -61,6 +61,7 @@ export const CALL_SOURCES = {
   'JSON.parse': 'passthrough',
   'fetch': 'passthrough',       // tainted URL → tainted response for .then chains
   'String': 'passthrough',
+  'JSON.stringify': 'passthrough',
 };
 
 // Constructor sources: new Foo(tainted) where result is tainted
