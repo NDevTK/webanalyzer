@@ -172,6 +172,7 @@ class AnalysisContext {
     this.analyzedCalls = analyzedCalls || new Set();
     this.returnedFuncNode = null;  // tracks function nodes returned from calls
     this.returnedMethods = null;   // tracks { name → funcNode } for returned objects
+    this.scriptElements = new Set(); // tracks variables holding createElement('script') results
   }
 }
 
@@ -543,6 +544,15 @@ function processNode(node, env, ctx) {
   }
 }
 
+// ── Check if a node is document.createElement('script') ──
+function isCreateScriptElement(node) {
+  if (node.type !== 'CallExpression') return false;
+  const calleeStr = nodeToString(node.callee);
+  if (calleeStr !== 'document.createElement') return false;
+  const arg = node.arguments[0];
+  return arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === 'script';
+}
+
 // ── Variable declaration ──
 function processVarDeclarator(node, env, ctx) {
   if (!node.init) return;
@@ -574,8 +584,10 @@ function processVarDeclarator(node, env, ctx) {
         const propName = prop.key.name || prop.key.value;
         if (propName) {
           prop._closureEnv = env;
-          ctx.funcMap.set(`${varName}.${propName}`, prop);
-          if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, prop);
+          // Register getters with a special prefix so they can be invoked on property access
+          const prefix = prop.kind === 'get' ? 'getter:' : '';
+          ctx.funcMap.set(`${prefix}${varName}.${propName}`, prop);
+          if (!ctx.funcMap.has(`${prefix}${propName}`)) ctx.funcMap.set(`${prefix}${propName}`, prop);
         }
       }
     }
@@ -603,6 +615,12 @@ function processVarDeclarator(node, env, ctx) {
     }
   }
 
+  // Track document.createElement('script') results
+  if (node.id.type === 'Identifier' && isCreateScriptElement(node.init)) {
+    ctx.scriptElements.add(resolveId(node.id, ctx));
+    ctx.scriptElements.add(node.id.name);
+  }
+
   const taint = evaluateExpr(node.init, env, ctx);
   assignToPattern(node.id, taint, env, ctx);
   registerReturnedFunctions(node.id, ctx);
@@ -617,8 +635,16 @@ function processVarDeclarator(node, env, ctx) {
 function processAssignment(node, env, ctx) {
   ctx.returnedFuncNode = null;
   ctx.returnedMethods = null;
+
+  // Track document.createElement('script') in assignments
+  if (node.operator === '=' && node.left.type === 'Identifier' && isCreateScriptElement(node.right)) {
+    ctx.scriptElements.add(resolveId(node.left, ctx));
+    ctx.scriptElements.add(node.left.name);
+  }
+
   const rhsTaint = evaluateExpr(node.right, env, ctx);
   checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
+  checkScriptElementSink(node.left, rhsTaint, env, ctx);
   checkPrototypePollution(node, env, ctx);
 
   let finalTaint = rhsTaint;
@@ -943,6 +969,14 @@ function evaluateMemberExpr(node, env, ctx) {
   if (fullPath) {
     const propTaint = env.get(fullPath);
     if (propTaint.tainted) return propTaint.clone();
+
+    // Check for getter: invoke getter body to determine taint
+    const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
+    if (getterFunc && getterFunc.body) {
+      const childEnv = (getterFunc._closureEnv || env).child();
+      const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
+      if (getterTaint.tainted) return getterTaint;
+    }
   }
 
   // Properties that always produce a number or boolean — kill taint
@@ -953,7 +987,21 @@ function evaluateMemberExpr(node, env, ctx) {
   }
 
   const objTaint = evaluateExpr(node.object, env, ctx);
-  if (node.computed) evaluateExpr(node.property, env, ctx);
+  if (node.computed) {
+    evaluateExpr(node.property, env, ctx);
+    // For computed access obj[key], check if any obj.* properties are tainted
+    if (!objTaint.tainted) {
+      const objStr = nodeToString(node.object);
+      if (objStr) {
+        const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
+        if (taintedProps.size > 0) {
+          const merged = TaintSet.empty();
+          for (const [, taint] of taintedProps) merged.merge(taint);
+          return merged;
+        }
+      }
+    }
+  }
   return objTaint;
 }
 
@@ -985,6 +1033,29 @@ function evaluateCallExpr(node, env, ctx) {
   const sinkInfo = checkCallSink(calleeStr, methodName);
   if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
 
+  // Script element: el.setAttribute('src', tainted)
+  if (methodName === 'setAttribute' && node.arguments.length >= 2) {
+    const attrArg = node.arguments[0];
+    if (attrArg && isStringLiteral(attrArg) && stringLiteralValue(attrArg).toLowerCase() === 'src') {
+      const srcTaint = argTaints[1];
+      if (srcTaint && srcTaint.tainted && node.callee?.object) {
+        const objName = nodeToString(node.callee.object);
+        const objKey = node.callee.object.type === 'Identifier' ? resolveId(node.callee.object, ctx) : objName;
+        if (objName && (ctx.scriptElements.has(objKey) || ctx.scriptElements.has(objName))) {
+          const loc = node.loc?.start || {};
+          ctx.findings.push({
+            type: 'Script Injection',
+            severity: 'critical',
+            title: 'Script Injection: tainted data flows to script element src',
+            sink: { expression: `${objName}.setAttribute('src')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
+            source: srcTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+            path: buildTaintPath(srcTaint, `${objName}.setAttribute('src')`),
+          });
+        }
+      }
+    }
+  }
+
   // setTimeout/setInterval with function callback: analyze body for closure taint reaching sinks
   if ((calleeStr === 'setTimeout' || calleeStr === 'setInterval') && node.arguments[0]) {
     let callback = node.arguments[0];
@@ -1001,6 +1072,11 @@ function evaluateCallExpr(node, env, ctx) {
         evaluateExpr(callback.body, childEnv, ctx);
       }
     }
+  }
+
+  // Array.from(iterable) — propagate taint from iterable
+  if (calleeStr === 'Array.from') {
+    return argTaints[0]?.clone() || TaintSet.empty();
   }
 
   // Object.assign(target, ...sources) — propagate taint from sources to target and return
@@ -1124,6 +1200,34 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
       return TaintSet.empty();
 
+    case 'set': {
+      // Map.set(key, value) / WeakMap.set(key, value) — taint the Map if value is tainted
+      const valueTaint = argTaints[1] || TaintSet.empty();
+      if (valueTaint.tainted && node.callee?.object) {
+        const objStr = nodeToString(node.callee.object);
+        if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
+        if (node.callee.object.type === 'Identifier') {
+          const key = resolveId(node.callee.object, ctx);
+          env.set(key, env.get(key).clone().merge(valueTaint));
+        }
+      }
+      return objTaint.clone(); // Map.set returns the Map itself
+    }
+
+    case 'add': {
+      // Set.add(value) — taint the Set if value is tainted
+      const valueTaint = argTaints[0] || TaintSet.empty();
+      if (valueTaint.tainted && node.callee?.object) {
+        const objStr = nodeToString(node.callee.object);
+        if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
+        if (node.callee.object.type === 'Identifier') {
+          const key = resolveId(node.callee.object, ctx);
+          env.set(key, env.get(key).clone().merge(valueTaint));
+        }
+      }
+      return objTaint.clone();
+    }
+
     case 'push': case 'unshift':
       if (node.callee?.object) {
         const objStr = nodeToString(node.callee.object);
@@ -1177,6 +1281,10 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
 
     case 'addEventListener':
       return analyzeEventListener(node, argTaints, env, ctx);
+
+    case 'resolve': case 'reject':
+      // Promise.resolve(val) / Promise.reject(val) — propagate taint
+      return argTaints[0]?.clone() || TaintSet.empty();
 
     case 'all': case 'race': case 'any': case 'allSettled':
       // Promise.all([...]) — propagate taint from array argument
@@ -1720,6 +1828,28 @@ function classifyNavigationType(sinkInfo, env, rhsNode) {
   }
 
   return sinkInfo.type; // default: XSS
+}
+
+// ── Script element sink: el.src = tainted when el is createElement('script') ──
+function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
+  if (!rhsTaint.tainted) return;
+  if (leftNode.type !== 'MemberExpression' && leftNode.type !== 'OptionalMemberExpression') return;
+  const propName = leftNode.property?.name;
+  if (propName !== 'src') return;
+  const objName = nodeToString(leftNode.object);
+  if (!objName) return;
+  // Check if the object is a known script element
+  const objKey = leftNode.object.type === 'Identifier' ? resolveId(leftNode.object, ctx) : objName;
+  if (!ctx.scriptElements.has(objKey) && !ctx.scriptElements.has(objName)) return;
+  const loc = leftNode.loc?.start || {};
+  ctx.findings.push({
+    type: 'Script Injection',
+    severity: 'critical',
+    title: 'Script Injection: tainted data flows to script element src',
+    sink: { expression: `${objName}.src`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
+    source: rhsTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+    path: buildTaintPath(rhsTaint, `${objName}.src`),
+  });
 }
 
 function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {

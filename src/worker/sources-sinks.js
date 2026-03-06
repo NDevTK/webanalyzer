@@ -27,6 +27,17 @@ export const MEMBER_SOURCES = {
   'document.referrer': 'url.document.referrer',
   'document.cookie': 'cookie',
   'document.baseURI': 'url.document.baseURI',
+  'window.document.cookie': 'cookie',
+  // globalThis aliases (same as window/location)
+  'globalThis.location.href': 'url.location.href',
+  'globalThis.location.hash': 'url.location.hash',
+  'globalThis.location.search': 'url.location.search',
+  'globalThis.location.pathname': 'url.location.pathname',
+  // self aliases (workers, but also valid in window context)
+  'self.location.href': 'url.location.href',
+  'self.location.hash': 'url.location.hash',
+  'self.location.search': 'url.location.search',
+  'self.location.pathname': 'url.location.pathname',
   // window
   'window.name': 'window.name',
 };

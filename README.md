@@ -2,6 +2,8 @@
 
 A Chrome extension (MV3) that performs real-time, AST-based taint analysis on web applications. It intercepts JavaScript as pages load, parses it with Babel, builds control flow graphs, and traces attacker-controlled data from sources to dangerous sinks — detecting XSS, prototype pollution, open redirects, and other client-side vulnerabilities.
 
+<img src="Screenshot.png" />
+
 ## How It Works
 
 1. **Script interception** — The background service worker attaches Chrome DevTools Protocol (CDP) via `chrome.debugger` to collect every script loaded by a page, including inline scripts, dynamically injected scripts, and ES modules.

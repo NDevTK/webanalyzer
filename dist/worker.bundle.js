@@ -43524,6 +43524,17 @@ ${rootStack}`;
     "document.referrer": "url.document.referrer",
     "document.cookie": "cookie",
     "document.baseURI": "url.document.baseURI",
+    "window.document.cookie": "cookie",
+    // globalThis aliases (same as window/location)
+    "globalThis.location.href": "url.location.href",
+    "globalThis.location.hash": "url.location.hash",
+    "globalThis.location.search": "url.location.search",
+    "globalThis.location.pathname": "url.location.pathname",
+    // self aliases (workers, but also valid in window context)
+    "self.location.href": "url.location.href",
+    "self.location.hash": "url.location.hash",
+    "self.location.search": "url.location.search",
+    "self.location.pathname": "url.location.pathname",
     // window
     "window.name": "window.name"
   };
@@ -43796,6 +43807,7 @@ ${rootStack}`;
       this.analyzedCalls = analyzedCalls || /* @__PURE__ */ new Set();
       this.returnedFuncNode = null;
       this.returnedMethods = null;
+      this.scriptElements = /* @__PURE__ */ new Set();
     }
   };
   function resolveId(node, ctx) {
@@ -44086,6 +44098,13 @@ ${rootStack}`;
         break;
     }
   }
+  function isCreateScriptElement(node) {
+    if (node.type !== "CallExpression") return false;
+    const calleeStr = nodeToString(node.callee);
+    if (calleeStr !== "document.createElement") return false;
+    const arg = node.arguments[0];
+    return arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === "script";
+  }
   function processVarDeclarator(node, env, ctx) {
     if (!node.init) return;
     ctx.returnedFuncNode = null;
@@ -44112,8 +44131,9 @@ ${rootStack}`;
           const propName = prop.key.name || prop.key.value;
           if (propName) {
             prop._closureEnv = env;
-            ctx.funcMap.set(`${varName}.${propName}`, prop);
-            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, prop);
+            const prefix = prop.kind === "get" ? "getter:" : "";
+            ctx.funcMap.set(`${prefix}${varName}.${propName}`, prop);
+            if (!ctx.funcMap.has(`${prefix}${propName}`)) ctx.funcMap.set(`${prefix}${propName}`, prop);
           }
         }
       }
@@ -44137,6 +44157,10 @@ ${rootStack}`;
         ctx.funcMap.set(node.id.name, refFunc);
       }
     }
+    if (node.id.type === "Identifier" && isCreateScriptElement(node.init)) {
+      ctx.scriptElements.add(resolveId(node.id, ctx));
+      ctx.scriptElements.add(node.id.name);
+    }
     const taint = evaluateExpr(node.init, env, ctx);
     assignToPattern(node.id, taint, env, ctx);
     registerReturnedFunctions(node.id, ctx);
@@ -44147,8 +44171,13 @@ ${rootStack}`;
   function processAssignment(node, env, ctx) {
     ctx.returnedFuncNode = null;
     ctx.returnedMethods = null;
+    if (node.operator === "=" && node.left.type === "Identifier" && isCreateScriptElement(node.right)) {
+      ctx.scriptElements.add(resolveId(node.left, ctx));
+      ctx.scriptElements.add(node.left.name);
+    }
     const rhsTaint = evaluateExpr(node.right, env, ctx);
     checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
+    checkScriptElementSink(node.left, rhsTaint, env, ctx);
     checkPrototypePollution(node, env, ctx);
     let finalTaint = rhsTaint;
     if (node.operator !== "=") {
@@ -44395,6 +44424,12 @@ ${rootStack}`;
     if (fullPath) {
       const propTaint = env.get(fullPath);
       if (propTaint.tainted) return propTaint.clone();
+      const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
+      if (getterFunc && getterFunc.body) {
+        const childEnv = (getterFunc._closureEnv || env).child();
+        const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
+        if (getterTaint.tainted) return getterTaint;
+      }
     }
     const propName = !node.computed && node.property ? node.property.name || node.property.value : null;
     if (propName && NUMERIC_PROPS.has(propName)) {
@@ -44402,7 +44437,20 @@ ${rootStack}`;
       return TaintSet.empty();
     }
     const objTaint = evaluateExpr(node.object, env, ctx);
-    if (node.computed) evaluateExpr(node.property, env, ctx);
+    if (node.computed) {
+      evaluateExpr(node.property, env, ctx);
+      if (!objTaint.tainted) {
+        const objStr = nodeToString(node.object);
+        if (objStr) {
+          const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
+          if (taintedProps.size > 0) {
+            const merged = TaintSet.empty();
+            for (const [, taint] of taintedProps) merged.merge(taint);
+            return merged;
+          }
+        }
+      }
+    }
     return objTaint;
   }
   var NUMERIC_PROPS = /* @__PURE__ */ new Set([
@@ -44437,6 +44485,27 @@ ${rootStack}`;
     if (isSanitizer(calleeStr, methodName)) return TaintSet.empty();
     const sinkInfo = checkCallSink(calleeStr, methodName);
     if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
+    if (methodName === "setAttribute" && node.arguments.length >= 2) {
+      const attrArg = node.arguments[0];
+      if (attrArg && isStringLiteral(attrArg) && stringLiteralValue(attrArg).toLowerCase() === "src") {
+        const srcTaint = argTaints[1];
+        if (srcTaint && srcTaint.tainted && node.callee?.object) {
+          const objName = nodeToString(node.callee.object);
+          const objKey = node.callee.object.type === "Identifier" ? resolveId(node.callee.object, ctx) : objName;
+          if (objName && (ctx.scriptElements.has(objKey) || ctx.scriptElements.has(objName))) {
+            const loc = node.loc?.start || {};
+            ctx.findings.push({
+              type: "Script Injection",
+              severity: "critical",
+              title: "Script Injection: tainted data flows to script element src",
+              sink: { expression: `${objName}.setAttribute('src')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
+              source: srcTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+              path: buildTaintPath(srcTaint, `${objName}.setAttribute('src')`)
+            });
+          }
+        }
+      }
+    }
     if ((calleeStr === "setTimeout" || calleeStr === "setInterval") && node.arguments[0]) {
       let callback = node.arguments[0];
       if (callback.type === "Identifier") {
@@ -44451,6 +44520,9 @@ ${rootStack}`;
           evaluateExpr(callback.body, childEnv, ctx);
         }
       }
+    }
+    if (calleeStr === "Array.from") {
+      return argTaints[0]?.clone() || TaintSet.empty();
     }
     if (calleeStr === "Object.assign" && node.arguments.length >= 2) {
       const merged = argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
@@ -44567,6 +44639,30 @@ ${rootStack}`;
       case "forEach":
         analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
         return TaintSet.empty();
+      case "set": {
+        const valueTaint = argTaints[1] || TaintSet.empty();
+        if (valueTaint.tainted && node.callee?.object) {
+          const objStr = nodeToString(node.callee.object);
+          if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
+          if (node.callee.object.type === "Identifier") {
+            const key = resolveId(node.callee.object, ctx);
+            env.set(key, env.get(key).clone().merge(valueTaint));
+          }
+        }
+        return objTaint.clone();
+      }
+      case "add": {
+        const valueTaint = argTaints[0] || TaintSet.empty();
+        if (valueTaint.tainted && node.callee?.object) {
+          const objStr = nodeToString(node.callee.object);
+          if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
+          if (node.callee.object.type === "Identifier") {
+            const key = resolveId(node.callee.object, ctx);
+            env.set(key, env.get(key).clone().merge(valueTaint));
+          }
+        }
+        return objTaint.clone();
+      }
       case "push":
       case "unshift":
         if (node.callee?.object) {
@@ -44623,6 +44719,9 @@ ${rootStack}`;
         return analyzePromiseCallback(node, argTaints, objTaint, env, ctx);
       case "addEventListener":
         return analyzeEventListener(node, argTaints, env, ctx);
+      case "resolve":
+      case "reject":
+        return argTaints[0]?.clone() || TaintSet.empty();
       case "all":
       case "race":
       case "any":
@@ -45031,6 +45130,25 @@ ${rootStack}`;
       }
     }
     return sinkInfo.type;
+  }
+  function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
+    if (!rhsTaint.tainted) return;
+    if (leftNode.type !== "MemberExpression" && leftNode.type !== "OptionalMemberExpression") return;
+    const propName = leftNode.property?.name;
+    if (propName !== "src") return;
+    const objName = nodeToString(leftNode.object);
+    if (!objName) return;
+    const objKey = leftNode.object.type === "Identifier" ? resolveId(leftNode.object, ctx) : objName;
+    if (!ctx.scriptElements.has(objKey) && !ctx.scriptElements.has(objName)) return;
+    const loc = leftNode.loc?.start || {};
+    ctx.findings.push({
+      type: "Script Injection",
+      severity: "critical",
+      title: "Script Injection: tainted data flows to script element src",
+      sink: { expression: `${objName}.src`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
+      source: rhsTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+      path: buildTaintPath(rhsTaint, `${objName}.src`)
+    });
   }
   function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
     if (!rhsTaint.tainted) return;
