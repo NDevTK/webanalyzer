@@ -86,6 +86,8 @@ export const ASSIGNMENT_SINKS = {
   // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
   'location.href': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'window.location.href': { type: 'XSS', argIndex: 'rhs', navigation: true },
+  'document.location.href': { type: 'XSS', argIndex: 'rhs', navigation: true },
+  'document.location': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'window.location': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'location': { type: 'XSS', argIndex: 'rhs', navigation: true },
 };

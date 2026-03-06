@@ -288,6 +288,22 @@ function applyBranchCondition(testNode, polarity, env) {
     applyBranchCondition(node.right, false, env);
     return;
   }
+  // if (a || b) in the true branch → at least one is true
+  // For scheme checks: if both sides check the same var, mark it as checked
+  if (node.type === 'LogicalExpression' && node.operator === '||' && positive) {
+    const leftVar = extractSchemeCheck(node.left, true);
+    const rightVar = extractSchemeCheck(node.right, true);
+    if (leftVar && rightVar && leftVar === rightVar) {
+      env.schemeCheckedVars.add(leftVar);
+      const origin = env.urlConstructorOrigins.get(leftVar);
+      if (origin) env.schemeCheckedVars.add(origin);
+      return;
+    }
+    // Still recurse — individual checks may apply
+    applyBranchCondition(node.left, true, env);
+    applyBranchCondition(node.right, true, env);
+    return;
+  }
 
   const checkedVar = extractSchemeCheck(node, positive);
   if (checkedVar) {
@@ -863,6 +879,32 @@ function processAssignment(node, env, ctx) {
     }
   }
 
+  // Register object literal methods: obj = { render: function(){} } or window.Mod = { get: function(){} }
+  if (node.operator === '=' && node.right.type === 'ObjectExpression') {
+    const leftStr = nodeToString(node.left);
+    if (leftStr) {
+      for (const prop of node.right.properties) {
+        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+          const propName = prop.key.name || prop.key.value;
+          const val = prop.value;
+          if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
+            val._closureEnv = env;
+            ctx.funcMap.set(`${leftStr}.${propName}`, val);
+            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+          }
+        }
+        if (prop.type === 'ObjectMethod' && prop.key) {
+          const propName = prop.key.name || prop.key.value;
+          if (propName) {
+            prop._closureEnv = env;
+            ctx.funcMap.set(`${leftStr}.${propName}`, prop);
+            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, prop);
+          }
+        }
+      }
+    }
+  }
+
   // window.onmessage / self.onmessage = function(e) { ... }
   // Analyze the handler body with tainted event param, same as addEventListener('message', fn)
   if (node.operator === '=') {
@@ -1397,6 +1439,11 @@ function evaluateCallExpr(node, env, ctx) {
     return TaintSet.empty();
   }
 
+  // Object.freeze/seal/preventExtensions — return the same object, propagate taint
+  if (calleeStr === 'Object.freeze' || calleeStr === 'Object.seal' || calleeStr === 'Object.preventExtensions') {
+    return argTaints[0]?.clone() || TaintSet.empty();
+  }
+
   // Object.values/keys/entries — propagate taint from object properties
   // Object.keys returns property names (strings) — not tainted by values
   if (calleeStr === 'Object.keys') return TaintSet.empty();
@@ -1464,7 +1511,9 @@ function evaluateNewExpr(node, env, ctx) {
   }
 
   if (constructorName === 'Function') {
-    checkSinkCall(node, { type: 'XSS', taintedArgs: [0] }, argTaints, 'new Function()', env, ctx);
+    // new Function(body) or new Function(arg1, ..., body) — any tainted arg is code injection
+    const allArgIndices = argTaints.map((_, i) => i);
+    checkSinkCall(node, { type: 'XSS', taintedArgs: allArgIndices }, argTaints, 'new Function()', env, ctx);
   }
 
   // Analyze constructor body to track this.* assignments
@@ -1629,6 +1678,13 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
           }
         }
       }
+      // If the callee resolves to a user-defined function, let analyzeCalledFunction handle it
+      const setCalleeStr = nodeToString(node.callee);
+      if (setCalleeStr && ctx.funcMap.has(setCalleeStr)) return null;
+      if (ctx.funcMap.has('set')) {
+        const setFunc = ctx.funcMap.get('set');
+        if (setFunc && setFunc.body) return null;
+      }
       return objTaint.clone(); // Map.set returns the Map itself
     }
 
@@ -1699,18 +1755,33 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       // e.g. Array.prototype.join.call(arr, sep) → join taint from first arg (the array)
       const thisArgTaint = argTaints[0] || TaintSet.empty();
       const restArgTaints = argTaints.slice(1);
-      // Determine the method being called (e.g. "join" from "Array.prototype.join.call")
       const calleeObj = node.callee?.object;
       const protoMethod = calleeObj ? nodeToString(calleeObj) : null;
       if (protoMethod) {
         const parts = protoMethod.split('.');
         const method = parts[parts.length - 1];
-        // Delegate to handleBuiltinMethod with the resolved method name and thisArg as objTaint
+        // Try builtin method first
         const result = handleBuiltinMethod(method, {
           ...node,
           callee: { ...node.callee, object: node.arguments?.[0] || node.callee.object },
         }, restArgTaints, env, ctx);
         if (result !== null) return thisArgTaint.clone().merge(result);
+        // Try interprocedural: fn.call(thisArg, arg1, ...) → analyze fn with args
+        const funcRef = calleeObj.type === 'Identifier'
+          ? (ctx.funcMap.get(resolveId(calleeObj, ctx)) || ctx.funcMap.get(calleeObj.name))
+          : (protoMethod && ctx.funcMap.get(protoMethod));
+        if (funcRef && funcRef.body) {
+          const thisArgNode = node.arguments?.[0];
+          const thisArgName = thisArgNode ? nodeToString(thisArgNode) : null;
+          if (thisArgName) {
+            funcRef._boundThisArg = thisArgName;
+          } else if (thisArgNode && thisArgNode.type === 'ObjectExpression') {
+            // Inline object literal: evaluate properties into this.* bindings
+            funcRef._boundThisNode = thisArgNode;
+          }
+          const synthCall = { ...node, callee: calleeObj, arguments: node.arguments.slice(1) };
+          return analyzeCalledFunction(synthCall, protoMethod, restArgTaints, env, ctx);
+        }
       }
       return thisArgTaint.clone().merge(restArgTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
     }
@@ -1719,6 +1790,19 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       // Function.prototype.apply(thisArg, argsArray) — similar to call but args in array
       const thisArgTaint = argTaints[0] || TaintSet.empty();
       const argsArrayTaint = argTaints[1] || TaintSet.empty();
+      // Try interprocedural: fn.apply(thisArg, [args]) → analyze fn
+      const applyObj = node.callee?.object;
+      if (applyObj) {
+        const funcName = nodeToString(applyObj);
+        const funcRef = applyObj.type === 'Identifier'
+          ? (ctx.funcMap.get(resolveId(applyObj, ctx)) || ctx.funcMap.get(applyObj.name))
+          : (funcName && ctx.funcMap.get(funcName));
+        if (funcRef && funcRef.body) {
+          // For apply, args are in an array — pass the array taint as each arg
+          const synthCall = { ...node, callee: applyObj, arguments: node.arguments?.slice(1) || [] };
+          return analyzeCalledFunction(synthCall, funcName, [argsArrayTaint], env, ctx);
+        }
+      }
       return thisArgTaint.clone().merge(argsArrayTaint);
     }
 
@@ -2192,10 +2276,19 @@ function analyzeInlineFunction(funcNode, env, ctx) {
   if (innerCtx.returnedFuncNode) ctx.returnedFuncNode = innerCtx.returnedFuncNode;
   if (innerCtx.returnedMethods) ctx.returnedMethods = innerCtx.returnedMethods;
 
-  // Propagate array-stored callback entries (e.g., handlers[]) discovered during inline analysis
-  // back to the caller so computed calls like handlers[0](data) can resolve them
+  // Propagate function entries discovered during inline analysis back to the caller:
+  // - Array-stored callbacks (key ends with [])
+  // - Global assignments via window.X (strip prefix for cross-file resolution)
   for (const [key, val] of innerCtx.funcMap) {
-    if (key.endsWith('[]') && !ctx.funcMap.has(key)) ctx.funcMap.set(key, val);
+    if (key.endsWith('[]') && !ctx.funcMap.has(key)) {
+      ctx.funcMap.set(key, val);
+    }
+    if (key.startsWith('window.') && !ctx.funcMap.has(key)) {
+      ctx.funcMap.set(key, val);
+      // Also register without the window. prefix: window.Mod.get → Mod.get
+      const stripped = key.slice(7); // remove "window."
+      if (stripped && !ctx.funcMap.has(stripped)) ctx.funcMap.set(stripped, val);
+    }
   }
 
   return innerCtx.returnTaint;
@@ -2237,11 +2330,21 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     }
     // Immediately-invoked return: factory()(arg) — callee is a CallExpression
     if (!funcNode && (callNode.callee.type === 'CallExpression' || callNode.callee.type === 'OptionalCallExpression')) {
-      // The callee was already evaluated by evaluateCallExpr (which set ctx.returnedFuncNode)
-      // Check if a function node was returned
       if (ctx.returnedFuncNode) {
         funcNode = ctx.returnedFuncNode;
         ctx.returnedFuncNode = null;
+      }
+    }
+    // Ternary callee: (cond ? fnA : fnB)(args) — resolve either branch
+    if (!funcNode && callNode.callee.type === 'ConditionalExpression') {
+      for (const branch of [callNode.callee.consequent, callNode.callee.alternate]) {
+        if (branch.type === 'Identifier') {
+          const ref = ctx.funcMap.get(resolveId(branch, ctx)) || ctx.funcMap.get(branch.name);
+          if (ref) { funcNode = ref; break; }
+        }
+        if (branch.type === 'ArrowFunctionExpression' || branch.type === 'FunctionExpression') {
+          funcNode = branch; break;
+        }
       }
     }
   }
@@ -2302,10 +2405,17 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         const propName = key.slice(objName.length + 1);
         childEnv.set(`this.${propName}`, taint);
       }
+    } else {
+      // Anonymous receiver (chained calls on new X() or other expressions):
+      // Inherit this.* bindings from env set by a previous call in the chain
+      const thisBindings = env.getTaintedWithPrefix('this.');
+      for (const [key, taint] of thisBindings) {
+        childEnv.set(key, taint);
+      }
     }
   }
 
-  // Handle bound this context from fn.bind(thisArg)
+  // Handle bound this context from fn.bind(thisArg) or fn.call(thisArg)
   if (funcNode._boundThisArg) {
     const boundName = funcNode._boundThisArg;
     const boundTaint = env.get(boundName);
@@ -2315,6 +2425,20 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       const propName = key.slice(boundName.length + 1);
       childEnv.set(`this.${propName}`, taint);
     }
+  }
+  // Handle inline object literal as thisArg: fn.call({html: tainted})
+  if (funcNode._boundThisNode) {
+    const objNode = funcNode._boundThisNode;
+    for (const prop of objNode.properties || []) {
+      if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+        const propName = prop.key.name || prop.key.value;
+        if (propName && prop.value) {
+          const propTaint = evaluateExpr(prop.value, env, ctx);
+          childEnv.set(`this.${propName}`, propTaint);
+        }
+      }
+    }
+    funcNode._boundThisNode = null; // consume
   }
 
   // Store function expression arguments in funcMap so they can be called inside the body
@@ -2399,12 +2523,13 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   // After obj.setData(tainted), if setData sets this.data, copy it back as obj.data
   if (callNode.callee?.type === 'MemberExpression' || callNode.callee?.type === 'OptionalMemberExpression') {
     const objName = nodeToString(callNode.callee.object);
-    if (objName) {
-      for (const [key, taint] of childEnv.bindings) {
-        if (key.startsWith('this.') && taint.tainted) {
-          const propName = key.slice(5);
-          env.set(`${objName}.${propName}`, taint);
-        }
+    for (const [key, taint] of childEnv.bindings) {
+      if (key.startsWith('this.') && taint.tainted) {
+        const propName = key.slice(5);
+        if (objName) env.set(`${objName}.${propName}`, taint);
+        // Also keep this.* in env for chained calls on anonymous receivers
+        // e.g., new Builder().set(x).build() — this.data persists across the chain
+        env.set(key, taint);
       }
     }
   }
@@ -2542,9 +2667,10 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
 export function checkPrototypePollution(node, env, ctx) {
   if (node.type !== 'AssignmentExpression') return;
   const left = node.left;
-  if (left.type !== 'MemberExpression' || !left.computed) return;
+  if (left.type !== 'MemberExpression') return;
 
-  if (left.object.type === 'MemberExpression' && left.object.computed) {
+  // Pattern 1: obj[key1][key2] = tainted (both keys tainted)
+  if (left.computed && left.object.type === 'MemberExpression' && left.object.computed) {
     const outerKey = evaluateExpr(left.object.property, env, ctx);
     const innerKey = evaluateExpr(left.property, env, ctx);
 
@@ -2558,6 +2684,26 @@ export function checkPrototypePollution(node, env, ctx) {
         source: outerKey.clone().merge(innerKey).toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
         path: buildTaintPath(outerKey.clone().merge(innerKey), 'obj[key1][key2]'),
       });
+    }
+  }
+
+  // Pattern 2: obj.__proto__.X = tainted or obj.prototype.X = tainted
+  if (left.object?.type === 'MemberExpression' && !left.object.computed) {
+    const objProp = left.object.property?.name;
+    if (objProp === '__proto__' || objProp === 'prototype') {
+      const rhsTaint = evaluateExpr(node.right, env, ctx);
+      if (rhsTaint.tainted) {
+        const loc = node.loc?.start || {};
+        const expr = nodeToString(left) || `obj.${objProp}.prop`;
+        ctx.findings.push({
+          type: 'Prototype Pollution',
+          severity: 'critical',
+          title: `Prototype Pollution: tainted data assigned to ${objProp}`,
+          sink: { expression: expr, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
+          source: rhsTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+          path: buildTaintPath(rhsTaint, expr),
+        });
+      }
     }
   }
 }
