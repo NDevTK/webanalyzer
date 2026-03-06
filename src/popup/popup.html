@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <h1>WebAppSec Taint Analyzer</h1>
+    <label class="toggle">
+      <input type="checkbox" id="enableToggle" checked>
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+
+  <div id="status" class="status"></div>
+
+  <div id="findings" class="findings-list"></div>
+
+  <button id="clearBtn" class="clear-btn hidden">Clear All Findings</button>
+
+  <div id="empty" class="empty">No findings yet. Navigate to a page to begin analysis.</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

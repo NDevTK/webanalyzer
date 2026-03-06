@@ -1,0 +1,154 @@
+/* scope.js — Uses @babel/traverse to build a scope-aware binding map.
+   Maps each Identifier AST node to a canonical binding key that respects
+   variable shadowing, closures, hoisting, and block scoping. */
+
+import _traverse from '@babel/traverse';
+const traverse = _traverse.default || _traverse;
+
+// Build a scope info map for an AST
+// Returns ScopeInfo with methods to resolve identifiers to canonical keys
+export function buildScopeInfo(ast) {
+  // Map from AST node → canonical binding key
+  // Using node start position as identity since Babel nodes are unique objects
+  const nodeBindingMap = new Map();   // node reference → bindingKey
+  const bindingScopes = new Map();    // bindingKey → scope uid
+  const bindingNodes = new Map();     // bindingKey → declaration node
+
+  traverse(ast, {
+    // Capture all scope-creating nodes to register bindings
+    Scope(path) {
+      const scope = path.scope;
+      for (const [name, binding] of Object.entries(scope.bindings)) {
+        const key = `${scope.uid}:${name}`;
+        bindingScopes.set(key, scope.uid);
+        bindingNodes.set(key, binding.path.node);
+
+        // Map the declaration identifier
+        if (binding.identifier) {
+          nodeBindingMap.set(binding.identifier, key);
+        }
+
+        // Map all reference identifiers
+        for (const refPath of binding.referencePaths) {
+          nodeBindingMap.set(refPath.node, key);
+        }
+
+        // Map all constant violation identifiers (reassignments)
+        for (const violPath of binding.constantViolations) {
+          const violNode = violPath.node;
+          if (violNode.type === 'AssignmentExpression' && violNode.left?.type === 'Identifier') {
+            nodeBindingMap.set(violNode.left, key);
+          } else if (violNode.type === 'UpdateExpression' && violNode.argument?.type === 'Identifier') {
+            nodeBindingMap.set(violNode.argument, key);
+          }
+        }
+      }
+    },
+
+    // For function parameters, capture in the function scope
+    'FunctionDeclaration|FunctionExpression|ArrowFunctionExpression'(path) {
+      const scope = path.scope;
+      for (const param of path.node.params) {
+        walkPattern(param, (idNode) => {
+          const name = idNode.name;
+          const binding = scope.getBinding(name);
+          if (binding) {
+            const key = `${scope.uid}:${name}`;
+            nodeBindingMap.set(idNode, key);
+          }
+        });
+      }
+    },
+
+    // Capture identifiers in all references
+    ReferencedIdentifier(path) {
+      if (nodeBindingMap.has(path.node)) return; // already mapped
+
+      const binding = path.scope.getBinding(path.node.name);
+      if (binding) {
+        const key = `${binding.scope.uid}:${path.node.name}`;
+        nodeBindingMap.set(path.node, key);
+      }
+      // If no binding found, it's a global — use 'global:name'
+    },
+
+    // Capture identifiers in binding declarations (let x = ...)
+    BindingIdentifier(path) {
+      if (nodeBindingMap.has(path.node)) return;
+
+      const binding = path.scope.getBinding(path.node.name);
+      if (binding) {
+        const key = `${binding.scope.uid}:${path.node.name}`;
+        nodeBindingMap.set(path.node, key);
+      }
+    },
+  });
+
+  return new ScopeInfo(nodeBindingMap, bindingScopes, bindingNodes);
+}
+
+export class ScopeInfo {
+  constructor(nodeBindingMap, bindingScopes, bindingNodes) {
+    this.nodeBindingMap = nodeBindingMap;
+    this.bindingScopes = bindingScopes;
+    this.bindingNodes = bindingNodes;
+  }
+
+  // Resolve an Identifier AST node to its canonical binding key
+  // Returns a unique string like "3:myVar" (scope uid + name)
+  // Falls back to "global:name" for unresolved globals
+  resolve(identifierNode) {
+    if (!identifierNode) return null;
+    const mapped = this.nodeBindingMap.get(identifierNode);
+    if (mapped) return mapped;
+    // Unresolved → treat as global
+    if (identifierNode.type === 'Identifier') {
+      return `global:${identifierNode.name}`;
+    }
+    return null;
+  }
+
+  // Check if two identifier nodes refer to the same binding
+  sameBinding(nodeA, nodeB) {
+    const keyA = this.resolve(nodeA);
+    const keyB = this.resolve(nodeB);
+    return keyA && keyB && keyA === keyB;
+  }
+
+  // Get all binding keys in a given scope
+  bindingsInScope(scopeUid) {
+    const keys = [];
+    for (const [key, uid] of this.bindingScopes) {
+      if (uid === scopeUid) keys.push(key);
+    }
+    return keys;
+  }
+}
+
+// Walk a pattern node (Identifier, ObjectPattern, ArrayPattern, etc.)
+// calling visitor for each Identifier leaf
+function walkPattern(node, visitor) {
+  if (!node) return;
+  switch (node.type) {
+    case 'Identifier':
+      visitor(node);
+      break;
+    case 'ObjectPattern':
+      for (const prop of node.properties) {
+        if (prop.type === 'RestElement') walkPattern(prop.argument, visitor);
+        else walkPattern(prop.value, visitor);
+      }
+      break;
+    case 'ArrayPattern':
+      for (const elem of node.elements) {
+        if (elem) {
+          if (elem.type === 'RestElement') walkPattern(elem.argument, visitor);
+          else walkPattern(elem, visitor);
+        }
+      }
+      break;
+    case 'AssignmentPattern':
+      walkPattern(node.left, visitor);
+      break;
+  }
+}

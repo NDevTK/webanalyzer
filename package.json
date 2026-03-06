@@ -1,0 +1,16 @@
+{
+  "name": "webappsec",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.26.0",
+    "@babel/traverse": "^7.26.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
