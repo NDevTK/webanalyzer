@@ -1024,8 +1024,11 @@ export function evaluateExpr(node, env, ctx) {
       const key = resolveId(node, ctx);
       const taint = env.get(key);
       if (taint.tainted) return taint.clone();
-      // Fall back: check raw name in case taint was set by another script
-      return env.get(`global:${node.name}`).clone();
+      // Fall back: check global: prefix
+      const globalTaint = env.get(`global:${node.name}`);
+      if (globalTaint.tainted) return globalTaint.clone();
+      // Fall back: check raw name (cross-file globals set by raw name)
+      return env.get(node.name).clone();
     }
 
     case 'MemberExpression':
@@ -1059,8 +1062,25 @@ export function evaluateExpr(node, env, ctx) {
       return leftT.clone().merge(rightT);
     }
 
-    case 'LogicalExpression':
-      return evaluateExpr(node.left, env, ctx).clone().merge(evaluateExpr(node.right, env, ctx));
+    case 'LogicalExpression': {
+      const leftVal = evaluateExpr(node.left, env, ctx);
+      // Short-circuit: false && x → false (never evaluates right), true || x → true
+      // Short-circuit with constant left operand
+      if (node.operator === '&&' || node.operator === '||') {
+        const constLeft = isConstantBool(node.left);
+        if (node.operator === '&&' && constLeft === false) return TaintSet.empty();
+        if (node.operator === '||' && constLeft === true) return leftVal.clone();
+      }
+      // Nullish coalescing: null/undefined ?? x → right side only
+      if (node.operator === '??') {
+        const ln = node.left;
+        const isNullish = (ln.type === 'NullLiteral') ||
+          (ln.type === 'Literal' && ln.value === null) ||
+          (ln.type === 'Identifier' && ln.name === 'undefined');
+        if (isNullish) return evaluateExpr(node.right, env, ctx);
+      }
+      return leftVal.clone().merge(evaluateExpr(node.right, env, ctx));
+    }
 
     case 'UnaryExpression':
       if (node.operator === '!' || node.operator === 'typeof' ||
@@ -1081,7 +1101,19 @@ export function evaluateExpr(node, env, ctx) {
       if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
       const consequentTaint = evaluateExpr(node.consequent, env, ctx);
       if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
-      return consequentTaint.clone().merge(evaluateExpr(node.alternate, env, ctx));
+      const alternateTaint = evaluateExpr(node.alternate, env, ctx);
+      // If either branch is a function reference, register it so ternary function selection works
+      // e.g., var render = cond ? renderHTML : renderText; render(tainted)
+      if (!ctx.returnedFuncNode) {
+        for (const branch of [node.consequent, node.alternate]) {
+          if (branch.type === 'Identifier') {
+            const refKey = resolveId(branch, ctx);
+            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+            if (funcRef) { ctx.returnedFuncNode = funcRef; break; }
+          }
+        }
+      }
+      return consequentTaint.clone().merge(alternateTaint);
     }
 
     case 'TemplateLiteral': {
@@ -1211,7 +1243,9 @@ function evaluateMemberExpr(node, env, ctx) {
 
   const objTaint = evaluateExpr(node.object, env, ctx);
   if (node.computed) {
-    evaluateExpr(node.property, env, ctx);
+    const keyTaint = evaluateExpr(node.property, env, ctx);
+    // If the key is tainted, the attacker controls which property is read — propagate key taint
+    if (keyTaint.tainted) return keyTaint.clone();
     // For computed access obj[key], check if any obj.* properties are tainted
     if (!objTaint.tainted) {
       const objStr = nodeToString(node.object);
@@ -1331,6 +1365,38 @@ function evaluateCallExpr(node, env, ctx) {
     return merged;
   }
 
+  // Object.fromEntries — propagate taint from entries (array of [key, value] pairs)
+  if (calleeStr === 'Object.fromEntries') {
+    return argTaints[0]?.clone() || TaintSet.empty();
+  }
+
+  // Object.defineProperty(obj, prop, descriptor) — propagate taint from descriptor.value to obj.prop
+  if (calleeStr === 'Object.defineProperty' && node.arguments.length >= 3) {
+    const objNode = node.arguments[0];
+    const propNode = node.arguments[1];
+    const descNode = node.arguments[2];
+    if (objNode && propNode && descNode && descNode.type === 'ObjectExpression') {
+      for (const prop of descNode.properties) {
+        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') &&
+            prop.key && (prop.key.name === 'value' || prop.key.value === 'value')) {
+          const valTaint = evaluateExpr(prop.value, env, ctx);
+          if (valTaint.tainted) {
+            const objStr = nodeToString(objNode);
+            const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
+            if (objStr && propName) {
+              env.set(`${objStr}.${propName}`, valTaint);
+              if (objNode.type === 'Identifier') {
+                const key = resolveId(objNode, ctx);
+                env.set(`${key}.${propName}`, valTaint);
+              }
+            }
+          }
+        }
+      }
+    }
+    return TaintSet.empty();
+  }
+
   // Object.values/keys/entries — propagate taint from object properties
   // Object.keys returns property names (strings) — not tainted by values
   if (calleeStr === 'Object.keys') return TaintSet.empty();
@@ -1446,9 +1512,43 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     case 'valueOf': case 'toString':
       return objTaint.clone();
 
+    case 'match': case 'matchAll':
+      // Returns array of matches — preserve taint from the source string
+      return objTaint.clone();
+
+    case 'exec':
+      // RegExp.exec(string) — taint comes from the argument string, not the regex
+      return argTaints[0]?.clone() || TaintSet.empty();
+
+    case 'search': case 'localeCompare':
+      // Returns number — kill taint
+      return TaintSet.empty();
+
     case 'charCodeAt': case 'codePointAt':
       // These return numbers — kill taint
       return TaintSet.empty();
+
+    case 'splice':
+      // Returns removed elements — they carry the array's taint
+      return objTaint.clone();
+
+    case 'bind': {
+      // fn.bind(thisArg) returns a bound function — register it in funcMap
+      // so when the result is called, it resolves to the original function
+      const callee = node.callee?.object;
+      if (callee) {
+        const funcRef = callee.type === 'Identifier'
+          ? (ctx.funcMap.get(resolveId(callee, ctx)) || ctx.funcMap.get(callee.name))
+          : null;
+        if (funcRef) {
+          // Store the thisArg node so analyzeCalledFunction can bind this.* properties
+          const thisArgNode = node.arguments?.[0];
+          if (thisArgNode) funcRef._boundThisArg = nodeToString(thisArgNode);
+          ctx.returnedFuncNode = funcRef;
+        }
+      }
+      return objTaint.clone();
+    }
 
     case 'concat':
       return objTaint.clone().merge(argTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
@@ -1468,9 +1568,14 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     }
 
     case 'filter': case 'find':
-    case 'flat': case 'flatMap': case 'reverse': case 'sort':
+    case 'flat': case 'reverse': case 'sort':
     case 'values': case 'keys': case 'entries':
       return objTaint.clone();
+
+    case 'flatMap': {
+      const cbTaint = analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
+      return objTaint.clone().merge(cbTaint);
+    }
 
     case 'findIndex': case 'indexOf': case 'lastIndexOf':
       // These return a number — kill taint
@@ -1639,6 +1744,9 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
         const loc = node.loc?.start || {};
         return TaintSet.from(new TaintLabel(`storage.${getObjStr === 'localStorage' ? 'local' : 'session'}`, ctx.file, loc.line || 0, loc.column || 0, `${getObjStr}.getItem()`));
       }
+      // If the callee resolves to a user-defined function, let analyzeCalledFunction handle it
+      const getCalleeStr = nodeToString(node.callee);
+      if (getCalleeStr && ctx.funcMap.has(getCalleeStr)) return null;
       return TaintSet.empty();
     }
 
@@ -2018,6 +2126,13 @@ function analyzePromiseCallback(node, argTaints, objTaint, env, ctx) {
   const childEnv = env.child();
   if (callback.params[0]) assignToPattern(callback.params[0], objTaint, childEnv, ctx);
 
+  // If a previous promise callback returned a function node, register it under the
+  // current callback's parameter name so fn() calls inside this callback resolve correctly
+  if (ctx.returnedFuncNode && callback.params[0]?.type === 'Identifier') {
+    ctx.funcMap.set(callback.params[0].name, ctx.returnedFuncNode);
+    ctx.returnedFuncNode = null;
+  }
+
   if (callback.body.type === 'BlockStatement') {
     return analyzeInlineFunction(callback, childEnv, ctx);
   }
@@ -2190,6 +2305,18 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     }
   }
 
+  // Handle bound this context from fn.bind(thisArg)
+  if (funcNode._boundThisArg) {
+    const boundName = funcNode._boundThisArg;
+    const boundTaint = env.get(boundName);
+    if (boundTaint.tainted) childEnv.set('this', boundTaint);
+    const boundBindings = env.getTaintedWithPrefix(`${boundName}.`);
+    for (const [key, taint] of boundBindings) {
+      const propName = key.slice(boundName.length + 1);
+      childEnv.set(`this.${propName}`, taint);
+    }
+  }
+
   // Store function expression arguments in funcMap so they can be called inside the body
   // Handles: doRender(function(html) { ... }) → fn(x) resolves fn to the passed function
   const innerFuncMap = new Map(ctx.funcMap);
@@ -2299,7 +2426,16 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
 // ── For-in/of binding ──
 function processForBinding(node, env, ctx) {
-  const iterableTaint = evaluateExpr(node.right, env, ctx);
+  let iterableTaint = evaluateExpr(node.right, env, ctx);
+  // For Maps/objects with per-key taint, merge per-key entries into iterable taint
+  const iterStr = nodeToString(node.right);
+  if (iterStr) {
+    const perKeyTaints = env.getTaintedWithPrefix(`${iterStr}.#key_`);
+    if (perKeyTaints.size > 0) {
+      iterableTaint = iterableTaint.clone();
+      for (const [, taint] of perKeyTaints) iterableTaint.merge(taint);
+    }
+  }
   if (node.left.type === 'VariableDeclaration') {
     for (const decl of node.left.declarations) assignToPattern(decl.id, iterableTaint, env, ctx);
   } else {

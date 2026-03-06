@@ -44491,7 +44491,9 @@ ${rootStack}`;
         const key = resolveId(node, ctx);
         const taint = env.get(key);
         if (taint.tainted) return taint.clone();
-        return env.get(`global:${node.name}`).clone();
+        const globalTaint = env.get(`global:${node.name}`);
+        if (globalTaint.tainted) return globalTaint.clone();
+        return env.get(node.name).clone();
       }
       case "MemberExpression":
       case "OptionalMemberExpression":
@@ -44513,8 +44515,20 @@ ${rootStack}`;
         if (op === "-" || op === "*" || op === "/" || op === "%" || op === "**" || op === "|" || op === "&" || op === "^" || op === "<<" || op === ">>" || op === ">>>") return TaintSet.empty();
         return leftT.clone().merge(rightT);
       }
-      case "LogicalExpression":
-        return evaluateExpr(node.left, env, ctx).clone().merge(evaluateExpr(node.right, env, ctx));
+      case "LogicalExpression": {
+        const leftVal = evaluateExpr(node.left, env, ctx);
+        if (node.operator === "&&" || node.operator === "||") {
+          const constLeft = isConstantBool(node.left);
+          if (node.operator === "&&" && constLeft === false) return TaintSet.empty();
+          if (node.operator === "||" && constLeft === true) return leftVal.clone();
+        }
+        if (node.operator === "??") {
+          const ln = node.left;
+          const isNullish = ln.type === "NullLiteral" || ln.type === "Literal" && ln.value === null || ln.type === "Identifier" && ln.name === "undefined";
+          if (isNullish) return evaluateExpr(node.right, env, ctx);
+        }
+        return leftVal.clone().merge(evaluateExpr(node.right, env, ctx));
+      }
       case "UnaryExpression":
         if (node.operator === "!" || node.operator === "typeof" || node.operator === "+" || node.operator === "-" || node.operator === "~" || node.operator === "void") {
           return TaintSet.empty();
@@ -44529,7 +44543,20 @@ ${rootStack}`;
         if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
         const consequentTaint = evaluateExpr(node.consequent, env, ctx);
         if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
-        return consequentTaint.clone().merge(evaluateExpr(node.alternate, env, ctx));
+        const alternateTaint = evaluateExpr(node.alternate, env, ctx);
+        if (!ctx.returnedFuncNode) {
+          for (const branch of [node.consequent, node.alternate]) {
+            if (branch.type === "Identifier") {
+              const refKey = resolveId(branch, ctx);
+              const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+              if (funcRef) {
+                ctx.returnedFuncNode = funcRef;
+                break;
+              }
+            }
+          }
+        }
+        return consequentTaint.clone().merge(alternateTaint);
       }
       case "TemplateLiteral": {
         const t = TaintSet.empty();
@@ -44637,7 +44664,8 @@ ${rootStack}`;
     }
     const objTaint = evaluateExpr(node.object, env, ctx);
     if (node.computed) {
-      evaluateExpr(node.property, env, ctx);
+      const keyTaint = evaluateExpr(node.property, env, ctx);
+      if (keyTaint.tainted) return keyTaint.clone();
       if (!objTaint.tainted) {
         const objStr = nodeToString(node.object);
         if (objStr) {
@@ -44765,6 +44793,33 @@ ${rootStack}`;
       for (const t of argTaints) merged.merge(t);
       return merged;
     }
+    if (calleeStr === "Object.fromEntries") {
+      return argTaints[0]?.clone() || TaintSet.empty();
+    }
+    if (calleeStr === "Object.defineProperty" && node.arguments.length >= 3) {
+      const objNode = node.arguments[0];
+      const propNode = node.arguments[1];
+      const descNode = node.arguments[2];
+      if (objNode && propNode && descNode && descNode.type === "ObjectExpression") {
+        for (const prop of descNode.properties) {
+          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key && (prop.key.name === "value" || prop.key.value === "value")) {
+            const valTaint = evaluateExpr(prop.value, env, ctx);
+            if (valTaint.tainted) {
+              const objStr = nodeToString(objNode);
+              const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
+              if (objStr && propName) {
+                env.set(`${objStr}.${propName}`, valTaint);
+                if (objNode.type === "Identifier") {
+                  const key = resolveId(objNode, ctx);
+                  env.set(`${key}.${propName}`, valTaint);
+                }
+              }
+            }
+          }
+        }
+      }
+      return TaintSet.empty();
+    }
     if (calleeStr === "Object.keys") return TaintSet.empty();
     if (calleeStr === "Object.values" || calleeStr === "Object.entries") {
       const argTaint = argTaints[0] || TaintSet.empty();
@@ -44865,9 +44920,31 @@ ${rootStack}`;
       case "valueOf":
       case "toString":
         return objTaint.clone();
+      case "match":
+      case "matchAll":
+        return objTaint.clone();
+      case "exec":
+        return argTaints[0]?.clone() || TaintSet.empty();
+      case "search":
+      case "localeCompare":
+        return TaintSet.empty();
       case "charCodeAt":
       case "codePointAt":
         return TaintSet.empty();
+      case "splice":
+        return objTaint.clone();
+      case "bind": {
+        const callee = node.callee?.object;
+        if (callee) {
+          const funcRef = callee.type === "Identifier" ? ctx.funcMap.get(resolveId(callee, ctx)) || ctx.funcMap.get(callee.name) : null;
+          if (funcRef) {
+            const thisArgNode = node.arguments?.[0];
+            if (thisArgNode) funcRef._boundThisArg = nodeToString(thisArgNode);
+            ctx.returnedFuncNode = funcRef;
+          }
+        }
+        return objTaint.clone();
+      }
       case "concat":
         return objTaint.clone().merge(argTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
       case "replace":
@@ -44884,13 +44961,16 @@ ${rootStack}`;
       case "filter":
       case "find":
       case "flat":
-      case "flatMap":
       case "reverse":
       case "sort":
       case "values":
       case "keys":
       case "entries":
         return objTaint.clone();
+      case "flatMap": {
+        const cbTaint = analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
+        return objTaint.clone().merge(cbTaint);
+      }
       case "findIndex":
       case "indexOf":
       case "lastIndexOf":
@@ -45035,6 +45115,8 @@ ${rootStack}`;
           const loc = node.loc?.start || {};
           return TaintSet.from(new TaintLabel(`storage.${getObjStr === "localStorage" ? "local" : "session"}`, ctx.file, loc.line || 0, loc.column || 0, `${getObjStr}.getItem()`));
         }
+        const getCalleeStr = nodeToString(node.callee);
+        if (getCalleeStr && ctx.funcMap.has(getCalleeStr)) return null;
         return TaintSet.empty();
       }
       case "getItem": {
@@ -45325,6 +45407,10 @@ ${rootStack}`;
     if (callback.type !== "ArrowFunctionExpression" && callback.type !== "FunctionExpression") return objTaint.clone();
     const childEnv = env.child();
     if (callback.params[0]) assignToPattern(callback.params[0], objTaint, childEnv, ctx);
+    if (ctx.returnedFuncNode && callback.params[0]?.type === "Identifier") {
+      ctx.funcMap.set(callback.params[0].name, ctx.returnedFuncNode);
+      ctx.returnedFuncNode = null;
+    }
     if (callback.body.type === "BlockStatement") {
       return analyzeInlineFunction(callback, childEnv, ctx);
     }
@@ -45462,6 +45548,16 @@ ${rootStack}`;
         }
       }
     }
+    if (funcNode._boundThisArg) {
+      const boundName = funcNode._boundThisArg;
+      const boundTaint = env.get(boundName);
+      if (boundTaint.tainted) childEnv.set("this", boundTaint);
+      const boundBindings = env.getTaintedWithPrefix(`${boundName}.`);
+      for (const [key, taint] of boundBindings) {
+        const propName = key.slice(boundName.length + 1);
+        childEnv.set(`this.${propName}`, taint);
+      }
+    }
     const innerFuncMap = new Map(ctx.funcMap);
     for (let i = 0; i < funcNode.params.length; i++) {
       const param = funcNode.params[i];
@@ -45541,7 +45637,15 @@ ${rootStack}`;
     return result;
   }
   function processForBinding(node, env, ctx) {
-    const iterableTaint = evaluateExpr(node.right, env, ctx);
+    let iterableTaint = evaluateExpr(node.right, env, ctx);
+    const iterStr = nodeToString(node.right);
+    if (iterStr) {
+      const perKeyTaints = env.getTaintedWithPrefix(`${iterStr}.#key_`);
+      if (perKeyTaints.size > 0) {
+        iterableTaint = iterableTaint.clone();
+        for (const [, taint] of perKeyTaints) iterableTaint.merge(taint);
+      }
+    }
     if (node.left.type === "VariableDeclaration") {
       for (const decl of node.left.declarations) assignToPattern(decl.id, iterableTaint, env, ctx);
     } else {
