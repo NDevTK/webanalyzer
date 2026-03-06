@@ -31,9 +31,6 @@ export function analyze(source, { file = 'test.js', isModule = false, globalEnv 
 
   const env = globalEnv ? globalEnv.child() : new TaintEnv();
 
-  // Set up postMessage taint for message handlers
-  setupMessageHandlerTaint(ast, env, file);
-
   const cfg = buildCFG(ast.program);
   const findings = analyzeCFG(cfg, env, file, funcMap, globalEnv || new TaintEnv(), scopeInfo);
 
@@ -72,7 +69,6 @@ export function analyzeMultiple(scripts) {
     for (const [k, v] of funcMap) globalFuncMap.set(k, v);
 
     const env = globalEnv.child();
-    setupMessageHandlerTaint(ast, env, file || 'test.js');
 
     const cfg = buildCFG(ast.program);
     const findings = analyzeCFG(cfg, env, file || 'test.js', funcMap, globalEnv, scopeInfo);
@@ -82,42 +78,6 @@ export function analyzeMultiple(scripts) {
   }
 
   return allFindings;
-}
-
-function setupMessageHandlerTaint(ast, env, file) {
-  walkAST(ast.program, (node) => {
-    if (node.type !== 'CallExpression') return;
-    if (node.callee?.type !== 'MemberExpression') return;
-    if (node.callee.property?.name !== 'addEventListener') return;
-    const firstArg = node.arguments[0];
-    if (!firstArg || firstArg.value !== 'message') return;
-    const handler = node.arguments[1];
-    if (!handler || (handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression')) return;
-
-    const checksOrigin = containsOriginCheck(handler.body);
-    if (!checksOrigin && handler.params[0]?.type === 'Identifier') {
-      const paramName = handler.params[0].name;
-      const loc = handler.loc?.start || {};
-      const label = new TaintLabel('postMessage.data', file, loc.line || 0, loc.column || 0, `${paramName}.data (no origin check)`);
-      env.set(`${paramName}.data`, TaintSet.from(label));
-      env.set(paramName, TaintSet.from(label));
-    }
-  });
-
-  walkAST(ast.program, (node) => {
-    if (node.type !== 'AssignmentExpression') return;
-    const leftStr = nodeToString(node.left);
-    if (leftStr !== 'window.onmessage' && leftStr !== 'onmessage' && leftStr !== 'self.onmessage') return;
-    const handler = node.right;
-    if (handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression') return;
-    if (!containsOriginCheck(handler.body) && handler.params[0]?.name) {
-      const paramName = handler.params[0].name;
-      const loc = handler.loc?.start || {};
-      const label = new TaintLabel('postMessage.data', file, loc.line || 0, loc.column || 0, `${paramName}.data (no origin check)`);
-      env.set(`${paramName}.data`, TaintSet.from(label));
-      env.set(paramName, TaintSet.from(label));
-    }
-  });
 }
 
 function walkAST(node, visitor) {
@@ -136,20 +96,3 @@ function walkAST(node, visitor) {
   }
 }
 
-function containsOriginCheck(node) {
-  if (!node || typeof node !== 'object') return false;
-  if (node.type === 'BinaryExpression' && (node.operator === '===' || node.operator === '==' || node.operator === '!==' || node.operator === '!=')) {
-    const l = nodeToString(node.left), r = nodeToString(node.right);
-    if ((l && l.endsWith('.origin')) || (r && r.endsWith('.origin'))) return true;
-  }
-  for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end') continue;
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        if (item && typeof item === 'object' && item.type && containsOriginCheck(item)) return true;
-      }
-    } else if (child && typeof child === 'object' && child.type && containsOriginCheck(child)) return true;
-  }
-  return false;
-}

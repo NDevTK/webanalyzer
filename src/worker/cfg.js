@@ -212,7 +212,9 @@ function buildIf(stmt, current, cfg, ctx) {
   const thenBlock = cfg.createBlock();
   const joinBlock = cfg.createBlock();
 
-  // True edge
+  // True edge — annotate with the branch condition for path-sensitive analysis
+  thenBlock.branchCondition = stmt.test;
+  thenBlock.branchPolarity = true;
   current.connect(thenBlock);
   const afterThen = buildStatement(stmt.consequent, thenBlock, cfg, ctx);
   if (afterThen) afterThen.connect(joinBlock);
@@ -220,10 +222,19 @@ function buildIf(stmt, current, cfg, ctx) {
   // False edge
   if (stmt.alternate) {
     const elseBlock = cfg.createBlock();
+    elseBlock.branchCondition = stmt.test;
+    elseBlock.branchPolarity = false;
     current.connect(elseBlock);
     const afterElse = buildStatement(stmt.alternate, elseBlock, cfg, ctx);
     if (afterElse) afterElse.connect(joinBlock);
   } else {
+    // No else clause: fall-through represents the false branch.
+    // If the consequent terminates (return/throw/break), the join block only
+    // executes when the test is FALSE — annotate with negated condition.
+    if (!afterThen) {
+      joinBlock.branchCondition = stmt.test;
+      joinBlock.branchPolarity = false;
+    }
     current.connect(joinBlock);
   }
 

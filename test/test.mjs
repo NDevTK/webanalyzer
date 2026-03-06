@@ -24,7 +24,7 @@ function test(name, fn) {
 }
 
 function expect(findings) {
-  return {
+  const obj = {
     toHaveType(type) {
       const found = findings.some(f => f.type === type);
       if (!found) throw new Error(`Expected finding of type "${type}" but got: [${findings.map(f => f.type).join(', ') || 'none'}]`);
@@ -42,7 +42,13 @@ function expect(findings) {
       const found = findings.some(f => f.type === type);
       if (found) throw new Error(`Expected no "${type}" finding but got one: ${findings.filter(f => f.type === type).map(f => f.title).join('; ')}`);
     },
+    get not() {
+      return {
+        toHaveType(type) { obj.notToHaveType(type); },
+      };
+    },
   };
+  return obj;
 }
 
 
@@ -1907,6 +1913,234 @@ test('message handler that only logs, does not sink', () => {
 });
 
 
+// ─── postMessage: weak origin checks (should still flag) ─────
+
+console.log('\n--- postMessage: weak origin checks ---');
+
+test('origin === "null" is weak (sandboxed iframe bypass)', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin === 'null') {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('origin.includes() is weak (substring bypass)', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin.includes('trusted.com')) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('origin.indexOf() is weak (substring bypass)', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin.indexOf('trusted') !== -1) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('origin.endsWith() is weak (prefix bypass)', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(event) {
+      if (event.origin.endsWith('trusted.com')) {
+        document.body.innerHTML = event.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('unanchored regex is weak', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (/trusted\\.com/.test(e.origin)) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('origin.startsWith("http") is weak (not an origin check)', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin.startsWith('http')) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('origin === "" is weak (empty string)', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin === '') return;
+      document.body.innerHTML = e.data;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('origin compared to bare domain (no scheme) is weak', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin === 'trusted.com') {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('custom weak validator (uses includes) still flags', () => {
+  const { findings } = analyze(`
+    function isAllowed(origin) {
+      return origin.includes('trusted.com');
+    }
+    window.addEventListener('message', function(e) {
+      if (isAllowed(e.origin)) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('onmessage with origin === "null" is weak', () => {
+  const { findings } = analyze(`
+    window.onmessage = function(e) {
+      if (e.origin === 'null') {
+        document.body.innerHTML = e.data;
+      }
+    };
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('origin === "*" is weak (wildcard)', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin === '*') {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── postMessage: strong origin checks (should suppress) ─────
+
+console.log('\n--- postMessage: strong origin checks ---');
+
+test('origin === full https URL is strong', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin === 'https://trusted.example.com') {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('origin.startsWith with full origin is strong', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin.startsWith('https://trusted.com')) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('allowList.includes(origin) is strong', () => {
+  const { findings } = analyze(`
+    var allowed = ['https://a.com', 'https://b.com'];
+    window.addEventListener('message', function(e) {
+      if (allowed.includes(e.origin)) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('anchored regex is strong', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (/^https:\\/\\/trusted\\.com$/.test(e.origin)) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('custom strong validator (uses === full origin) suppresses', () => {
+  const { findings } = analyze(`
+    function checkOrigin(o) {
+      return o === 'https://trusted.com';
+    }
+    window.addEventListener('message', function(e) {
+      if (checkOrigin(e.origin)) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('custom validator with allowlist is strong', () => {
+  const { findings } = analyze(`
+    var ALLOWED = ['https://a.com', 'https://b.com'];
+    function validateOrigin(origin) {
+      return ALLOWED.includes(origin);
+    }
+    window.addEventListener('message', function(e) {
+      if (validateOrigin(e.origin)) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('origin compared to variable is strong (benefit of doubt)', () => {
+  const { findings } = analyze(`
+    var expectedOrigin = 'https://partner.com';
+    window.addEventListener('message', function(e) {
+      if (e.origin === expectedOrigin) {
+        document.body.innerHTML = e.data;
+      }
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('origin !== full URL with early return is strong', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      if (e.origin !== 'https://trusted.com') return;
+      document.body.innerHTML = e.data;
+    });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+
 // ─── Safe: DOM reads ────────────────────────────────────
 
 console.log('\n--- Safe: DOM reads ---');
@@ -2521,6 +2755,239 @@ test('factory returns function that sanitizes', () => {
     document.body.innerHTML = sanitize(location.hash);
   `);
   expect(findings).toBeEmpty();
+});
+
+
+// ╔═══════════════════════════════════════════════════════╗
+// ║  OPEN REDIRECT vs XSS — navigation sink classification ║
+// ╚═══════════════════════════════════════════════════════╝
+
+// Navigation sinks (location.href, location.assign, etc.) are classified as:
+// - XSS when javascript: URIs are possible (no scheme validation)
+// - Open Redirect when the URL scheme is validated (http/https only)
+
+console.log('\n--- Open Redirect vs XSS: positive (Open Redirect) ---');
+
+test('startsWith http → location.href is Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (url.startsWith('http')) {
+      location.href = url;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+  expect(findings).not.toHaveType('XSS');
+});
+
+test('startsWith https:// → location.assign is Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = new URLSearchParams(location.search).get('next');
+    if (url.startsWith('https://')) {
+      location.assign(url);
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+  expect(findings).not.toHaveType('XSS');
+});
+
+test('startsWith / (relative URL) → window.location.href is Open Redirect', () => {
+  const { findings } = analyze(`
+    var path = location.hash.slice(1);
+    if (path.startsWith('/')) {
+      window.location.href = path;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('indexOf http === 0 → location.replace is Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = location.search.split('url=')[1];
+    if (url.indexOf('http') === 0) {
+      location.replace(url);
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('url.protocol === https: → window.open is Open Redirect', () => {
+  const { findings } = analyze(`
+    var raw = location.hash.slice(1);
+    var url = new URL(raw);
+    if (url.protocol === 'https:') {
+      window.open(url.href);
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('url.protocol === http: → location.href is Open Redirect', () => {
+  const { findings } = analyze(`
+    var raw = location.search.split('redirect=')[1];
+    var parsed = new URL(raw);
+    if (parsed.protocol === 'http:') {
+      location.href = parsed.href;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('negated javascript: check → Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (!url.startsWith('javascript:')) {
+      location.href = url;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('protocol !== javascript: → Open Redirect', () => {
+  const { findings } = analyze(`
+    var raw = location.search.split('url=')[1];
+    var parsed = new URL(raw);
+    if (parsed.protocol !== 'javascript:') {
+      window.location.href = parsed.href;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('regex test /^https?:/ → Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (/^https?:\\/\\//.test(url)) {
+      location.href = url;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('url.match regex → Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (url.match(/^https?:/)) {
+      location.assign(url);
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('early return guard: if (!startsWith http) return → Open Redirect', () => {
+  const { findings } = analyze(`
+    function redirect() {
+      var url = location.hash.slice(1);
+      if (!url.startsWith('http')) return;
+      location.href = url;
+    }
+    redirect();
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('slice comparison → Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (url.slice(0, 4) === 'http') {
+      location.href = url;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+test('logical AND with scheme check → Open Redirect', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (url && url.startsWith('https://')) {
+      location.href = url;
+    }
+  `);
+  expect(findings).toHaveType('Open Redirect');
+});
+
+console.log('\n--- Open Redirect vs XSS: positive (XSS — no scheme check) ---');
+
+test('no scheme check → location.href is XSS', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    location.href = url;
+  `);
+  expect(findings).toHaveType('XSS');
+  expect(findings).not.toHaveType('Open Redirect');
+});
+
+test('no scheme check → location.assign is XSS', () => {
+  const { findings } = analyze(`
+    var next = location.search.split('url=')[1];
+    location.assign(next);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('no scheme check → window.open is XSS', () => {
+  const { findings } = analyze(`
+    var url = new URLSearchParams(location.search).get('next');
+    window.open(url);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('no scheme check → window.location.replace is XSS', () => {
+  const { findings } = analyze(`
+    var url = location.search.split('url=')[1];
+    window.location.replace(url);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('irrelevant check (length) still XSS', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (url.length > 0) {
+      location.href = url;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+  expect(findings).not.toHaveType('Open Redirect');
+});
+
+test('innerHTML remains XSS even with scheme check', () => {
+  const { findings } = analyze(`
+    var data = location.hash.slice(1);
+    if (data.startsWith('http')) {
+      document.body.innerHTML = data;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+  expect(findings).not.toHaveType('Open Redirect');
+});
+
+console.log('\n--- Open Redirect vs XSS: negative (safe patterns) ---');
+
+test('scheme check + sanitized URL → no finding', () => {
+  const { findings } = analyze(`
+    var url = location.hash.slice(1);
+    if (url.startsWith('https://')) {
+      var safe = encodeURIComponent(url);
+      location.href = safe;
+    }
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('hardcoded URL → no finding', () => {
+  const { findings } = analyze(`
+    location.href = 'https://example.com';
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('location.href → innerHTML is still XSS (not redirect)', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = location.href;
+  `);
+  expect(findings).toHaveType('XSS');
+  expect(findings).not.toHaveType('Open Redirect');
 });
 
 

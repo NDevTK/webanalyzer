@@ -1,73 +1,13 @@
 /* background.js — MV3 service worker
    Lightweight coordinator: auto-attaches chrome.debugger on tab navigation,
-   collects scripts via CDP, relays to offscreen worker, shows notifications. */
+   collects scripts via CDP, relays to offscreen worker, shows notifications.
+   Findings are stored in IndexedDB by the worker — this file does NOT use IndexedDB. */
 
 // ── State ──
 const attachedTabs = new Map();   // tabId → { origin, scripts: Map<hash,url> }
 const tabFindingCounts = new Map(); // tabId → count (for badge, in-memory only)
 let offscreenReady = false;
 let enabled = true;               // global on/off
-
-// ── IndexedDB for persistent findings (shared with worker + popup) ──
-let _findingsDB = null;
-function openFindingsDB() {
-  if (_findingsDB) return Promise.resolve(_findingsDB);
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('webappsec-findings', 1);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains('findings')) {
-        db.createObjectStore('findings');
-      }
-    };
-    req.onsuccess = () => { _findingsDB = req.result; resolve(req.result); };
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function readFindingsFromDB(tabId) {
-  try {
-    const db = await openFindingsDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction('findings', 'readonly');
-      const store = tx.objectStore('findings');
-      const req = store.get(String(tabId));
-      req.onsuccess = () => resolve(req.result ? req.result.findings : []);
-      req.onerror = () => resolve([]);
-    });
-  } catch { return []; }
-}
-
-async function clearAllFindingsInDB() {
-  try {
-    const db = await openFindingsDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction('findings', 'readwrite');
-      tx.objectStore('findings').clear();
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch { /* non-fatal */ }
-}
-
-async function readAllFindingsFromDB() {
-  try {
-    const db = await openFindingsDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction('findings', 'readonly');
-      const store = tx.objectStore('findings');
-      const req = store.getAll();
-      req.onsuccess = () => {
-        const all = [];
-        for (const record of (req.result || [])) {
-          if (record && record.findings) all.push(...record.findings);
-        }
-        resolve(all);
-      };
-      req.onerror = () => resolve([]);
-    });
-  } catch { return []; }
-}
 
 // ── Offscreen document lifecycle ──
 let offscreenCreating = null;
@@ -115,17 +55,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // ── Message handling (from offscreen / popup) ──
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (sender.origin !== `chrome-extension://${chrome.runtime.id}`) return;
   if (msg.type === 'findings') {
     handleFindings(msg.tabId, msg.findings);
-  } else if (msg.type === 'getFindings') {
-    readFindingsFromDB(msg.tabId).then(f => sendResponse(f));
-    return true; // async response
   } else if (msg.type === 'getEnabled') {
     sendResponse(enabled);
   } else if (msg.type === 'setEnabled') {
     enabled = msg.enabled;
     if (!enabled) {
-      // Detach from all tabs
       for (const tabId of [...attachedTabs.keys()]) detachFromTab(tabId);
     }
     persistState();
@@ -134,17 +71,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     for (const [id, info] of attachedTabs) tabs.push({ id, origin: info.origin });
     sendResponse(tabs);
   } else if (msg.type === 'clearFindings') {
-    clearAllFindingsInDB().then(() => {
-      tabFindingCounts.clear();
-      for (const tabId of attachedTabs.keys()) updateBadge(tabId);
-      // Tell worker to clear its IndexedDB too
-      sendToOffscreen({ type: 'clearFindings' });
-      sendResponse(true);
-    });
-    return true;
-  } else if (msg.type === 'getAllFindings') {
-    readAllFindingsFromDB().then(f => sendResponse(f));
-    return true;
+    // IndexedDB is cleared by the side panel and/or offscreen worker.
+    // We just reset badge counts here.
+    tabFindingCounts.clear();
+    for (const tabId of attachedTabs.keys()) updateBadge(tabId);
+    sendToOffscreen({ type: 'clearFindings' });
+    persistState();
   }
   return true;
 });
@@ -152,12 +84,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ── Attach / Detach debugger ──
 async function attachToTab(tabId, url) {
   if (attachedTabs.has(tabId)) {
-    // Already attached — if same tab navigated, reset its state
+    // Already attached — tab navigated, reset its state
     const tabState = attachedTabs.get(tabId);
     const newOrigin = safeOrigin(url);
     tabState.origin = newOrigin;
     tabState.pageUrl = url;
     tabState.scripts.clear();
+    tabFindingCounts.delete(tabId);
+    updateBadge(tabId);
     sendToOffscreen({ type: 'resetPage', tabId, origin: newOrigin });
     return;
   }
@@ -213,8 +147,6 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
     await handleNetworkResponse(tabId, tabState, params);
   } else if (method === 'Target.attachedToTarget') {
     // New child target (iframe, about:blank frame, worker, etc.)
-    // With flatten: true, we can send commands to child sessions
-    // The Debugger.scriptParsed events from child frames are automatically forwarded
   }
 });
 
@@ -225,12 +157,9 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 // ── Script collection ──
 async function handleScriptParsed(tabId, tabState, params) {
-  const { scriptId, url, isModule, startLine, startColumn, executionContextAuxData } = params;
+  const { scriptId, url, isModule, startLine, startColumn } = params;
   // Skip extension scripts only — allow about:blank, data: URIs, blob: URIs, etc.
   if (url && (url.startsWith('chrome-extension://') || url.startsWith('extensions::'))) return;
-
-  // Track frame context for cross-frame analysis
-  const frameUrl = executionContextAuxData?.frameId || '';
 
   let scriptSource;
   try {
@@ -292,18 +221,19 @@ async function handleNetworkResponse(tabId, tabState, params) {
   });
 }
 
-// ── Findings ──
-// The worker already deduplicates and stores in IndexedDB.
-// The background just receives novel findings for badge/notification updates.
+// ── Findings (from offscreen worker) ──
 function handleFindings(tabId, newFindings) {
   if (!newFindings || newFindings.length === 0) return;
 
-  // Update in-memory count for badge
+  // Update badge count
   const current = tabFindingCounts.get(tabId) || 0;
   tabFindingCounts.set(tabId, current + newFindings.length);
   updateBadge(tabId);
   showNotification(tabId, newFindings.length, newFindings);
   persistState();
+
+  // Signal the side panel to refresh from IndexedDB
+  chrome.storage.session.set({ findingsSignal: Date.now() }).catch(() => {});
 }
 
 function showNotification(tabId, count, findings) {
@@ -353,6 +283,11 @@ async function restoreState() {
   }
   if (data.enabled !== undefined) enabled = data.enabled;
 }
+
+// ── Side panel: open on action click ──
+chrome.action.onClicked.addListener((tab) => {
+  chrome.sidePanel.open({ tabId: tab.id });
+});
 
 // ── Startup ──
 restoreState();

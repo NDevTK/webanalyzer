@@ -71,11 +71,11 @@ export const ASSIGNMENT_SINKS = {
   'innerHTML': { type: 'XSS', argIndex: 'rhs' },
   'outerHTML': { type: 'XSS', argIndex: 'rhs' },
   'srcdoc': { type: 'XSS', argIndex: 'rhs' },
-  // javascript: URI injection via location assignment (XSS)
-  'location.href': { type: 'XSS', argIndex: 'rhs' },
-  'window.location.href': { type: 'XSS', argIndex: 'rhs' },
-  'window.location': { type: 'XSS', argIndex: 'rhs' },
-  'location': { type: 'XSS', argIndex: 'rhs' },
+  // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
+  'location.href': { type: 'XSS', argIndex: 'rhs', navigation: true },
+  'window.location.href': { type: 'XSS', argIndex: 'rhs', navigation: true },
+  'window.location': { type: 'XSS', argIndex: 'rhs', navigation: true },
+  'location': { type: 'XSS', argIndex: 'rhs', navigation: true },
 };
 
 // Call sinks: function(taintedArg)
@@ -95,12 +95,12 @@ export const CALL_SINKS = {
   '$.append': { type: 'XSS', taintedArgs: [0] },
   'jQuery.append': { type: 'XSS', taintedArgs: [0] },
   '$.prepend': { type: 'XSS', taintedArgs: [0] },
-  // javascript: URI injection via navigation (XSS)
-  'location.assign': { type: 'XSS', taintedArgs: [0] },
-  'location.replace': { type: 'XSS', taintedArgs: [0] },
-  'window.open': { type: 'XSS', taintedArgs: [0] },
-  'window.location.assign': { type: 'XSS', taintedArgs: [0] },
-  'window.location.replace': { type: 'XSS', taintedArgs: [0] },
+  // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
+  'location.assign': { type: 'XSS', taintedArgs: [0], navigation: true },
+  'location.replace': { type: 'XSS', taintedArgs: [0], navigation: true },
+  'window.open': { type: 'XSS', taintedArgs: [0], navigation: true },
+  'window.location.assign': { type: 'XSS', taintedArgs: [0], navigation: true },
+  'window.location.replace': { type: 'XSS', taintedArgs: [0], navigation: true },
   // Script injection
   'document.createElement': { type: 'Script Injection', taintedArgs: [0], checkValue: 'script' },
   // Fetch with tainted URL (SSRF-like in browser context, but mainly for data exfil)

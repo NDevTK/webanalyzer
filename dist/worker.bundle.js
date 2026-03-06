@@ -15323,7 +15323,7 @@ ${trace}`);
       exports.isNumberLiteral = isNumberLiteral;
       exports.isNumberLiteralTypeAnnotation = isNumberLiteralTypeAnnotation;
       exports.isNumberTypeAnnotation = isNumberTypeAnnotation;
-      exports.isNumericLiteral = isNumericLiteral;
+      exports.isNumericLiteral = isNumericLiteral2;
       exports.isObjectExpression = isObjectExpression;
       exports.isObjectMember = isObjectMember;
       exports.isObjectMethod = isObjectMethod;
@@ -15365,7 +15365,7 @@ ${trace}`);
       exports.isStandardized = isStandardized;
       exports.isStatement = isStatement;
       exports.isStaticBlock = isStaticBlock;
-      exports.isStringLiteral = isStringLiteral;
+      exports.isStringLiteral = isStringLiteral2;
       exports.isStringLiteralTypeAnnotation = isStringLiteralTypeAnnotation;
       exports.isStringTypeAnnotation = isStringTypeAnnotation;
       exports.isSuper = isSuper;
@@ -15599,12 +15599,12 @@ ${trace}`);
         if (node.type !== "LabeledStatement") return false;
         return opts == null || (0, _shallowEqual.default)(node, opts);
       }
-      function isStringLiteral(node, opts) {
+      function isStringLiteral2(node, opts) {
         if (!node) return false;
         if (node.type !== "StringLiteral") return false;
         return opts == null || (0, _shallowEqual.default)(node, opts);
       }
-      function isNumericLiteral(node, opts) {
+      function isNumericLiteral2(node, opts) {
         if (!node) return false;
         if (node.type !== "NumericLiteral") return false;
         return opts == null || (0, _shallowEqual.default)(node, opts);
@@ -40437,7 +40437,7 @@ ${str}
         isNewExpression,
         isPlaceholder,
         isStatement,
-        isStringLiteral,
+        isStringLiteral: isStringLiteral2,
         removePropertiesDeep,
         traverse: traverse2
       } = _t;
@@ -40486,7 +40486,7 @@ ${str}
           return;
         } else if (isIdentifier(node) || isJSXIdentifier(node)) {
           name = node.name;
-        } else if (isStringLiteral(node)) {
+        } else if (isStringLiteral2(node)) {
           name = node.value;
         } else {
           return;
@@ -40503,7 +40503,7 @@ ${str}
           key
         } = ancestors[ancestors.length - 1];
         let type;
-        if (isStringLiteral(node) || isPlaceholder(node, {
+        if (isStringLiteral2(node) || isPlaceholder(node, {
           expectedNode: "StringLiteral"
         })) {
           type = "string";
@@ -40600,7 +40600,7 @@ ${str}
         expressionStatement,
         identifier,
         isStatement,
-        isStringLiteral,
+        isStringLiteral: isStringLiteral2,
         stringLiteral,
         validate
       } = _t;
@@ -40650,7 +40650,7 @@ ${str}
           if (typeof replacement === "string") {
             replacement = stringLiteral(replacement);
           }
-          if (!replacement || !isStringLiteral(replacement)) {
+          if (!replacement || !isStringLiteral2(replacement)) {
             throw new Error("Expected string substitution");
           }
         } else if (placeholder.type === "statement") {
@@ -41568,7 +41568,7 @@ ${rootStack}`;
         isExpression,
         isIdentifier,
         isLiteral,
-        isStringLiteral,
+        isStringLiteral: isStringLiteral2,
         isType,
         matchesPattern: _matchesPattern
       } = _t;
@@ -41638,7 +41638,7 @@ ${rootStack}`;
       }
       function referencesImport(moduleSource, importName) {
         if (!this.isReferencedIdentifier()) {
-          if (this.isJSXMemberExpression() && this.node.property.name === importName || (this.isMemberExpression() || this.isOptionalMemberExpression()) && (this.node.computed ? isStringLiteral(this.node.property, {
+          if (this.isJSXMemberExpression() && this.node.property.name === importName || (this.isMemberExpression() || this.isOptionalMemberExpression()) && (this.node.computed ? isStringLiteral2(this.node.property, {
             value: importName
           }) : this.node.property.name === importName)) {
             const object = this.get("object");
@@ -43342,15 +43342,23 @@ ${rootStack}`;
     current.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
     const thenBlock = cfg.createBlock();
     const joinBlock = cfg.createBlock();
+    thenBlock.branchCondition = stmt.test;
+    thenBlock.branchPolarity = true;
     current.connect(thenBlock);
     const afterThen = buildStatement(stmt.consequent, thenBlock, cfg, ctx);
     if (afterThen) afterThen.connect(joinBlock);
     if (stmt.alternate) {
       const elseBlock = cfg.createBlock();
+      elseBlock.branchCondition = stmt.test;
+      elseBlock.branchPolarity = false;
       current.connect(elseBlock);
       const afterElse = buildStatement(stmt.alternate, elseBlock, cfg, ctx);
       if (afterElse) afterElse.connect(joinBlock);
     } else {
+      if (!afterThen) {
+        joinBlock.branchCondition = stmt.test;
+        joinBlock.branchPolarity = false;
+      }
       current.connect(joinBlock);
     }
     return joinBlock.predecessors.length > 0 ? joinBlock : null;
@@ -43547,11 +43555,11 @@ ${rootStack}`;
     "innerHTML": { type: "XSS", argIndex: "rhs" },
     "outerHTML": { type: "XSS", argIndex: "rhs" },
     "srcdoc": { type: "XSS", argIndex: "rhs" },
-    // javascript: URI injection via location assignment (XSS)
-    "location.href": { type: "XSS", argIndex: "rhs" },
-    "window.location.href": { type: "XSS", argIndex: "rhs" },
-    "window.location": { type: "XSS", argIndex: "rhs" },
-    "location": { type: "XSS", argIndex: "rhs" }
+    // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
+    "location.href": { type: "XSS", argIndex: "rhs", navigation: true },
+    "window.location.href": { type: "XSS", argIndex: "rhs", navigation: true },
+    "window.location": { type: "XSS", argIndex: "rhs", navigation: true },
+    "location": { type: "XSS", argIndex: "rhs", navigation: true }
   };
   var CALL_SINKS = {
     "eval": { type: "XSS", taintedArgs: [0] },
@@ -43569,12 +43577,12 @@ ${rootStack}`;
     "$.append": { type: "XSS", taintedArgs: [0] },
     "jQuery.append": { type: "XSS", taintedArgs: [0] },
     "$.prepend": { type: "XSS", taintedArgs: [0] },
-    // javascript: URI injection via navigation (XSS)
-    "location.assign": { type: "XSS", taintedArgs: [0] },
-    "location.replace": { type: "XSS", taintedArgs: [0] },
-    "window.open": { type: "XSS", taintedArgs: [0] },
-    "window.location.assign": { type: "XSS", taintedArgs: [0] },
-    "window.location.replace": { type: "XSS", taintedArgs: [0] },
+    // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
+    "location.assign": { type: "XSS", taintedArgs: [0], navigation: true },
+    "location.replace": { type: "XSS", taintedArgs: [0], navigation: true },
+    "window.open": { type: "XSS", taintedArgs: [0], navigation: true },
+    "window.location.assign": { type: "XSS", taintedArgs: [0], navigation: true },
+    "window.location.replace": { type: "XSS", taintedArgs: [0], navigation: true },
     // Script injection
     "document.createElement": { type: "Script Injection", taintedArgs: [0], checkValue: "script" }
     // Fetch with tainted URL (SSRF-like in browser context, but mainly for data exfil)
@@ -43698,6 +43706,7 @@ ${rootStack}`;
     constructor(parent) {
       this.bindings = /* @__PURE__ */ new Map();
       this.parent = parent || null;
+      this.schemeCheckedVars = /* @__PURE__ */ new Set();
     }
     get(key) {
       if (this.bindings.has(key)) return this.bindings.get(key);
@@ -43716,6 +43725,7 @@ ${rootStack}`;
     clone() {
       const env = new _TaintEnv(this.parent);
       for (const [k, v] of this.bindings) env.bindings.set(k, v.clone());
+      env.schemeCheckedVars = new Set(this.schemeCheckedVars);
       return env;
     }
     mergeFrom(other) {
@@ -43729,6 +43739,17 @@ ${rootStack}`;
           const before = existing.size;
           existing.merge(taint);
           if (existing.size !== before) changed = true;
+        }
+      }
+      if (this.schemeCheckedVars.size === 0 && other.schemeCheckedVars.size > 0) {
+        for (const v of other.schemeCheckedVars) this.schemeCheckedVars.add(v);
+        changed = true;
+      } else if (this.schemeCheckedVars.size > 0 && other.schemeCheckedVars.size > 0) {
+        for (const v of this.schemeCheckedVars) {
+          if (!other.schemeCheckedVars.has(v)) {
+            this.schemeCheckedVars.delete(v);
+            changed = true;
+          }
         }
       }
       return changed;
@@ -43748,6 +43769,20 @@ ${rootStack}`;
         if (!otherTaint || !taint.equals(otherTaint)) return false;
       }
       return true;
+    }
+    // Collect all tainted bindings matching a prefix (walks parent chain)
+    getTaintedWithPrefix(prefix) {
+      const results = /* @__PURE__ */ new Map();
+      let env = this;
+      while (env) {
+        for (const [key, taint] of env.bindings) {
+          if (key.startsWith(prefix) && taint.tainted && !results.has(key)) {
+            results.set(key, taint);
+          }
+        }
+        env = env.parent;
+      }
+      return results;
     }
   };
   var AnalysisContext = class {
@@ -43811,8 +43846,146 @@ ${rootStack}`;
     return findings;
   }
   function processBlock(block, env, ctx) {
+    if (block.branchCondition) {
+      applyBranchCondition(block.branchCondition, block.branchPolarity, env);
+    }
     for (const node of block.nodes) processNode(node, env, ctx);
     return env;
+  }
+  function applyBranchCondition(testNode, polarity, env) {
+    let node = testNode;
+    let positive = polarity;
+    while (node.type === "UnaryExpression" && node.operator === "!") {
+      positive = !positive;
+      node = node.argument;
+    }
+    if (node.type === "LogicalExpression" && node.operator === "&&" && positive) {
+      applyBranchCondition(node.left, true, env);
+      applyBranchCondition(node.right, true, env);
+      return;
+    }
+    if (node.type === "LogicalExpression" && node.operator === "||" && !positive) {
+      applyBranchCondition(node.left, false, env);
+      applyBranchCondition(node.right, false, env);
+      return;
+    }
+    const checkedVar = extractSchemeCheck(node, positive);
+    if (checkedVar) {
+      env.schemeCheckedVars.add(checkedVar);
+    }
+  }
+  function extractSchemeCheck(node, positive) {
+    if (node.type === "CallExpression" && positive) {
+      const callee = node.callee;
+      if (callee.type === "MemberExpression" && callee.property?.name === "startsWith") {
+        const arg = node.arguments[0];
+        if (arg && isStringLiteral(arg)) {
+          const val = stringLiteralValue(arg);
+          if (val === "http" || val === "https" || val === "http:" || val === "https:" || val === "http://" || val === "https://" || val === "/") {
+            return nodeToString(callee.object);
+          }
+        }
+      }
+      if (callee.type === "MemberExpression" && callee.property?.name === "test") {
+        if (callee.object.type === "RegExpLiteral" || callee.object.regex) {
+          const pattern = callee.object.pattern || callee.object.regex?.pattern || "";
+          if (isHttpSchemeRegex(pattern)) {
+            const arg = node.arguments[0];
+            return arg ? nodeToString(arg) : null;
+          }
+        }
+      }
+      if (callee.type === "MemberExpression" && callee.property?.name === "match") {
+        const arg = node.arguments[0];
+        if (arg && (arg.type === "RegExpLiteral" || arg.regex)) {
+          const pattern = arg.pattern || arg.regex?.pattern || "";
+          if (isHttpSchemeRegex(pattern)) {
+            return nodeToString(callee.object);
+          }
+        }
+      }
+    }
+    if (node.type === "CallExpression" && !positive) {
+      const callee = node.callee;
+      if (callee.type === "MemberExpression" && callee.property?.name === "startsWith") {
+        const arg = node.arguments[0];
+        if (arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === "javascript:") {
+          return nodeToString(callee.object);
+        }
+      }
+    }
+    if (node.type === "BinaryExpression") {
+      const op = node.operator;
+      const isEquality = op === "===" || op === "==";
+      const isInequality = op === "!==" || op === "!=";
+      const isEquals = isEquality && positive || isInequality && !positive;
+      const isNotEquals = isInequality && positive || isEquality && !positive;
+      if (isEquals) {
+        const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
+        const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
+        if (varSide && litSide && (litSide === "http:" || litSide === "https:")) {
+          return varSide;
+        }
+      }
+      if (isNotEquals) {
+        const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
+        const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
+        if (varSide && litSide && litSide.toLowerCase() === "javascript:") {
+          return varSide;
+        }
+      }
+      if (isEquals) {
+        const zeroSide = isNumericLiteral(node.left, 0) ? "left" : isNumericLiteral(node.right, 0) ? "right" : null;
+        const callSide = zeroSide === "left" ? node.right : zeroSide === "right" ? node.left : null;
+        if (callSide && callSide.type === "CallExpression") {
+          const cc = callSide.callee;
+          if (cc.type === "MemberExpression" && cc.property?.name === "indexOf") {
+            const arg = callSide.arguments[0];
+            if (arg && isStringLiteral(arg)) {
+              const val = stringLiteralValue(arg);
+              if (val === "http" || val === "https" || val === "http:" || val === "https:" || val === "http://" || val === "https://") {
+                return nodeToString(cc.object);
+              }
+            }
+          }
+        }
+      }
+      if (isEquals) {
+        const litVal = getStringLiteral(node.left) || getStringLiteral(node.right);
+        const callNode = isStringLiteral(node.left) ? node.right : node.left;
+        if (litVal && (litVal === "http" || litVal === "https" || litVal === "http:" || litVal === "https:" || litVal === "http://" || litVal === "https://") && callNode?.type === "CallExpression") {
+          const cc = callNode.callee;
+          if (cc.type === "MemberExpression" && (cc.property?.name === "slice" || cc.property?.name === "substring" || cc.property?.name === "substr")) {
+            return nodeToString(cc.object);
+          }
+        }
+      }
+    }
+    return null;
+  }
+  function isStringLiteral(node) {
+    return node && (node.type === "StringLiteral" || node.type === "Literal" && typeof node.value === "string");
+  }
+  function stringLiteralValue(node) {
+    return node.value;
+  }
+  function getStringLiteral(node) {
+    return isStringLiteral(node) ? node.value : null;
+  }
+  function isNumericLiteral(node, value) {
+    if (!node) return false;
+    if (node.type === "NumericLiteral" && node.value === value) return true;
+    if (node.type === "Literal" && typeof node.value === "number" && node.value === value) return true;
+    return false;
+  }
+  function findProtocolMember(node) {
+    if (node?.type === "MemberExpression" && node.property?.name === "protocol") {
+      return nodeToString(node.object);
+    }
+    return null;
+  }
+  function isHttpSchemeRegex(pattern) {
+    return /^\^https?\??/.test(pattern);
   }
   function processNode(node, env, ctx) {
     if (!node) return;
@@ -43917,6 +44090,53 @@ ${rootStack}`;
     if (!node.init) return;
     ctx.returnedFuncNode = null;
     ctx.returnedMethods = null;
+    if (node.id.type === "Identifier" && node.init && (node.init.type === "FunctionExpression" || node.init.type === "ArrowFunctionExpression")) {
+      node.init._closureEnv = env;
+      const key = resolveId(node.id, ctx);
+      ctx.funcMap.set(key, node.init);
+      ctx.funcMap.set(node.id.name, node.init);
+    }
+    if (node.id.type === "Identifier" && node.init && node.init.type === "ObjectExpression") {
+      const varName = node.id.name;
+      for (const prop of node.init.properties) {
+        if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+          const propName = prop.key.name || prop.key.value;
+          const val = prop.value;
+          if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
+            val._closureEnv = env;
+            ctx.funcMap.set(`${varName}.${propName}`, val);
+            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+          }
+        }
+        if (prop.type === "ObjectMethod" && prop.key) {
+          const propName = prop.key.name || prop.key.value;
+          if (propName) {
+            prop._closureEnv = env;
+            ctx.funcMap.set(`${varName}.${propName}`, prop);
+            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, prop);
+          }
+        }
+      }
+    }
+    if (node.id.type === "Identifier" && node.init.type === "Identifier") {
+      const refKey = resolveId(node.init, ctx);
+      const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(node.init.name);
+      if (refFunc) {
+        const key = resolveId(node.id, ctx);
+        ctx.funcMap.set(key, refFunc);
+        ctx.funcMap.set(node.id.name, refFunc);
+      }
+    }
+    if (node.id.type === "Identifier" && (node.init.type === "MemberExpression" || node.init.type === "OptionalMemberExpression")) {
+      const initStr = nodeToString(node.init);
+      const methodName = node.init.property?.name;
+      const refFunc = initStr && ctx.funcMap.get(initStr) || methodName && ctx.funcMap.get(methodName);
+      if (refFunc) {
+        const key = resolveId(node.id, ctx);
+        ctx.funcMap.set(key, refFunc);
+        ctx.funcMap.set(node.id.name, refFunc);
+      }
+    }
     const taint = evaluateExpr(node.init, env, ctx);
     assignToPattern(node.id, taint, env, ctx);
     registerReturnedFunctions(node.id, ctx);
@@ -43928,7 +44148,7 @@ ${rootStack}`;
     ctx.returnedFuncNode = null;
     ctx.returnedMethods = null;
     const rhsTaint = evaluateExpr(node.right, env, ctx);
-    checkSinkAssignment(node.left, rhsTaint, ctx);
+    checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
     checkPrototypePollution(node, env, ctx);
     let finalTaint = rhsTaint;
     if (node.operator !== "=") {
@@ -43937,14 +44157,19 @@ ${rootStack}`;
     assignToPattern(node.left, finalTaint, env, ctx);
     registerReturnedFunctions(node.left, ctx);
     if (node.operator === "=" && (node.right.type === "FunctionExpression" || node.right.type === "ArrowFunctionExpression")) {
+      node.right._closureEnv = env;
       const leftStr = nodeToString(node.left);
       if (leftStr) {
-        node.right._closureEnv = env;
         ctx.funcMap.set(leftStr, node.right);
         if (node.left.type === "MemberExpression" && node.left.property?.name) {
           const propName = node.left.property.name;
           if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, node.right);
         }
+      }
+      if (node.left.type === "Identifier") {
+        const key = resolveId(node.left, ctx);
+        ctx.funcMap.set(key, node.right);
+        ctx.funcMap.set(node.left.name, node.right);
       }
     }
     if (node.operator === "=" && node.right.type === "Identifier" && node.left.type === "Identifier") {
@@ -43964,13 +44189,14 @@ ${rootStack}`;
           handler = ctx.funcMap.get(refKey) || ctx.funcMap.get(handler.name) || handler;
         }
         if (handler.type === "ArrowFunctionExpression" || handler.type === "FunctionExpression" || handler.type === "FunctionDeclaration") {
-          const checksOrigin = callbackChecksOrigin(handler.body);
-          if (!checksOrigin && handler.params[0]) {
+          const originCheck = callbackChecksOrigin(handler.body, ctx);
+          if (originCheck !== "strong" && handler.params[0]) {
             const paramName = handler.params[0].type === "Identifier" ? handler.params[0].name : null;
             if (paramName) {
               const childEnv = env.child();
               const loc = handler.loc?.start || {};
-              const label = new TaintLabel("postMessage.data", ctx.file, loc.line || 0, loc.column || 0, `${paramName}.data (no origin check)`);
+              const desc = originCheck === "weak" ? `${paramName}.data (weak origin check)` : `${paramName}.data (no origin check)`;
+              const label = new TaintLabel("postMessage.data", ctx.file, loc.line || 0, loc.column || 0, desc);
               assignToPattern(handler.params[0], TaintSet.from(label), childEnv, ctx);
               childEnv.set(`${paramName}.data`, TaintSet.from(label));
               if (handler.body.type === "BlockStatement") {
@@ -44204,10 +44430,13 @@ ${rootStack}`;
   function evaluateCallExpr(node, env, ctx) {
     const calleeStr = nodeToString(node.callee);
     const methodName = node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression" ? node.callee.property?.name || "" : "";
+    if (node.callee.type === "CallExpression" || node.callee.type === "OptionalCallExpression") {
+      evaluateExpr(node.callee, env, ctx);
+    }
     const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
     if (isSanitizer(calleeStr, methodName)) return TaintSet.empty();
     const sinkInfo = checkCallSink(calleeStr, methodName);
-    if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, ctx);
+    if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
     if ((calleeStr === "setTimeout" || calleeStr === "setInterval") && node.arguments[0]) {
       let callback = node.arguments[0];
       if (callback.type === "Identifier") {
@@ -44222,6 +44451,21 @@ ${rootStack}`;
           evaluateExpr(callback.body, childEnv, ctx);
         }
       }
+    }
+    if (calleeStr === "Object.assign" && node.arguments.length >= 2) {
+      const merged = argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
+      const targetNode = node.arguments[0];
+      if (targetNode) {
+        const targetStr = nodeToString(targetNode);
+        if (targetStr) {
+          env.set(targetStr, env.get(targetStr).clone().merge(merged));
+          if (targetNode.type === "Identifier") {
+            const key = resolveId(targetNode, ctx);
+            env.set(key, env.get(key).clone().merge(merged));
+          }
+        }
+      }
+      return merged;
     }
     if (calleeStr && CALL_SOURCES[calleeStr] && CALL_SOURCES[calleeStr] !== "passthrough") {
       const loc = node.loc?.start || {};
@@ -44242,7 +44486,7 @@ ${rootStack}`;
       return TaintSet.from(new TaintLabel(CONSTRUCTOR_SOURCES[constructorName], ctx.file, loc.line || 0, loc.column || 0, `new ${constructorName}()`));
     }
     if (constructorName === "Function") {
-      checkSinkCall(node, { type: "XSS", taintedArgs: [0] }, argTaints, "new Function()", ctx);
+      checkSinkCall(node, { type: "XSS", taintedArgs: [0] }, argTaints, "new Function()", env, ctx);
     }
     if (constructorName) {
       const funcNode = ctx.funcMap.get(constructorName);
@@ -44379,6 +44623,13 @@ ${rootStack}`;
         return analyzePromiseCallback(node, argTaints, objTaint, env, ctx);
       case "addEventListener":
         return analyzeEventListener(node, argTaints, env, ctx);
+      case "all":
+      case "race":
+      case "any":
+      case "allSettled":
+        return argTaints[0]?.clone() || TaintSet.empty();
+      case "assign":
+        return argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
       default:
         return null;
     }
@@ -44397,12 +44648,13 @@ ${rootStack}`;
     const eventName = eventType.value;
     const childEnv = env.child();
     if (eventName === "message" && callback.params[0]) {
-      const checksOrigin = callbackChecksOrigin(callback.body);
-      if (!checksOrigin) {
+      const originCheck = callbackChecksOrigin(callback.body, ctx);
+      if (originCheck !== "strong") {
         const paramName = callback.params[0].type === "Identifier" ? callback.params[0].name : null;
         if (paramName) {
           const loc = callback.loc?.start || {};
-          const label = new TaintLabel("postMessage.data", ctx.file, loc.line || 0, loc.column || 0, `${paramName}.data (no origin check)`);
+          const desc = originCheck === "weak" ? `${paramName}.data (weak origin check)` : `${paramName}.data (no origin check)`;
+          const label = new TaintLabel("postMessage.data", ctx.file, loc.line || 0, loc.column || 0, desc);
           assignToPattern(callback.params[0], TaintSet.from(label), childEnv, ctx);
           childEnv.set(`${paramName}.data`, TaintSet.from(label));
         }
@@ -44413,27 +44665,190 @@ ${rootStack}`;
     }
     return evaluateExpr(callback.body, childEnv, ctx);
   }
-  function callbackChecksOrigin(node) {
+  function callbackChecksOrigin(node, ctx) {
     if (!node || typeof node !== "object") return false;
+    const checks = [];
+    collectOriginChecks(node, checks, ctx);
+    if (checks.length === 0) return false;
+    if (checks.some((c) => c === "strong")) return "strong";
+    return "weak";
+  }
+  function collectOriginChecks(node, checks, ctx) {
+    if (!node || typeof node !== "object") return;
     if (node.type === "BinaryExpression" && (node.operator === "===" || node.operator === "==" || node.operator === "!==" || node.operator === "!=")) {
       const l = nodeToString(node.left), r = nodeToString(node.right);
-      if (l && l.endsWith(".origin") || r && r.endsWith(".origin")) return true;
+      const originSide = l && l.endsWith(".origin") ? "left" : r && r.endsWith(".origin") ? "right" : null;
+      if (originSide) {
+        const otherNode = originSide === "left" ? node.right : node.left;
+        const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
+        if (otherStr !== null) {
+          checks.push(classifyOriginLiteral(otherStr));
+        } else {
+          checks.push("strong");
+        }
+        return;
+      }
+    }
+    if (node.type === "CallExpression" && node.callee?.type === "MemberExpression") {
+      const objStr = nodeToString(node.callee.object);
+      const method = node.callee.property?.name;
+      if (objStr && objStr.endsWith(".origin") && method) {
+        checks.push(classifyOriginMethod(method, node));
+        return;
+      }
+      if (method === "includes" || method === "has") {
+        const arg = node.arguments[0];
+        if (arg) {
+          const argStr = nodeToString(arg);
+          if (argStr && argStr.endsWith(".origin")) {
+            checks.push("strong");
+            return;
+          }
+        }
+      }
+      if (method === "test") {
+        const arg = node.arguments[0];
+        if (arg) {
+          const argStr = nodeToString(arg);
+          if (argStr && argStr.endsWith(".origin")) {
+            const pattern = node.callee.object?.regex?.pattern || node.callee.object?.pattern || "";
+            checks.push(classifyOriginRegex(pattern));
+            return;
+          }
+        }
+      }
+    }
+    if (node.type === "CallExpression") {
+      const hasOriginArg = node.arguments?.some((arg) => {
+        const str = nodeToString(arg);
+        return str && str.endsWith(".origin");
+      });
+      if (hasOriginArg) {
+        const calleeName = nodeToString(node.callee);
+        if (calleeName && ctx) {
+          const funcNode = ctx.funcMap.get(calleeName);
+          if (funcNode) {
+            const quality = analyzeOriginValidator(funcNode, ctx);
+            checks.push(quality);
+            return;
+          }
+        }
+        checks.push("weak");
+        return;
+      }
     }
     for (const key of Object.keys(node)) {
       if (key === "loc" || key === "start" || key === "end" || key === "_closureEnv") continue;
       const child = node[key];
       if (Array.isArray(child)) {
         for (const item of child) {
-          if (item && typeof item === "object" && item.type && callbackChecksOrigin(item)) return true;
+          if (item && typeof item === "object" && item.type) collectOriginChecks(item, checks, ctx);
         }
-      } else if (child && typeof child === "object" && child.type && callbackChecksOrigin(child)) return true;
+      } else if (child && typeof child === "object" && child.type) {
+        collectOriginChecks(child, checks, ctx);
+      }
     }
-    return false;
+  }
+  function classifyOriginLiteral(value) {
+    if (!value || typeof value !== "string") return "weak";
+    if (value === "null") return "weak";
+    if (value === "") return "weak";
+    if (value === "*") return "weak";
+    if (/^https?:\/\/[^/]+$/.test(value)) return "strong";
+    return "weak";
+  }
+  function classifyOriginMethod(method, callNode) {
+    const arg = callNode.arguments?.[0];
+    const argVal = arg && isStringLiteral(arg) ? stringLiteralValue(arg) : null;
+    switch (method) {
+      case "includes":
+      case "indexOf":
+        return "weak";
+      case "endsWith":
+        return "weak";
+      case "startsWith":
+        if (argVal && /^https?:\/\/[^/]+/.test(argVal)) return "strong";
+        return "weak";
+      case "match":
+        if (arg && (arg.type === "RegExpLiteral" || arg.regex)) {
+          return classifyOriginRegex(arg.pattern || arg.regex?.pattern || "");
+        }
+        return "weak";
+      default:
+        return "weak";
+    }
+  }
+  function classifyOriginRegex(pattern) {
+    if (!pattern) return "weak";
+    const hasStart = pattern.startsWith("^");
+    const hasEnd = pattern.endsWith("$");
+    if (hasStart && hasEnd) return "strong";
+    if (hasStart && /^(\^)https?:/.test(pattern)) return "strong";
+    return "weak";
+  }
+  function analyzeOriginValidator(funcNode, ctx) {
+    if (!funcNode) return "weak";
+    const body = funcNode.body || funcNode;
+    const checks = [];
+    collectOriginValidatorChecks(body, funcNode.params, checks);
+    if (checks.length === 0) return "weak";
+    if (checks.some((c) => c === "strong")) return "strong";
+    return "weak";
+  }
+  function collectOriginValidatorChecks(node, params, checks) {
+    if (!node || typeof node !== "object") return;
+    const paramNames = (params || []).map((p) => p.type === "Identifier" ? p.name : null).filter(Boolean);
+    if (node.type === "BinaryExpression" && (node.operator === "===" || node.operator === "==" || node.operator === "!==" || node.operator === "!=")) {
+      const l = nodeToString(node.left), r = nodeToString(node.right);
+      const paramSide = paramNames.includes(l) ? "left" : paramNames.includes(r) ? "right" : null;
+      if (paramSide) {
+        const otherNode = paramSide === "left" ? node.right : node.left;
+        const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
+        if (otherStr !== null) {
+          checks.push(classifyOriginLiteral(otherStr));
+        } else {
+          checks.push("strong");
+        }
+        return;
+      }
+    }
+    if (node.type === "CallExpression" && node.callee?.type === "MemberExpression") {
+      const objStr = nodeToString(node.callee.object);
+      const method = node.callee.property?.name;
+      if (paramNames.includes(objStr) && method) {
+        checks.push(classifyOriginMethod(method, node));
+        return;
+      }
+      if ((method === "includes" || method === "has") && node.arguments?.[0]) {
+        const argStr = nodeToString(node.arguments[0]);
+        if (paramNames.includes(argStr)) {
+          checks.push("strong");
+          return;
+        }
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "loc" || key === "start" || key === "end" || key === "_closureEnv") continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (item && typeof item === "object" && item.type) collectOriginValidatorChecks(item, params, checks);
+        }
+      } else if (child && typeof child === "object" && child.type) {
+        collectOriginValidatorChecks(child, params, checks);
+      }
+    }
   }
   function analyzeArrayCallback(node, argTaints, objTaint, env, ctx) {
-    const callback = node.arguments[0];
+    let callback = node.arguments[0];
     if (!callback) return TaintSet.empty();
-    if (callback.type !== "ArrowFunctionExpression" && callback.type !== "FunctionExpression") return TaintSet.empty();
+    if (callback.type === "Identifier") {
+      const refKey = resolveId(callback, ctx);
+      const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(callback.name);
+      if (refFunc) callback = refFunc;
+      else return TaintSet.empty();
+    }
+    if (callback.type !== "ArrowFunctionExpression" && callback.type !== "FunctionExpression" && callback.type !== "FunctionDeclaration") return TaintSet.empty();
     const childEnv = env.child();
     if (callback.params[0]) assignToPattern(callback.params[0], objTaint, childEnv, ctx);
     if (callback.params[1]) assignToPattern(callback.params[1], TaintSet.empty(), childEnv, ctx);
@@ -44489,6 +44904,12 @@ ${rootStack}`;
         }
       }
     }
+    const exitState = blockEnvs.get(innerCfg.exit.id);
+    if (exitState) env.mergeFrom(exitState);
+    for (const pred of innerCfg.exit.predecessors) {
+      const state = blockEnvs.get(pred.id);
+      if (state) env.mergeFrom(state);
+    }
     if (innerCtx.returnedFuncNode) ctx.returnedFuncNode = innerCtx.returnedFuncNode;
     if (innerCtx.returnedMethods) ctx.returnedMethods = innerCtx.returnedMethods;
     return innerCtx.returnTaint;
@@ -44505,6 +44926,12 @@ ${rootStack}`;
     if (!funcNode && callNode.callee) {
       if (callNode.callee.type === "ArrowFunctionExpression" || callNode.callee.type === "FunctionExpression") {
         funcNode = callNode.callee;
+      }
+      if (!funcNode && (callNode.callee.type === "CallExpression" || callNode.callee.type === "OptionalCallExpression")) {
+        if (ctx.returnedFuncNode) {
+          funcNode = ctx.returnedFuncNode;
+          ctx.returnedFuncNode = null;
+        }
       }
     }
     if (!funcNode && (callNode.callee?.type === "MemberExpression" || callNode.callee?.type === "OptionalMemberExpression")) {
@@ -44526,11 +44953,10 @@ ${rootStack}`;
       if (objName) {
         const objTaint = evaluateExpr(callNode.callee.object, env, ctx);
         childEnv.set("this", objTaint);
-        for (const [key, taint] of env.bindings) {
-          if (key.startsWith(`${objName}.`) && taint.tainted) {
-            const propName = key.slice(objName.length + 1);
-            childEnv.set(`this.${propName}`, taint);
-          }
+        const objBindings = env.getTaintedWithPrefix(`${objName}.`);
+        for (const [key, taint] of objBindings) {
+          const propName = key.slice(objName.length + 1);
+          childEnv.set(`this.${propName}`, taint);
         }
       }
     }
@@ -44568,6 +44994,17 @@ ${rootStack}`;
     const body = funcNode.body.type === "BlockStatement" ? funcNode.body : { type: "BlockStatement", body: [{ type: "ReturnStatement", argument: funcNode.body }] };
     const result = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx);
     ctx.funcMap = savedFuncMap;
+    if (callNode.callee?.type === "MemberExpression" || callNode.callee?.type === "OptionalMemberExpression") {
+      const objName = nodeToString(callNode.callee.object);
+      if (objName) {
+        for (const [key, taint] of childEnv.bindings) {
+          if (key.startsWith("this.") && taint.tainted) {
+            const propName = key.slice(5);
+            env.set(`${objName}.${propName}`, taint);
+          }
+        }
+      }
+    }
     return result;
   }
   function processForBinding(node, env, ctx) {
@@ -44578,23 +45015,42 @@ ${rootStack}`;
       assignToPattern(node.left, iterableTaint, env, ctx);
     }
   }
-  function checkSinkAssignment(leftNode, rhsTaint, ctx) {
+  function classifyNavigationType(sinkInfo, env, rhsNode) {
+    if (!sinkInfo.navigation) return sinkInfo.type;
+    if (rhsNode) {
+      const varName = nodeToString(rhsNode);
+      if (varName && env.schemeCheckedVars.has(varName)) return "Open Redirect";
+      if (rhsNode.type === "MemberExpression" || rhsNode.type === "OptionalMemberExpression") {
+        const objName = nodeToString(rhsNode.object);
+        if (objName && env.schemeCheckedVars.has(objName)) return "Open Redirect";
+      }
+      if (rhsNode.type === "Identifier") {
+        for (const checked of env.schemeCheckedVars) {
+          if (checked === rhsNode.name || checked.endsWith(":" + rhsNode.name)) return "Open Redirect";
+        }
+      }
+    }
+    return sinkInfo.type;
+  }
+  function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
     if (!rhsTaint.tainted) return;
     const leftStr = nodeToString(leftNode);
     const propName = leftNode.type === "MemberExpression" ? leftNode.property?.name : null;
     const sinkInfo = checkAssignmentSink(leftStr, propName);
     if (!sinkInfo) return;
+    const type = classifyNavigationType(sinkInfo, env, rhsNode);
+    const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
     const loc = leftNode.loc?.start || {};
     ctx.findings.push({
-      type: sinkInfo.type,
-      severity: sinkInfo.type === "XSS" ? "critical" : "high",
-      title: `${sinkInfo.type}: tainted data flows to ${leftStr || propName}`,
+      type,
+      severity,
+      title: `${type}: tainted data flows to ${leftStr || propName}`,
       sink: { expression: leftStr || propName, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
       source: rhsTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
       path: buildTaintPath(rhsTaint, leftStr || propName)
     });
   }
-  function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, ctx) {
+  function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
     for (const argIdx of sinkInfo.taintedArgs) {
       const argTaint = argTaints[argIdx];
       if (!argTaint || !argTaint.tainted) continue;
@@ -44602,11 +45058,13 @@ ${rootStack}`;
         const argNode = callNode.arguments[argIdx];
         if (argNode.type === "ArrowFunctionExpression" || argNode.type === "FunctionExpression") continue;
       }
+      const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx]);
+      const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
       const loc = callNode.loc?.start || {};
       ctx.findings.push({
-        type: sinkInfo.type,
-        severity: sinkInfo.type === "XSS" ? "critical" : "high",
-        title: `${sinkInfo.type}: tainted data flows to ${calleeStr}()`,
+        type,
+        severity,
+        title: `${type}: tainted data flows to ${calleeStr}()`,
         sink: { expression: `${calleeStr}(arg${argIdx})`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
         source: argTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
         path: buildTaintPath(argTaint, calleeStr)
@@ -44931,98 +45389,15 @@ ${rootStack}`;
     }
   }
 
-  // src/worker/cache.js
-  init_define_process_env();
-  var DB_NAME = "webappsec-findings";
-  var DB_VERSION = 1;
-  var STORE_FINDINGS = "findings";
-  var dbPromise = null;
-  function openDB() {
-    if (dbPromise) return dbPromise;
-    dbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = (e) => {
-        const db = e.target.result;
-        if (!db.objectStoreNames.contains(STORE_FINDINGS)) {
-          db.createObjectStore(STORE_FINDINGS);
-        }
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-    return dbPromise;
-  }
+  // src/worker/index.js
+  var moduleGraph = new ModuleGraph();
+  var seenFindingKeys = /* @__PURE__ */ new Set();
+  var debounceTimers = /* @__PURE__ */ new Map();
+  var DEBOUNCE_MS = 2e3;
   function findingKey(f) {
     const srcKey = Array.isArray(f.source) ? f.source.map((s) => `${s.type}:${s.file}`).join("+") : `${f.source?.type}:${f.source?.file}`;
     return `${f.type}|${srcKey}|${f.sink?.expression}:${f.sink?.file}`;
   }
-  async function addFindings(tabId, newFindings) {
-    if (!newFindings || newFindings.length === 0) return [];
-    try {
-      const db = await openDB();
-      const key = String(tabId);
-      const existing = await new Promise((resolve) => {
-        const tx = db.transaction(STORE_FINDINGS, "readonly");
-        const store = tx.objectStore(STORE_FINDINGS);
-        const req = store.get(key);
-        req.onsuccess = () => resolve(req.result ? req.result.findings : []);
-        req.onerror = () => resolve([]);
-      });
-      const keyToIdx = /* @__PURE__ */ new Map();
-      for (let i = 0; i < existing.length; i++) {
-        keyToIdx.set(findingKey(existing[i]), i);
-      }
-      const novel = [];
-      let urlsUpdated = false;
-      for (const f of newFindings) {
-        const fk = findingKey(f);
-        const existIdx = keyToIdx.get(fk);
-        if (existIdx !== void 0) {
-          const ef = existing[existIdx];
-          if (f.pageUrl && ef.seenOn && !ef.seenOn.includes(f.pageUrl)) {
-            ef.seenOn.push(f.pageUrl);
-            urlsUpdated = true;
-          }
-        } else {
-          if (f.pageUrl) {
-            f.seenOn = [f.pageUrl];
-            delete f.pageUrl;
-          }
-          keyToIdx.set(fk, existing.length + novel.length);
-          novel.push(f);
-        }
-      }
-      if (novel.length === 0 && !urlsUpdated) return [];
-      const merged = existing.concat(novel);
-      await new Promise((resolve) => {
-        const tx = db.transaction(STORE_FINDINGS, "readwrite");
-        const store = tx.objectStore(STORE_FINDINGS);
-        store.put({ findings: merged, timestamp: Date.now() }, key);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
-      return novel;
-    } catch {
-      return newFindings;
-    }
-  }
-  async function clearAllFindings() {
-    try {
-      const db = await openDB();
-      return new Promise((resolve) => {
-        const tx = db.transaction(STORE_FINDINGS, "readwrite");
-        tx.objectStore(STORE_FINDINGS).clear();
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
-    } catch {
-    }
-  }
-
-  // src/worker/index.js
-  var moduleGraph = new ModuleGraph();
-  var debounceTimers = /* @__PURE__ */ new Map();
-  var DEBOUNCE_MS = 2e3;
   self.onmessage = function(e) {
     const msg = e.data;
     switch (msg.type) {
@@ -45036,7 +45411,7 @@ ${rootStack}`;
         moduleGraph.resetPage(msg.tabId);
         break;
       case "clearFindings":
-        clearAllFindings();
+        seenFindingKeys.clear();
         break;
     }
   };
@@ -45076,7 +45451,12 @@ ${rootStack}`;
     const findings = analyzeAST(ast, script.url, script.isModule, page);
     for (const f of findings) f.pageUrl = pageUrl;
     if (findings.length > 0) {
-      const novel = await addFindings(tabId, findings);
+      const novel = findings.filter((f) => {
+        const key = findingKey(f);
+        if (seenFindingKeys.has(key)) return false;
+        seenFindingKeys.add(key);
+        return true;
+      });
       if (novel.length > 0) {
         postFindings(tabId, novel);
       }
@@ -45105,7 +45485,12 @@ ${rootStack}`;
       allFindings.push(...findings);
     }
     if (allFindings.length > 0) {
-      const novel = await addFindings(tabId, allFindings);
+      const novel = allFindings.filter((f) => {
+        const key = findingKey(f);
+        if (seenFindingKeys.has(key)) return false;
+        seenFindingKeys.add(key);
+        return true;
+      });
       if (novel.length > 0) {
         postFindings(tabId, novel);
       }
@@ -45305,7 +45690,12 @@ ${rootStack}`;
     }
     if (findings.length > 0) {
       const deduped = deduplicateFindings(findings);
-      const novel = await addFindings(tabId, deduped);
+      const novel = deduped.filter((f) => {
+        const key = findingKey(f);
+        if (seenFindingKeys.has(key)) return false;
+        seenFindingKeys.add(key);
+        return true;
+      });
       if (novel.length > 0) {
         postFindings(tabId, novel);
       }

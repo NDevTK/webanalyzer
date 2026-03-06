@@ -5,8 +5,8 @@
 }
 
 body {
-  width: 420px;
-  max-height: 520px;
+  width: 100%;
+  height: 100vh;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 13px;
   color: #e0e0e0;
@@ -95,35 +95,154 @@ body {
   display: none;
 }
 
-.clear-btn {
-  display: block;
-  width: calc(100% - 20px);
-  margin: 6px 10px;
-  padding: 6px 0;
+/* ── Action bar ── */
+
+.action-bar {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px;
+  background: #121225;
+  border-bottom: 1px solid #0f3460;
+}
+
+.action-bar.hidden {
+  display: none;
+}
+
+.action-btn {
+  flex: 1;
+  padding: 5px 0;
   border: none;
   border-radius: 4px;
-  background: #2a1a3e;
-  color: #e94560;
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
   text-align: center;
 }
 
+.clear-btn {
+  background: #2a1a3e;
+  color: #e94560;
+}
+
 .clear-btn:hover {
   background: #3a2a4e;
 }
 
-.clear-btn.hidden {
+.export-btn {
+  background: #1a2a3e;
+  color: #7ec8e3;
+}
+
+.export-btn:hover {
+  background: #1a3a4e;
+}
+
+/* ── Filter bar ── */
+
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 10px;
+  background: #121225;
+  border-bottom: 1px solid #0f3460;
+}
+
+.filter-bar.hidden {
   display: none;
+}
+
+.filter-pill {
+  padding: 3px 8px;
+  border-radius: 10px;
+  border: 1px solid #333;
+  background: transparent;
+  color: #888;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.filter-pill.active {
+  border-color: currentColor;
+  color: #e0e0e0;
+  background: #1a2a3e;
+}
+
+.filter-pill[data-type="XSS"].active,
+.filter-pill[data-type="Script Injection"].active {
+  color: #e94560;
+  border-color: #e94560;
+  background: #2a1a2e;
+}
+
+.filter-pill[data-type="Open Redirect"].active {
+  color: #feca57;
+  border-color: #feca57;
+  background: #2a2a1e;
+}
+
+.filter-pill[data-type="Prototype Pollution"].active {
+  color: #ff6b6b;
+  border-color: #ff6b6b;
+  background: #2a1a1e;
 }
 
 .findings-list {
   padding: 6px 0;
 }
 
+/* ── Finding type groups ── */
+
+.finding-group {
+  margin: 8px 10px 4px;
+}
+
+.finding-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  cursor: pointer;
+  user-select: none;
+}
+
+.finding-group-header:hover {
+  opacity: 0.85;
+}
+
+.finding-group-icon {
+  font-size: 12px;
+  transition: transform 0.15s;
+}
+
+.finding-group.collapsed .finding-group-icon {
+  transform: rotate(-90deg);
+}
+
+.finding-group-label {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.finding-group-count {
+  font-size: 10px;
+  color: #888;
+  font-weight: 400;
+}
+
+.finding-group.collapsed .finding-group-items {
+  display: none;
+}
+
+/* ── Individual finding cards ── */
+
 .finding {
-  margin: 4px 10px;
+  margin: 4px 0;
   padding: 10px 12px;
   border-radius: 6px;
   background: #16213e;
@@ -132,6 +251,18 @@ body {
 
 .finding.high {
   border-left-color: #ff9f43;
+}
+
+.finding.open-redirect {
+  border-left-color: #feca57;
+}
+
+.finding.proto-pollution {
+  border-left-color: #ff6b6b;
+}
+
+.finding.info {
+  border-left-color: #54a0ff;
 }
 
 .finding-header {
@@ -149,11 +280,56 @@ body {
   border-radius: 3px;
   background: #e94560;
   color: #fff;
+  white-space: nowrap;
 }
 
 .finding-type.high {
   background: #ff9f43;
   color: #1a1a2e;
+}
+
+.finding-type.open-redirect {
+  background: #feca57;
+  color: #1a1a2e;
+}
+
+.finding-type.proto-pollution {
+  background: #ff6b6b;
+  color: #fff;
+}
+
+/* ── Weak origin check warning ── */
+
+.finding-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: #2a1a0e;
+  border: 1px solid #ff9f4355;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #ff9f43;
+  line-height: 1.4;
+}
+
+.finding-warning-icon {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+/* ── Remediation hints ── */
+
+.finding-remediation {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: #0e1a2a;
+  border: 1px solid #54a0ff33;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #7ec8e3;
+  line-height: 1.4;
 }
 
 .finding-title {
@@ -163,14 +339,18 @@ body {
 }
 
 .finding-origin {
-  font-size: 10px;
-  color: #888;
+  font-size: 11px;
+  color: #aaa;
   margin-bottom: 6px;
+  padding: 4px 6px;
+  background: #121225;
+  border-radius: 3px;
   word-break: break-all;
 }
 
 .finding-origin-url {
-  color: #b8a9c9;
+  color: #c9b8e3;
+  font-weight: 500;
 }
 
 .finding-detail {
@@ -181,14 +361,27 @@ body {
 
 .finding-path {
   margin-top: 6px;
-  padding: 6px 8px;
+  padding: 8px 10px;
   background: #121225;
   border-radius: 4px;
   font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
   font-size: 11px;
   color: #7ec8e3;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.finding-path .path-step {
+  display: block;
+  padding-left: 12px;
+  text-indent: -12px;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.finding-path .path-arrow {
+  color: #444;
 }
 
 .finding-sink-row {
@@ -207,6 +400,26 @@ body {
   font-size: 10px;
   color: #666;
   margin-top: 4px;
+}
+
+/* ── Per-finding copy button ── */
+
+.copy-btn {
+  display: block;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border: 1px solid #333;
+  border-radius: 3px;
+  background: transparent;
+  color: #666;
+  font-size: 10px;
+  cursor: pointer;
+  float: right;
+}
+
+.copy-btn:hover {
+  color: #aaa;
+  border-color: #555;
 }
 
 .finding-link {

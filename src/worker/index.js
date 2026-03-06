@@ -11,13 +11,21 @@ import {
 } from './module-graph.js';
 import { nodeToString, EVENT_SOURCES } from './sources-sinks.js';
 import { buildScopeInfo } from './scope.js';
-import { addFindings, clearFindings, clearAllFindings } from './cache.js';
-
 const moduleGraph = new ModuleGraph();
+
+// In-memory dedup set (worker doesn't persist — IndexedDB writes happen in offscreen.js)
+const seenFindingKeys = new Set();
 
 // Debounce timers for cross-file analysis per tab
 const debounceTimers = new Map();
 const DEBOUNCE_MS = 2000;
+
+function findingKey(f) {
+  const srcKey = Array.isArray(f.source)
+    ? f.source.map(s => `${s.type}:${s.file}`).join('+')
+    : `${f.source?.type}:${f.source?.file}`;
+  return `${f.type}|${srcKey}|${f.sink?.expression}:${f.sink?.file}`;
+}
 
 // ── Message handler ──
 self.onmessage = function (e) {
@@ -37,7 +45,7 @@ self.onmessage = function (e) {
       break;
 
     case 'clearFindings':
-      clearAllFindings();
+      seenFindingKeys.clear();
       break;
   }
 };
@@ -88,9 +96,14 @@ async function handleScript(tabId, origin, pageUrl, script) {
   // Stamp page URL on each finding so the UI can show where the script was used
   for (const f of findings) f.pageUrl = pageUrl;
 
-  // Deduplicate against IndexedDB and only report genuinely new findings
+  // Deduplicate in memory and report genuinely new findings
   if (findings.length > 0) {
-    const novel = await addFindings(tabId, findings);
+    const novel = findings.filter(f => {
+      const key = findingKey(f);
+      if (seenFindingKeys.has(key)) return false;
+      seenFindingKeys.add(key);
+      return true;
+    });
     if (novel.length > 0) {
       postFindings(tabId, novel);
     }
@@ -127,7 +140,12 @@ async function handleHTML(tabId, origin, pageUrl, html) {
   }
 
   if (allFindings.length > 0) {
-    const novel = await addFindings(tabId, allFindings);
+    const novel = allFindings.filter(f => {
+      const key = findingKey(f);
+      if (seenFindingKeys.has(key)) return false;
+      seenFindingKeys.add(key);
+      return true;
+    });
     if (novel.length > 0) {
       postFindings(tabId, novel);
     }
@@ -367,7 +385,12 @@ async function runCrossFileAnalysis(tabId) {
 
   if (findings.length > 0) {
     const deduped = deduplicateFindings(findings);
-    const novel = await addFindings(tabId, deduped);
+    const novel = deduped.filter(f => {
+      const key = findingKey(f);
+      if (seenFindingKeys.has(key)) return false;
+      seenFindingKeys.add(key);
+      return true;
+    });
     if (novel.length > 0) {
       postFindings(tabId, novel);
     }

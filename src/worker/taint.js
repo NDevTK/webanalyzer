@@ -69,6 +69,8 @@ export class TaintEnv {
   constructor(parent) {
     this.bindings = new Map();
     this.parent = parent || null;
+    // Path-sensitive: variables confirmed to have http/https URL scheme on this path
+    this.schemeCheckedVars = new Set();
   }
 
   get(key) {
@@ -88,6 +90,7 @@ export class TaintEnv {
   clone() {
     const env = new TaintEnv(this.parent);
     for (const [k, v] of this.bindings) env.bindings.set(k, v.clone());
+    env.schemeCheckedVars = new Set(this.schemeCheckedVars);
     return env;
   }
 
@@ -102,6 +105,21 @@ export class TaintEnv {
         const before = existing.size;
         existing.merge(taint);
         if (existing.size !== before) changed = true;
+      }
+    }
+    // Scheme-checked vars: intersection at join points (conservative —
+    // only keep vars checked on ALL incoming paths)
+    if (this.schemeCheckedVars.size === 0 && other.schemeCheckedVars.size > 0) {
+      // First merge: adopt other's set
+      for (const v of other.schemeCheckedVars) this.schemeCheckedVars.add(v);
+      changed = true;
+    } else if (this.schemeCheckedVars.size > 0 && other.schemeCheckedVars.size > 0) {
+      // Subsequent merges: intersect
+      for (const v of this.schemeCheckedVars) {
+        if (!other.schemeCheckedVars.has(v)) {
+          this.schemeCheckedVars.delete(v);
+          changed = true;
+        }
       }
     }
     return changed;
@@ -215,8 +233,195 @@ export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo) {
 }
 
 function processBlock(block, env, ctx) {
+  // Path-sensitive: if this block is a branch consequent, check for URL scheme guards
+  if (block.branchCondition) {
+    applyBranchCondition(block.branchCondition, block.branchPolarity, env);
+  }
   for (const node of block.nodes) processNode(node, env, ctx);
   return env;
+}
+
+// ── Path-sensitive URL scheme check detection ──
+// Examines if-test conditions to determine if a variable's URL scheme has been validated.
+// When a navigation sink is reached, scheme-checked vars produce "Open Redirect"
+// instead of "XSS" (since javascript: URIs are blocked).
+
+function applyBranchCondition(testNode, polarity, env) {
+  // Unwrap negation: if (!expr) → analyze expr with flipped polarity
+  let node = testNode;
+  let positive = polarity;
+  while (node.type === 'UnaryExpression' && node.operator === '!') {
+    positive = !positive;
+    node = node.argument;
+  }
+
+  // Handle logical expressions: if (a && b) → both are true in consequent
+  if (node.type === 'LogicalExpression' && node.operator === '&&' && positive) {
+    applyBranchCondition(node.left, true, env);
+    applyBranchCondition(node.right, true, env);
+    return;
+  }
+  // if (a || b) in the false branch → both are false
+  if (node.type === 'LogicalExpression' && node.operator === '||' && !positive) {
+    applyBranchCondition(node.left, false, env);
+    applyBranchCondition(node.right, false, env);
+    return;
+  }
+
+  const checkedVar = extractSchemeCheck(node, positive);
+  if (checkedVar) {
+    env.schemeCheckedVars.add(checkedVar);
+  }
+}
+
+// Returns the variable name if `node` (with given polarity) represents a URL scheme check.
+// Recognizes:
+//   url.startsWith('http') / url.startsWith('https') / url.startsWith('/')
+//   url.indexOf('http') === 0
+//   url.protocol === 'http:' / 'https:'
+//   url.protocol !== 'javascript:'
+//   /^https?:\/\//.test(url)  /  url.match(/^https?:/)
+//   url.slice(0,4) === 'http' / url.substring(0,4) === 'http'
+function extractSchemeCheck(node, positive) {
+  // Pattern: url.startsWith('http') or url.startsWith('https') or url.startsWith('/')
+  if (node.type === 'CallExpression' && positive) {
+    const callee = node.callee;
+    if (callee.type === 'MemberExpression' && callee.property?.name === 'startsWith') {
+      const arg = node.arguments[0];
+      if (arg && isStringLiteral(arg)) {
+        const val = stringLiteralValue(arg);
+        if (val === 'http' || val === 'https' || val === 'http:' || val === 'https:' ||
+            val === 'http://' || val === 'https://' || val === '/') {
+          return nodeToString(callee.object);
+        }
+      }
+    }
+    // Pattern: /^https?:\/\//.test(url)  or  regex.test(url)
+    if (callee.type === 'MemberExpression' && callee.property?.name === 'test') {
+      if (callee.object.type === 'RegExpLiteral' || callee.object.regex) {
+        const pattern = callee.object.pattern || callee.object.regex?.pattern || '';
+        if (isHttpSchemeRegex(pattern)) {
+          const arg = node.arguments[0];
+          return arg ? nodeToString(arg) : null;
+        }
+      }
+    }
+    // Pattern: url.match(/^https?:/)
+    if (callee.type === 'MemberExpression' && callee.property?.name === 'match') {
+      const arg = node.arguments[0];
+      if (arg && (arg.type === 'RegExpLiteral' || arg.regex)) {
+        const pattern = arg.pattern || arg.regex?.pattern || '';
+        if (isHttpSchemeRegex(pattern)) {
+          return nodeToString(callee.object);
+        }
+      }
+    }
+  }
+
+  // Pattern: url.startsWith('javascript:') with negated polarity (false branch)
+  if (node.type === 'CallExpression' && !positive) {
+    const callee = node.callee;
+    if (callee.type === 'MemberExpression' && callee.property?.name === 'startsWith') {
+      const arg = node.arguments[0];
+      if (arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === 'javascript:') {
+        return nodeToString(callee.object);
+      }
+    }
+  }
+
+  // Binary comparisons: === / !== / == / !=
+  if (node.type === 'BinaryExpression') {
+    const op = node.operator;
+    const isEquality = op === '===' || op === '==';
+    const isInequality = op === '!==' || op === '!=';
+
+    // Determine effective check: equality+positive or inequality+negative → "equals"
+    const isEquals = (isEquality && positive) || (isInequality && !positive);
+    const isNotEquals = (isInequality && positive) || (isEquality && !positive);
+
+    // Pattern: url.protocol === 'https:' or url.protocol === 'http:'
+    if (isEquals) {
+      const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
+      const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
+      if (varSide && litSide && (litSide === 'http:' || litSide === 'https:')) {
+        return varSide;
+      }
+    }
+
+    // Pattern: url.protocol !== 'javascript:' (inequality check blocks javascript:)
+    if (isNotEquals) {
+      const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
+      const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
+      if (varSide && litSide && litSide.toLowerCase() === 'javascript:') {
+        return varSide;
+      }
+    }
+
+    // Pattern: url.indexOf('http') === 0
+    if (isEquals) {
+      const zeroSide = isNumericLiteral(node.left, 0) ? 'left' :
+                        isNumericLiteral(node.right, 0) ? 'right' : null;
+      const callSide = zeroSide === 'left' ? node.right : zeroSide === 'right' ? node.left : null;
+      if (callSide && callSide.type === 'CallExpression') {
+        const cc = callSide.callee;
+        if (cc.type === 'MemberExpression' && cc.property?.name === 'indexOf') {
+          const arg = callSide.arguments[0];
+          if (arg && isStringLiteral(arg)) {
+            const val = stringLiteralValue(arg);
+            if (val === 'http' || val === 'https' || val === 'http:' || val === 'https:' ||
+                val === 'http://' || val === 'https://') {
+              return nodeToString(cc.object);
+            }
+          }
+        }
+      }
+    }
+
+    // Pattern: url.slice(0,4) === 'http' or url.substring(0,5) === 'https'
+    if (isEquals) {
+      const litVal = getStringLiteral(node.left) || getStringLiteral(node.right);
+      const callNode = isStringLiteral(node.left) ? node.right : node.left;
+      if (litVal && (litVal === 'http' || litVal === 'https' || litVal === 'http:' ||
+                     litVal === 'https:' || litVal === 'http://' || litVal === 'https://') &&
+          callNode?.type === 'CallExpression') {
+        const cc = callNode.callee;
+        if (cc.type === 'MemberExpression' &&
+            (cc.property?.name === 'slice' || cc.property?.name === 'substring' || cc.property?.name === 'substr')) {
+          return nodeToString(cc.object);
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+// Helpers for scheme check detection
+function isStringLiteral(node) {
+  return node && (node.type === 'StringLiteral' || (node.type === 'Literal' && typeof node.value === 'string'));
+}
+function stringLiteralValue(node) {
+  return node.value;
+}
+function getStringLiteral(node) {
+  return isStringLiteral(node) ? node.value : null;
+}
+function isNumericLiteral(node, value) {
+  if (!node) return false;
+  if (node.type === 'NumericLiteral' && node.value === value) return true;
+  if (node.type === 'Literal' && typeof node.value === 'number' && node.value === value) return true;
+  return false;
+}
+function findProtocolMember(node) {
+  // Returns the base object name if node is X.protocol
+  if (node?.type === 'MemberExpression' && node.property?.name === 'protocol') {
+    return nodeToString(node.object);
+  }
+  return null;
+}
+function isHttpSchemeRegex(pattern) {
+  // Match patterns that validate http/https at string start: ^https?, ^https?:, ^https?://, etc.
+  return /^\^https?\??/.test(pattern);
 }
 
 function processNode(node, env, ctx) {
@@ -413,7 +618,7 @@ function processAssignment(node, env, ctx) {
   ctx.returnedFuncNode = null;
   ctx.returnedMethods = null;
   const rhsTaint = evaluateExpr(node.right, env, ctx);
-  checkSinkAssignment(node.left, rhsTaint, ctx);
+  checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
   checkPrototypePollution(node, env, ctx);
 
   let finalTaint = rhsTaint;
@@ -471,13 +676,16 @@ function processAssignment(node, env, ctx) {
       }
       if (handler.type === 'ArrowFunctionExpression' || handler.type === 'FunctionExpression' ||
           handler.type === 'FunctionDeclaration') {
-        const checksOrigin = callbackChecksOrigin(handler.body);
-        if (!checksOrigin && handler.params[0]) {
+        const originCheck = callbackChecksOrigin(handler.body, ctx);
+        if (originCheck !== 'strong' && handler.params[0]) {
           const paramName = handler.params[0].type === 'Identifier' ? handler.params[0].name : null;
           if (paramName) {
             const childEnv = env.child();
             const loc = handler.loc?.start || {};
-            const label = new TaintLabel('postMessage.data', ctx.file, loc.line || 0, loc.column || 0, `${paramName}.data (no origin check)`);
+            const desc = originCheck === 'weak'
+              ? `${paramName}.data (weak origin check)`
+              : `${paramName}.data (no origin check)`;
+            const label = new TaintLabel('postMessage.data', ctx.file, loc.line || 0, loc.column || 0, desc);
             assignToPattern(handler.params[0], TaintSet.from(label), childEnv, ctx);
             childEnv.set(`${paramName}.data`, TaintSet.from(label));
             if (handler.body.type === 'BlockStatement') {
@@ -775,7 +983,7 @@ function evaluateCallExpr(node, env, ctx) {
   if (isSanitizer(calleeStr, methodName)) return TaintSet.empty();
 
   const sinkInfo = checkCallSink(calleeStr, methodName);
-  if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, ctx);
+  if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
 
   // setTimeout/setInterval with function callback: analyze body for closure taint reaching sinks
   if ((calleeStr === 'setTimeout' || calleeStr === 'setInterval') && node.arguments[0]) {
@@ -839,7 +1047,7 @@ function evaluateNewExpr(node, env, ctx) {
   }
 
   if (constructorName === 'Function') {
-    checkSinkCall(node, { type: 'XSS', taintedArgs: [0] }, argTaints, 'new Function()', ctx);
+    checkSinkCall(node, { type: 'XSS', taintedArgs: [0] }, argTaints, 'new Function()', env, ctx);
   }
 
   // Analyze constructor body to track this.* assignments
@@ -1004,13 +1212,16 @@ function analyzeEventListener(node, argTaints, env, ctx) {
   const childEnv = env.child();
 
   if (eventName === 'message' && callback.params[0]) {
-    // Check if the handler validates event.origin
-    const checksOrigin = callbackChecksOrigin(callback.body);
-    if (!checksOrigin) {
+    // Check if the handler validates event.origin — returns 'strong', 'weak', or false
+    const originCheck = callbackChecksOrigin(callback.body, ctx);
+    if (originCheck !== 'strong') {
       const paramName = callback.params[0].type === 'Identifier' ? callback.params[0].name : null;
       if (paramName) {
         const loc = callback.loc?.start || {};
-        const label = new TaintLabel('postMessage.data', ctx.file, loc.line || 0, loc.column || 0, `${paramName}.data (no origin check)`);
+        const desc = originCheck === 'weak'
+          ? `${paramName}.data (weak origin check)`
+          : `${paramName}.data (no origin check)`;
+        const label = new TaintLabel('postMessage.data', ctx.file, loc.line || 0, loc.column || 0, desc);
         assignToPattern(callback.params[0], TaintSet.from(label), childEnv, ctx);
         childEnv.set(`${paramName}.data`, TaintSet.from(label));
       }
@@ -1023,20 +1234,238 @@ function analyzeEventListener(node, argTaints, env, ctx) {
   return evaluateExpr(callback.body, childEnv, ctx);
 }
 
-function callbackChecksOrigin(node) {
+// Classify origin validation quality in a postMessage handler.
+// Returns: 'strong' — properly validated (suppress finding)
+//          'weak'   — bypassable check (still flag, but note the weak check)
+//          false    — no origin check at all
+function callbackChecksOrigin(node, ctx) {
   if (!node || typeof node !== 'object') return false;
-  if (node.type === 'BinaryExpression' && (node.operator === '===' || node.operator === '==' || node.operator === '!==' || node.operator === '!=')) {
+  const checks = [];
+  collectOriginChecks(node, checks, ctx);
+  if (checks.length === 0) return false;
+  // If any check is strong, the handler is safe
+  if (checks.some(c => c === 'strong')) return 'strong';
+  return 'weak';
+}
+
+function collectOriginChecks(node, checks, ctx) {
+  if (!node || typeof node !== 'object') return;
+
+  // Binary comparison: e.origin === / !== / == / != something
+  if (node.type === 'BinaryExpression' &&
+      (node.operator === '===' || node.operator === '==' ||
+       node.operator === '!==' || node.operator === '!=')) {
     const l = nodeToString(node.left), r = nodeToString(node.right);
-    if ((l && l.endsWith('.origin')) || (r && r.endsWith('.origin'))) return true;
+    const originSide = (l && l.endsWith('.origin')) ? 'left' : (r && r.endsWith('.origin')) ? 'right' : null;
+    if (originSide) {
+      const otherNode = originSide === 'left' ? node.right : node.left;
+      const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
+      if (otherStr !== null) {
+        checks.push(classifyOriginLiteral(otherStr));
+      } else {
+        // Variable comparison: e.origin === expectedOrigin — assume strong
+        checks.push('strong');
+      }
+      return;
+    }
   }
+
+  // Method call on .origin: e.origin.includes(), e.origin.startsWith(), etc.
+  if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
+    const objStr = nodeToString(node.callee.object);
+    const method = node.callee.property?.name;
+    if (objStr && objStr.endsWith('.origin') && method) {
+      checks.push(classifyOriginMethod(method, node));
+      return;
+    }
+    // Array/Set allowlist check: allowedOrigins.includes(e.origin)
+    if (method === 'includes' || method === 'has') {
+      const arg = node.arguments[0];
+      if (arg) {
+        const argStr = nodeToString(arg);
+        if (argStr && argStr.endsWith('.origin')) {
+          checks.push('strong'); // allowList.includes(e.origin) is strong
+          return;
+        }
+      }
+    }
+    // Regex .test(e.origin): /pattern/.test(e.origin)
+    if (method === 'test') {
+      const arg = node.arguments[0];
+      if (arg) {
+        const argStr = nodeToString(arg);
+        if (argStr && argStr.endsWith('.origin')) {
+          const pattern = node.callee.object?.regex?.pattern ||
+                          node.callee.object?.pattern || '';
+          checks.push(classifyOriginRegex(pattern));
+          return;
+        }
+      }
+    }
+  }
+
+  // Custom validator function call with origin as argument:
+  // isAllowed(e.origin), validateOrigin(e.origin), etc.
+  if (node.type === 'CallExpression') {
+    const hasOriginArg = node.arguments?.some(arg => {
+      const str = nodeToString(arg);
+      return str && str.endsWith('.origin');
+    });
+    if (hasOriginArg) {
+      // Resolve the function and analyze it
+      const calleeName = nodeToString(node.callee);
+      if (calleeName && ctx) {
+        const funcNode = ctx.funcMap.get(calleeName);
+        if (funcNode) {
+          const quality = analyzeOriginValidator(funcNode, ctx);
+          checks.push(quality);
+          return;
+        }
+      }
+      // Unknown function with origin arg — conservative: treat as weak
+      checks.push('weak');
+      return;
+    }
+  }
+
+  // Recurse into child nodes
   for (const key of Object.keys(node)) {
     if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
     const child = node[key];
     if (Array.isArray(child)) {
-      for (const item of child) { if (item && typeof item === 'object' && item.type && callbackChecksOrigin(item)) return true; }
-    } else if (child && typeof child === 'object' && child.type && callbackChecksOrigin(child)) return true;
+      for (const item of child) {
+        if (item && typeof item === 'object' && item.type) collectOriginChecks(item, checks, ctx);
+      }
+    } else if (child && typeof child === 'object' && child.type) {
+      collectOriginChecks(child, checks, ctx);
+    }
   }
-  return false;
+}
+
+// Classify a string literal compared against .origin
+function classifyOriginLiteral(value) {
+  if (!value || typeof value !== 'string') return 'weak';
+  // 'null' origin — sandboxed iframes have null origin, this is insecure
+  if (value === 'null') return 'weak';
+  // Empty string check is useless
+  if (value === '') return 'weak';
+  // Wildcard '*' is not a real check
+  if (value === '*') return 'weak';
+  // Must look like a proper origin: scheme + :// + host (no path)
+  // e.g., 'https://trusted.com', 'http://localhost:3000'
+  if (/^https?:\/\/[^/]+$/.test(value)) return 'strong';
+  // Partial values (just a domain, just a scheme) are weak
+  return 'weak';
+}
+
+// Classify a method call on .origin (e.g., e.origin.includes('x'))
+function classifyOriginMethod(method, callNode) {
+  const arg = callNode.arguments?.[0];
+  const argVal = (arg && isStringLiteral(arg)) ? stringLiteralValue(arg) : null;
+
+  switch (method) {
+    case 'includes':
+    case 'indexOf':
+      // Substring matching is always bypassable: evil-trusted.com matches 'trusted.com'
+      return 'weak';
+    case 'endsWith':
+      // e.origin.endsWith('.example.com') — bypassable: evil.example.com matches
+      // e.origin.endsWith('trusted.com') — bypassable: evil-trusted.com matches
+      return 'weak';
+    case 'startsWith':
+      // e.origin.startsWith('https://trusted.com') with full origin is strong
+      if (argVal && /^https?:\/\/[^/]+/.test(argVal)) return 'strong';
+      // e.origin.startsWith('http') — just a scheme check, not origin validation
+      return 'weak';
+    case 'match':
+      // Regex match on origin
+      if (arg && (arg.type === 'RegExpLiteral' || arg.regex)) {
+        return classifyOriginRegex(arg.pattern || arg.regex?.pattern || '');
+      }
+      return 'weak';
+    default:
+      return 'weak';
+  }
+}
+
+// Classify a regex used to validate .origin
+function classifyOriginRegex(pattern) {
+  if (!pattern) return 'weak';
+  // Must be anchored at both start and end to prevent bypass
+  const hasStart = pattern.startsWith('^');
+  const hasEnd = pattern.endsWith('$');
+  if (hasStart && hasEnd) return 'strong';
+  // Anchored at start with a full origin pattern is acceptable
+  if (hasStart && /^(\^)https?:/.test(pattern)) return 'strong';
+  // Unanchored regex is bypassable
+  return 'weak';
+}
+
+// Analyze a custom origin validator function to determine check quality.
+// Looks inside the function body for origin comparison patterns.
+function analyzeOriginValidator(funcNode, ctx) {
+  if (!funcNode) return 'weak';
+  const body = funcNode.body || funcNode;
+  const checks = [];
+  collectOriginValidatorChecks(body, funcNode.params, checks);
+  if (checks.length === 0) return 'weak';
+  if (checks.some(c => c === 'strong')) return 'strong';
+  return 'weak';
+}
+
+// Scan a validator function body for comparison patterns on its parameter
+function collectOriginValidatorChecks(node, params, checks) {
+  if (!node || typeof node !== 'object') return;
+  const paramNames = (params || []).map(p => p.type === 'Identifier' ? p.name : null).filter(Boolean);
+
+  // Binary comparison: param === 'https://...' or allowList.includes(param)
+  if (node.type === 'BinaryExpression' &&
+      (node.operator === '===' || node.operator === '==' ||
+       node.operator === '!==' || node.operator === '!=')) {
+    const l = nodeToString(node.left), r = nodeToString(node.right);
+    const paramSide = paramNames.includes(l) ? 'left' : paramNames.includes(r) ? 'right' : null;
+    if (paramSide) {
+      const otherNode = paramSide === 'left' ? node.right : node.left;
+      const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
+      if (otherStr !== null) {
+        checks.push(classifyOriginLiteral(otherStr));
+      } else {
+        checks.push('strong'); // variable comparison
+      }
+      return;
+    }
+  }
+
+  // Method call: param.includes(), allowList.includes(param), etc.
+  if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
+    const objStr = nodeToString(node.callee.object);
+    const method = node.callee.property?.name;
+    // param.includes('...'), param.startsWith('...'), etc.
+    if (paramNames.includes(objStr) && method) {
+      checks.push(classifyOriginMethod(method, node));
+      return;
+    }
+    // allowList.includes(param) — array allowlist lookup is strong
+    if ((method === 'includes' || method === 'has') && node.arguments?.[0]) {
+      const argStr = nodeToString(node.arguments[0]);
+      if (paramNames.includes(argStr)) {
+        checks.push('strong');
+        return;
+      }
+    }
+  }
+
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
+    const child = node[key];
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        if (item && typeof item === 'object' && item.type) collectOriginValidatorChecks(item, params, checks);
+      }
+    } else if (child && typeof child === 'object' && child.type) {
+      collectOriginValidatorChecks(child, params, checks);
+    }
+  }
 }
 
 // ── Analyze callback passed to array methods ──
@@ -1266,7 +1695,34 @@ function processForBinding(node, env, ctx) {
 }
 
 // ── Sink checks ──
-function checkSinkAssignment(leftNode, rhsTaint, ctx) {
+function classifyNavigationType(sinkInfo, env, rhsNode) {
+  // For navigation sinks, check if the value has been URL-scheme-validated on this path.
+  // If scheme is confirmed http/https, it's Open Redirect (javascript: blocked).
+  // Otherwise it's XSS (javascript: URI injection possible).
+  if (!sinkInfo.navigation) return sinkInfo.type;
+
+  // Check the RHS expression — resolve to variable name(s) that may be scheme-checked
+  if (rhsNode) {
+    const varName = nodeToString(rhsNode);
+    if (varName && env.schemeCheckedVars.has(varName)) return 'Open Redirect';
+    // Also check for URL object patterns: if url is scheme-checked, url.href inherits it
+    if (rhsNode.type === 'MemberExpression' || rhsNode.type === 'OptionalMemberExpression') {
+      const objName = nodeToString(rhsNode.object);
+      if (objName && env.schemeCheckedVars.has(objName)) return 'Open Redirect';
+    }
+    // Check if the variable references a new URL() result — new URL() with validated protocol
+    if (rhsNode.type === 'Identifier') {
+      // Check all resolved names (scope-resolved and raw)
+      for (const checked of env.schemeCheckedVars) {
+        if (checked === rhsNode.name || checked.endsWith(':' + rhsNode.name)) return 'Open Redirect';
+      }
+    }
+  }
+
+  return sinkInfo.type; // default: XSS
+}
+
+function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
   if (!rhsTaint.tainted) return;
 
   const leftStr = nodeToString(leftNode);
@@ -1274,18 +1730,20 @@ function checkSinkAssignment(leftNode, rhsTaint, ctx) {
   const sinkInfo = checkAssignmentSink(leftStr, propName);
   if (!sinkInfo) return;
 
+  const type = classifyNavigationType(sinkInfo, env, rhsNode);
+  const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
   const loc = leftNode.loc?.start || {};
   ctx.findings.push({
-    type: sinkInfo.type,
-    severity: sinkInfo.type === 'XSS' ? 'critical' : 'high',
-    title: `${sinkInfo.type}: tainted data flows to ${leftStr || propName}`,
+    type,
+    severity,
+    title: `${type}: tainted data flows to ${leftStr || propName}`,
     sink: { expression: leftStr || propName, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
     source: rhsTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
     path: buildTaintPath(rhsTaint, leftStr || propName),
   });
 }
 
-function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, ctx) {
+function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
   for (const argIdx of sinkInfo.taintedArgs) {
     const argTaint = argTaints[argIdx];
     if (!argTaint || !argTaint.tainted) continue;
@@ -1295,11 +1753,13 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, ctx) {
       if (argNode.type === 'ArrowFunctionExpression' || argNode.type === 'FunctionExpression') continue;
     }
 
+    const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx]);
+    const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
     const loc = callNode.loc?.start || {};
     ctx.findings.push({
-      type: sinkInfo.type,
-      severity: sinkInfo.type === 'XSS' ? 'critical' : 'high',
-      title: `${sinkInfo.type}: tainted data flows to ${calleeStr}()`,
+      type,
+      severity,
+      title: `${type}: tainted data flows to ${calleeStr}()`,
       sink: { expression: `${calleeStr}(arg${argIdx})`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
       source: argTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
       path: buildTaintPath(argTaint, calleeStr),
