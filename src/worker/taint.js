@@ -73,6 +73,8 @@ export class TaintEnv {
     this.schemeCheckedVars = new Set();
     // Track new URL(x) origins: urlVar → sourceVar (so checking url.protocol also validates sourceVar)
     this.urlConstructorOrigins = new Map();
+    // Object aliases: varName → globalName (e.g., loc → location, doc → document)
+    this.aliases = new Map();
   }
 
   get(key) {
@@ -94,6 +96,7 @@ export class TaintEnv {
     for (const [k, v] of this.bindings) env.bindings.set(k, v.clone());
     env.schemeCheckedVars = new Set(this.schemeCheckedVars);
     env.urlConstructorOrigins = new Map(this.urlConstructorOrigins);
+    env.aliases = new Map(this.aliases);
     return env;
   }
 
@@ -127,6 +130,9 @@ export class TaintEnv {
     }
     for (const [k, v] of other.urlConstructorOrigins) {
       if (!this.urlConstructorOrigins.has(k)) this.urlConstructorOrigins.set(k, v);
+    }
+    for (const [k, v] of other.aliases) {
+      if (!this.aliases.has(k)) this.aliases.set(k, v);
     }
     return changed;
   }
@@ -215,6 +221,12 @@ export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo) {
     const exitEnv = processBlock(block, entryEnv.clone(), ctx);
 
     for (const succ of block.successors) {
+      // Constant-fold: skip unreachable branches (e.g., if(false) consequent)
+      if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
+        const val = isConstantBool(succ.branchCondition);
+        if (val === false && succ.branchPolarity === true) continue;
+        if (val === true && succ.branchPolarity === false) continue;
+      }
       const existing = blockEnvs.get(succ.id);
       if (!existing) {
         blockEnvs.set(succ.id, exitEnv.clone());
@@ -423,6 +435,19 @@ function isNumericLiteral(node, value) {
   if (node.type === 'NumericLiteral' && node.value === value) return true;
   if (node.type === 'Literal' && typeof node.value === 'number' && node.value === value) return true;
   return false;
+}
+// Returns true/false if the node is a constant truthy/falsy literal, null if unknown
+function isConstantBool(node) {
+  if (!node) return null;
+  if (node.type === 'BooleanLiteral') return node.value;
+  if (node.type === 'Literal' && typeof node.value === 'boolean') return node.value;
+  if (node.type === 'NumericLiteral' || (node.type === 'Literal' && typeof node.value === 'number'))
+    return node.value !== 0;
+  if (node.type === 'StringLiteral' || (node.type === 'Literal' && typeof node.value === 'string'))
+    return node.value !== '';
+  if (node.type === 'NullLiteral' || (node.type === 'Literal' && node.value === null)) return false;
+  if (node.type === 'Identifier' && node.name === 'undefined') return false;
+  return null;
 }
 function findProtocolMember(node) {
   // Returns the base object name if node is X.protocol
@@ -705,6 +730,37 @@ function processVarDeclarator(node, env, ctx) {
   }
   registerReturnedFunctions(node.id, ctx);
 
+  // Track aliases to known globals: var loc = location; var doc = document; etc.
+  if (node.id.type === 'Identifier' && node.init.type === 'Identifier') {
+    const ALIASABLE_GLOBALS = new Set(['location', 'document', 'window', 'self', 'globalThis', 'navigator', 'top', 'parent']);
+    const initName = node.init.name;
+    if (ALIASABLE_GLOBALS.has(initName)) {
+      env.aliases.set(node.id.name, initName);
+    }
+    // Transitive: if init is itself an alias, propagate
+    const existing = env.aliases.get(initName);
+    if (existing) env.aliases.set(node.id.name, existing);
+  }
+  // Also: var search = location.search (MemberExpression alias)
+  if (node.id.type === 'Identifier' && (node.init.type === 'MemberExpression' || node.init.type === 'OptionalMemberExpression')) {
+    const objStr = nodeToString(node.init.object);
+    if (objStr) {
+      const resolvedObj = env.aliases.get(objStr) || objStr;
+      if (resolvedObj !== objStr) {
+        // Store the resolved path so later lookups find it
+        const prop = node.init.property?.name || node.init.property?.value;
+        if (prop) {
+          const resolvedPath = `${resolvedObj}.${prop}`;
+          const sourceTaint = checkMemberSource({ type: 'MemberExpression', object: { type: 'Identifier', name: resolvedObj }, property: node.init.property, computed: false });
+          if (sourceTaint) {
+            const loc = node.init.loc?.start || {};
+            env.set(node.id.name, TaintSet.from(new TaintLabel(sourceTaint, ctx.file, loc.line || 0, loc.column || 0, resolvedPath)));
+          }
+        }
+      }
+    }
+  }
+
   // Store per-property taint for ObjectExpression: var obj = { a: tainted, b: safe }
   if (node.id.type === 'Identifier' && node.init.type === 'ObjectExpression') {
     storeObjectPropertyTaints(node.id.name, node.init, env, ctx);
@@ -762,6 +818,17 @@ function processAssignment(node, env, ctx) {
         if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, node.right);
       }
     }
+    // Computed member: obj[key] = function(){} → register as obj[] for dynamic dispatch
+    if (!leftStr && node.left.type === 'MemberExpression' && node.left.computed) {
+      const objStr = nodeToString(node.left.object);
+      if (objStr) {
+        ctx.funcMap.set(`${objStr}[]`, node.right);
+        if (node.left.object.type === 'Identifier') {
+          const key = resolveId(node.left.object, ctx);
+          ctx.funcMap.set(`${key}[]`, node.right);
+        }
+      }
+    }
     // For Identifier targets, also register by scope-resolved key
     if (node.left.type === 'Identifier') {
       const key = resolveId(node.left, ctx);
@@ -777,6 +844,22 @@ function processAssignment(node, env, ctx) {
       const leftKey = resolveId(node.left, ctx);
       ctx.funcMap.set(leftKey, refFunc);
       ctx.funcMap.set(node.left.name, refFunc);
+    }
+  }
+
+  // Computed member assignment of function ref: obj[key] = existingFunc
+  if (node.operator === '=' && node.right.type === 'Identifier' &&
+      node.left.type === 'MemberExpression' && node.left.computed) {
+    const refFunc = ctx.funcMap.get(node.right.name) || ctx.funcMap.get(resolveId(node.right, ctx));
+    if (refFunc) {
+      const objStr = nodeToString(node.left.object);
+      if (objStr) {
+        ctx.funcMap.set(`${objStr}[]`, refFunc);
+        if (node.left.object.type === 'Identifier') {
+          const key = resolveId(node.left.object, ctx);
+          ctx.funcMap.set(`${key}[]`, refFunc);
+        }
+      }
     }
   }
 
@@ -960,8 +1043,21 @@ export function evaluateExpr(node, env, ctx) {
       processAssignment(node, env, ctx);
       return evaluateExpr(node.left, env, ctx);
 
-    case 'BinaryExpression':
-      return evaluateExpr(node.left, env, ctx).clone().merge(evaluateExpr(node.right, env, ctx));
+    case 'BinaryExpression': {
+      const leftT = evaluateExpr(node.left, env, ctx);
+      const rightT = evaluateExpr(node.right, env, ctx);
+      const op = node.operator;
+      // String concatenation: propagate taint
+      if (op === '+') return leftT.clone().merge(rightT);
+      // Comparison/relational: return boolean — kill taint
+      if (op === '===' || op === '==' || op === '!==' || op === '!=' ||
+          op === '>' || op === '<' || op === '>=' || op === '<=' ||
+          op === 'instanceof' || op === 'in') return TaintSet.empty();
+      // Arithmetic/bitwise: return number — kill taint
+      if (op === '-' || op === '*' || op === '/' || op === '%' || op === '**' ||
+          op === '|' || op === '&' || op === '^' || op === '<<' || op === '>>' || op === '>>>') return TaintSet.empty();
+      return leftT.clone().merge(rightT);
+    }
 
     case 'LogicalExpression':
       return evaluateExpr(node.left, env, ctx).clone().merge(evaluateExpr(node.right, env, ctx));
@@ -1065,6 +1161,31 @@ function evaluateMemberExpr(node, env, ctx) {
   if (sourceLabel) {
     const loc = node.loc?.start || {};
     return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(node)));
+  }
+
+  // Resolve aliases: if obj is aliased to a global, check resolved path as source
+  if (!node.computed && node.object?.type === 'Identifier') {
+    const alias = env.aliases.get(node.object.name);
+    if (alias) {
+      const resolvedNode = { ...node, object: { type: 'Identifier', name: alias } };
+      const resolvedLabel = checkMemberSource(resolvedNode);
+      if (resolvedLabel) {
+        const loc = node.loc?.start || {};
+        return TaintSet.from(new TaintLabel(resolvedLabel, ctx.file, loc.line || 0, loc.column || 0, `${alias}.${node.property?.name || node.property?.value}`));
+      }
+      // Deep alias: loc.hash where loc → location → check location.hash
+      if (node.property) {
+        const deepPath = `${alias}.${node.property.name || node.property.value}`;
+        const deepNode = { type: 'MemberExpression', computed: false,
+          object: { type: 'Identifier', name: alias },
+          property: node.property };
+        const deepLabel = checkMemberSource(deepNode);
+        if (deepLabel) {
+          const loc = node.loc?.start || {};
+          return TaintSet.from(new TaintLabel(deepLabel, ctx.file, loc.line || 0, loc.column || 0, deepPath));
+        }
+      }
+    }
   }
 
   const fullPath = nodeToString(node);
@@ -1203,13 +1324,18 @@ function evaluateCallExpr(node, env, ctx) {
     }
   }
 
-  // Array.from(iterable) — propagate taint from iterable
-  if (calleeStr === 'Array.from') {
-    return argTaints[0]?.clone() || TaintSet.empty();
+  // Array.from(iterable) / Array.of(...items) — propagate taint from args
+  if (calleeStr === 'Array.from' || calleeStr === 'Array.of') {
+    const merged = TaintSet.empty();
+    for (const t of argTaints) merged.merge(t);
+    return merged;
   }
 
   // Object.values/keys/entries — propagate taint from object properties
-  if (calleeStr === 'Object.values' || calleeStr === 'Object.keys' || calleeStr === 'Object.entries') {
+  // Object.keys returns property names (strings) — not tainted by values
+  if (calleeStr === 'Object.keys') return TaintSet.empty();
+
+  if (calleeStr === 'Object.values' || calleeStr === 'Object.entries') {
     const argTaint = argTaints[0] || TaintSet.empty();
     if (argTaint.tainted) return argTaint.clone();
     // Also check if any properties of the argument are tainted
@@ -1359,9 +1485,19 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     case 'reduce': case 'reduceRight':
       return objTaint.clone().merge(argTaints[1] || TaintSet.empty());
 
-    case 'forEach':
-      analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
+    case 'forEach': {
+      // For Map/Set forEach, also include per-key taint stored as obj.#key_*
+      let effectiveTaint = objTaint.clone();
+      if (node.callee?.object) {
+        const objStr = nodeToString(node.callee.object);
+        if (objStr) {
+          const perKeyTaints = env.getTaintedWithPrefix(`${objStr}.#key_`);
+          for (const [, t] of perKeyTaints) effectiveTaint.merge(t);
+        }
+      }
+      analyzeArrayCallback(node, argTaints, effectiveTaint, env, ctx);
       return TaintSet.empty();
+    }
 
     case 'set': {
       // Map.set(key, value) — store taint per-key for precise tracking
@@ -1910,6 +2046,12 @@ function analyzeInlineFunction(funcNode, env, ctx) {
     const exitEnv = processBlock(block, entryEnv.clone(), innerCtx);
 
     for (const succ of block.successors) {
+      // Constant-fold: skip unreachable branches
+      if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
+        const val = isConstantBool(succ.branchCondition);
+        if (val === false && succ.branchPolarity === true) continue;
+        if (val === true && succ.branchPolarity === false) continue;
+      }
       const existing = blockEnvs.get(succ.id);
       if (!existing) {
         blockEnvs.set(succ.id, exitEnv.clone());
@@ -2077,8 +2219,30 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       for (let j = i; j < argTaints.length; j++) restTaint.merge(argTaints[j]);
       assignToPattern(param.argument, restTaint, childEnv, ctx);
     } else {
-      assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+      // If an actual non-undefined argument was provided, assign directly to the param's
+      // left side (skip default evaluation even if the arg taint is empty).
+      // Passing undefined explicitly still triggers the default parameter.
+      if (param.type === 'AssignmentPattern' && i < callNode.arguments.length) {
+        const argNode = callNode.arguments[i];
+        const isUndefined = argNode && argNode.type === 'Identifier' && argNode.name === 'undefined';
+        if (isUndefined) {
+          // Treat as missing — let AssignmentPattern evaluate the default
+          assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+        } else {
+          assignToPattern(param.left, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+        }
+      } else {
+        assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+      }
     }
+  }
+
+  // Bind `arguments` object — merge all arg taints so arguments[n] resolves
+  const argsMerged = TaintSet.empty();
+  for (const t of argTaints) argsMerged.merge(t);
+  if (argsMerged.tainted) {
+    childEnv.set('arguments', argsMerged);
+    childEnv.set('global:arguments', argsMerged);
   }
 
   const savedFuncMap = ctx.funcMap;

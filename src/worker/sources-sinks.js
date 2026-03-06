@@ -135,6 +135,18 @@ export const SANITIZERS = new Set([
   'Math.ceil',
   'Math.round',
   'Math.abs',
+  'Math.max',
+  'Math.min',
+  'Math.pow',
+  'Math.sqrt',
+  'Math.log',
+  'Number.isNaN',
+  'Number.isFinite',
+  'Number.isInteger',
+  'Number.isSafeInteger',
+  'isNaN',
+  'isFinite',
+  'Array.isArray',
 ]);
 
 // ── Helpers to match AST nodes against these definitions ──
