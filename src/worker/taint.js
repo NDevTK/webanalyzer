@@ -739,6 +739,30 @@ function processVarDeclarator(node, env, ctx) {
     const srcStr = nodeToString(node.init);
     if (srcStr) {
       assignObjectPatternFromSource(node.id, srcStr, taint, env, ctx);
+    } else if (node.init.type === 'ObjectExpression') {
+      // Direct destructuring from object literal: var { x = default } = { x: 'safe' }
+      // Build a map of property names → taint values from the RHS literal
+      const literalProps = new Map();
+      for (const prop of node.init.properties) {
+        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+          const pName = prop.key.name || prop.key.value;
+          if (pName) literalProps.set(pName, evaluateExpr(prop.value, env, ctx));
+        }
+      }
+      for (const prop of node.id.properties) {
+        if (prop.type === 'RestElement') {
+          assignToPattern(prop.argument, taint, env, ctx);
+          continue;
+        }
+        const keyName = prop.key ? (prop.key.name || prop.key.value) : null;
+        if (keyName && literalProps.has(keyName)) {
+          // Property exists in RHS literal — use its value, skip default
+          const target = prop.value.type === 'AssignmentPattern' ? prop.value.left : prop.value;
+          assignToPattern(target, literalProps.get(keyName), env, ctx);
+        } else {
+          assignToPattern(prop.value, taint, env, ctx);
+        }
+      }
     } else {
       assignToPattern(node.id, taint, env, ctx);
     }
@@ -761,7 +785,10 @@ function processVarDeclarator(node, env, ctx) {
 
   // Track aliases to known globals: var loc = location; var doc = document; etc.
   if (node.id.type === 'Identifier' && node.init.type === 'Identifier') {
-    const ALIASABLE_GLOBALS = new Set(['location', 'document', 'window', 'self', 'globalThis', 'navigator', 'top', 'parent']);
+    const ALIASABLE_GLOBALS = new Set(['location', 'document', 'window', 'self', 'globalThis', 'navigator', 'top', 'parent',
+      'eval', 'setTimeout', 'setInterval', 'Function', 'fetch', 'atob', 'decodeURIComponent', 'decodeURI',
+      'encodeURIComponent', 'encodeURI', 'parseInt', 'parseFloat', 'Number', 'Boolean', 'String', 'JSON', 'Math',
+      'DOMPurify', 'structuredClone', 'queueMicrotask', 'requestAnimationFrame']);
     const initName = node.init.name;
     if (ALIASABLE_GLOBALS.has(initName)) {
       env.aliases.set(node.id.name, initName);
@@ -773,18 +800,22 @@ function processVarDeclarator(node, env, ctx) {
   // Also: var search = location.search (MemberExpression alias)
   if (node.id.type === 'Identifier' && (node.init.type === 'MemberExpression' || node.init.type === 'OptionalMemberExpression')) {
     const objStr = nodeToString(node.init.object);
-    if (objStr) {
+    const prop = node.init.property?.name || node.init.property?.value;
+    if (objStr && prop) {
+      // var loc = window.location → alias loc to 'location'
+      // var loc = document.location → alias loc to 'location'
+      const LOCATION_PARENTS = new Set(['window', 'document', 'self', 'globalThis']);
+      if (prop === 'location' && LOCATION_PARENTS.has(objStr)) {
+        env.aliases.set(node.id.name, 'location');
+      }
       const resolvedObj = env.aliases.get(objStr) || objStr;
       if (resolvedObj !== objStr) {
         // Store the resolved path so later lookups find it
-        const prop = node.init.property?.name || node.init.property?.value;
-        if (prop) {
-          const resolvedPath = `${resolvedObj}.${prop}`;
-          const sourceTaint = checkMemberSource({ type: 'MemberExpression', object: { type: 'Identifier', name: resolvedObj }, property: node.init.property, computed: false });
-          if (sourceTaint) {
-            const loc = node.init.loc?.start || {};
-            env.set(node.id.name, TaintSet.from(new TaintLabel(sourceTaint, ctx.file, loc.line || 0, loc.column || 0, resolvedPath)));
-          }
+        const resolvedPath = `${resolvedObj}.${prop}`;
+        const sourceTaint = checkMemberSource({ type: 'MemberExpression', object: { type: 'Identifier', name: resolvedObj }, property: node.init.property, computed: false });
+        if (sourceTaint) {
+          const loc = node.init.loc?.start || {};
+          env.set(node.id.name, TaintSet.from(new TaintLabel(sourceTaint, ctx.file, loc.line || 0, loc.column || 0, resolvedPath)));
         }
       }
     }
@@ -827,7 +858,25 @@ function processAssignment(node, env, ctx) {
   if (node.operator !== '=') {
     finalTaint = evaluateExpr(node.left, env, ctx).clone().merge(rhsTaint);
   }
-  assignToPattern(node.left, finalTaint, env, ctx);
+  // Per-element destructuring from array literal: [a, b] = [expr1, expr2]
+  // Evaluate ALL RHS elements first (snapshot), then assign, to handle swaps correctly
+  if (node.operator === '=' && node.left.type === 'ArrayPattern' && node.right.type === 'ArrayExpression') {
+    const elems = node.right.elements;
+    const elemTaints = elems.map(e => e ? evaluateExpr(e, env, ctx) : TaintSet.empty());
+    for (let i = 0; i < node.left.elements.length; i++) {
+      const pat = node.left.elements[i];
+      if (!pat) continue;
+      if (pat.type === 'RestElement') {
+        const restTaint = TaintSet.empty();
+        for (let j = i; j < elemTaints.length; j++) restTaint.merge(elemTaints[j]);
+        assignToPattern(pat.argument, restTaint, env, ctx);
+        break;
+      }
+      assignToPattern(pat, i < elemTaints.length ? elemTaints[i] : TaintSet.empty(), env, ctx);
+    }
+  } else {
+    assignToPattern(node.left, finalTaint, env, ctx);
+  }
   registerReturnedFunctions(node.left, ctx);
 
   // Track CustomEvent type: var ev = new CustomEvent('type', ...) → map ev → type
@@ -1005,6 +1054,14 @@ function assignToPattern(pattern, taint, env, ctx) {
       if (!pattern.computed && pattern.property?.name) {
         const objStr = nodeToString(pattern.object);
         if (objStr) env.set(`${objStr}.${pattern.property.name}`, taint);
+        // For window.X / self.X / globalThis.X assignments, also set the bare name
+        // so cross-file resolution can find it as a plain identifier
+        const GLOBAL_PREFIXES = new Set(['window', 'self', 'globalThis']);
+        if (pattern.object.type === 'Identifier' && GLOBAL_PREFIXES.has(pattern.object.name)) {
+          const propName = pattern.property.name;
+          env.set(propName, taint);
+          env.set(`global:${propName}`, taint);
+        }
       }
       break;
     }
@@ -1180,6 +1237,29 @@ export function evaluateExpr(node, env, ctx) {
 
     case 'ConditionalExpression': {
       evaluateExpr(node.test, env, ctx);
+      // Constant-fold: if condition is known, only evaluate the taken branch
+      const constCond = isConstantBool(node.test);
+      if (constCond === true) {
+        const branch = node.consequent;
+        const result = evaluateExpr(branch, env, ctx);
+        // Register function reference for constant-folded ternary: var f = true ? fnA : fnB
+        if (!ctx.returnedFuncNode && branch.type === 'Identifier') {
+          const refKey = resolveId(branch, ctx);
+          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+          if (funcRef) ctx.returnedFuncNode = funcRef;
+        }
+        return result;
+      }
+      if (constCond === false) {
+        const branch = node.alternate;
+        const result = evaluateExpr(branch, env, ctx);
+        if (!ctx.returnedFuncNode && branch.type === 'Identifier') {
+          const refKey = resolveId(branch, ctx);
+          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+          if (funcRef) ctx.returnedFuncNode = funcRef;
+        }
+        return result;
+      }
       // Apply scheme check from test to consequent branch (same as if-statement path sensitivity)
       const checkedVar = extractSchemeCheck(node.test, true);
       const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
@@ -1363,6 +1443,12 @@ function evaluateCallExpr(node, env, ctx) {
   let calleeStr = nodeToString(node.callee);
   const methodName = (node.callee.type === 'MemberExpression' || node.callee.type === 'OptionalMemberExpression') ? node.callee.property?.name || '' : '';
 
+  // Resolve aliases for identifier callees: var e = eval; e(x) → eval(x)
+  if (calleeStr && node.callee.type === 'Identifier') {
+    const alias = env.aliases.get(calleeStr);
+    if (alias) calleeStr = alias;
+  }
+
   // Indirect eval: (0, eval)(x) — the callee is a SequenceExpression whose last element is eval
   if (!calleeStr && node.callee.type === 'SequenceExpression') {
     const last = node.callee.expressions[node.callee.expressions.length - 1];
@@ -1375,6 +1461,11 @@ function evaluateCallExpr(node, env, ctx) {
   // For factory()() patterns: evaluate the callee CallExpression first
   // so ctx.returnedFuncNode is set before analyzeCalledFunction runs
   if (node.callee.type === 'CallExpression' || node.callee.type === 'OptionalCallExpression') {
+    evaluateExpr(node.callee, env, ctx);
+  }
+  // For new Function(code)() patterns: evaluate the NewExpression callee
+  // so the sink check inside evaluateNewExpr fires
+  if (node.callee.type === 'NewExpression') {
     evaluateExpr(node.callee, env, ctx);
   }
 
@@ -1455,6 +1546,25 @@ function evaluateCallExpr(node, env, ctx) {
 
   // Object.fromEntries — propagate taint from entries (array of [key, value] pairs)
   if (calleeStr === 'Object.fromEntries') {
+    return argTaints[0]?.clone() || TaintSet.empty();
+  }
+
+  // Reflect.get(obj, prop) → equivalent to obj[prop]
+  if (calleeStr === 'Reflect.get' && node.arguments.length >= 2) {
+    const objNode = node.arguments[0];
+    const propNode = node.arguments[1];
+    const objStr = nodeToString(objNode);
+    if (objStr && isStringLiteral(propNode)) {
+      const propName = stringLiteralValue(propNode);
+      const propTaint = env.get(`${objStr}.${propName}`);
+      if (propTaint.tainted) return propTaint;
+      if (objNode.type === 'Identifier') {
+        const key = resolveId(objNode, ctx);
+        const keyTaint = env.get(`${key}.${propName}`);
+        if (keyTaint.tainted) return keyTaint;
+      }
+    }
+    // Fall back: if object itself is tainted, reading any property is tainted
     return argTaints[0]?.clone() || TaintSet.empty();
   }
 
@@ -1583,6 +1693,28 @@ function evaluateCallExpr(node, env, ctx) {
   return analyzeCalledFunction(node, calleeStr, argTaints, env, ctx);
 }
 
+// Walk AST to find calls to a named function (e.g., resolve(x) inside Promise constructor)
+function walkCallsToResolve(node, resolveName, env, ctx, taintOut) {
+  if (!node || typeof node !== 'object') return;
+  if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
+    if (node.callee?.type === 'Identifier' && node.callee.name === resolveName && node.arguments[0]) {
+      const argTaint = evaluateExpr(node.arguments[0], env, ctx);
+      taintOut.merge(argTaint);
+    }
+  }
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
+    const child = node[key];
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        if (item && typeof item === 'object' && item.type) walkCallsToResolve(item, resolveName, env, ctx, taintOut);
+      }
+    } else if (child && typeof child === 'object' && child.type) {
+      walkCallsToResolve(child, resolveName, env, ctx, taintOut);
+    }
+  }
+}
+
 // ── New expression ──
 function evaluateNewExpr(node, env, ctx) {
   const constructorName = nodeToString(node.callee);
@@ -1599,6 +1731,31 @@ function evaluateNewExpr(node, env, ctx) {
     // new Function(body) or new Function(arg1, ..., body) — any tainted arg is code injection
     const allArgIndices = argTaints.map((_, i) => i);
     checkSinkCall(node, { type: 'XSS', taintedArgs: allArgIndices }, argTaints, 'new Function()', env, ctx);
+  }
+
+  // new Promise(function(resolve, reject) { resolve(tainted) }) → taint propagates to .then()
+  if (constructorName === 'Promise' && node.arguments[0]) {
+    let callback = node.arguments[0];
+    if (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression') {
+      const childEnv = env.child();
+      // The first param is `resolve` — calls to resolve(x) should capture x's taint as the promise's value
+      // We analyze the callback body and track what resolve() is called with
+      const resolveName = callback.params[0]?.type === 'Identifier' ? callback.params[0].name : null;
+      if (resolveName) {
+        // Create a synthetic "resolve" function that captures its argument taint
+        // by analyzing the callback body and looking for resolve(x) calls
+        if (callback.body.type === 'BlockStatement') {
+          const result = analyzeInlineFunction(callback, childEnv, ctx);
+          // The return taint of the inline function captures resolve(x) calls
+          // But we need to specifically find what resolve() was called with.
+          // Walk the callback body for CallExpression where callee is resolve
+          const resolveTaint = TaintSet.empty();
+          walkCallsToResolve(callback.body, resolveName, env, ctx, resolveTaint);
+          if (resolveTaint.tainted) return resolveTaint;
+          return result;
+        }
+      }
+    }
   }
 
   // new CustomEvent('type', {detail: tainted}) — track event type and detail taint
@@ -2515,6 +2672,23 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     }
   }
 
+  // Inline object method call: ({fn: function(){...}}).fn()
+  if (!funcNode && (callNode.callee?.type === 'MemberExpression' || callNode.callee?.type === 'OptionalMemberExpression') &&
+      callNode.callee.object?.type === 'ObjectExpression' && !callNode.callee.computed) {
+    const methodName = callNode.callee.property?.name;
+    if (methodName) {
+      for (const prop of callNode.callee.object.properties) {
+        if ((prop.type === 'ObjectProperty' || prop.type === 'Property' || prop.type === 'ObjectMethod') && prop.key) {
+          const pName = prop.key.name || prop.key.value;
+          if (pName === methodName) {
+            funcNode = prop.type === 'ObjectMethod' ? prop : prop.value;
+            break;
+          }
+        }
+      }
+    }
+  }
+
   // Method call: try full dot-path first (e.g., "obj.render"), then plain method name
   if (!funcNode && (callNode.callee?.type === 'MemberExpression' || callNode.callee?.type === 'OptionalMemberExpression')) {
     const fullPath = nodeToString(callNode.callee);
@@ -2719,6 +2893,14 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         // This is a non-local, non-param binding — likely a closure variable
         funcNode._closureEnv.set(key, taint);
       }
+    }
+  }
+
+  // Propagate global-scoped side effects back to the caller's env
+  // Handles: Config.init(val) sets Config.data = val → caller sees Config.data as tainted
+  for (const [key, taint] of childEnv.bindings) {
+    if (taint.tainted && key.includes('.') && !key.startsWith('this.') && !key.startsWith('global:')) {
+      env.set(key, taint);
     }
   }
 

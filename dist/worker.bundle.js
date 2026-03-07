@@ -43536,7 +43536,24 @@ ${rootStack}`;
     "self.location.search": "url.location.search",
     "self.location.pathname": "url.location.pathname",
     // window
-    "window.name": "window.name"
+    "window.name": "window.name",
+    // Cross-window/frame sources (opener, parent, top)
+    "opener.location.href": "url.location.href",
+    "opener.location.hash": "url.location.hash",
+    "opener.location.search": "url.location.search",
+    "opener.location.pathname": "url.location.pathname",
+    "window.opener.location.href": "url.location.href",
+    "window.opener.location.hash": "url.location.hash",
+    "window.opener.location.search": "url.location.search",
+    "window.opener.location.pathname": "url.location.pathname",
+    "parent.location.href": "url.location.href",
+    "parent.location.hash": "url.location.hash",
+    "parent.location.search": "url.location.search",
+    "parent.location.pathname": "url.location.pathname",
+    "top.location.href": "url.location.href",
+    "top.location.hash": "url.location.hash",
+    "top.location.search": "url.location.search",
+    "top.location.pathname": "url.location.pathname"
   };
   var CALL_SOURCES = {
     // URLSearchParams
@@ -43557,7 +43574,8 @@ ${rootStack}`;
     "fetch": "passthrough",
     // tainted URL → tainted response for .then chains
     "String": "passthrough",
-    "JSON.stringify": "passthrough"
+    "JSON.stringify": "passthrough",
+    "structuredClone": "passthrough"
   };
   var CONSTRUCTOR_SOURCES = {
     "URL": "url.constructed",
@@ -44277,6 +44295,27 @@ ${rootStack}`;
       const srcStr = nodeToString(node.init);
       if (srcStr) {
         assignObjectPatternFromSource(node.id, srcStr, taint, env, ctx);
+      } else if (node.init.type === "ObjectExpression") {
+        const literalProps = /* @__PURE__ */ new Map();
+        for (const prop of node.init.properties) {
+          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+            const pName = prop.key.name || prop.key.value;
+            if (pName) literalProps.set(pName, evaluateExpr(prop.value, env, ctx));
+          }
+        }
+        for (const prop of node.id.properties) {
+          if (prop.type === "RestElement") {
+            assignToPattern(prop.argument, taint, env, ctx);
+            continue;
+          }
+          const keyName = prop.key ? prop.key.name || prop.key.value : null;
+          if (keyName && literalProps.has(keyName)) {
+            const target = prop.value.type === "AssignmentPattern" ? prop.value.left : prop.value;
+            assignToPattern(target, literalProps.get(keyName), env, ctx);
+          } else {
+            assignToPattern(prop.value, taint, env, ctx);
+          }
+        }
       } else {
         assignToPattern(node.id, taint, env, ctx);
       }
@@ -44295,7 +44334,37 @@ ${rootStack}`;
       ctx._pendingCustomEventType = null;
     }
     if (node.id.type === "Identifier" && node.init.type === "Identifier") {
-      const ALIASABLE_GLOBALS = /* @__PURE__ */ new Set(["location", "document", "window", "self", "globalThis", "navigator", "top", "parent"]);
+      const ALIASABLE_GLOBALS = /* @__PURE__ */ new Set([
+        "location",
+        "document",
+        "window",
+        "self",
+        "globalThis",
+        "navigator",
+        "top",
+        "parent",
+        "eval",
+        "setTimeout",
+        "setInterval",
+        "Function",
+        "fetch",
+        "atob",
+        "decodeURIComponent",
+        "decodeURI",
+        "encodeURIComponent",
+        "encodeURI",
+        "parseInt",
+        "parseFloat",
+        "Number",
+        "Boolean",
+        "String",
+        "JSON",
+        "Math",
+        "DOMPurify",
+        "structuredClone",
+        "queueMicrotask",
+        "requestAnimationFrame"
+      ]);
       const initName = node.init.name;
       if (ALIASABLE_GLOBALS.has(initName)) {
         env.aliases.set(node.id.name, initName);
@@ -44305,17 +44374,19 @@ ${rootStack}`;
     }
     if (node.id.type === "Identifier" && (node.init.type === "MemberExpression" || node.init.type === "OptionalMemberExpression")) {
       const objStr = nodeToString(node.init.object);
-      if (objStr) {
+      const prop = node.init.property?.name || node.init.property?.value;
+      if (objStr && prop) {
+        const LOCATION_PARENTS = /* @__PURE__ */ new Set(["window", "document", "self", "globalThis"]);
+        if (prop === "location" && LOCATION_PARENTS.has(objStr)) {
+          env.aliases.set(node.id.name, "location");
+        }
         const resolvedObj = env.aliases.get(objStr) || objStr;
         if (resolvedObj !== objStr) {
-          const prop = node.init.property?.name || node.init.property?.value;
-          if (prop) {
-            const resolvedPath = `${resolvedObj}.${prop}`;
-            const sourceTaint = checkMemberSource({ type: "MemberExpression", object: { type: "Identifier", name: resolvedObj }, property: node.init.property, computed: false });
-            if (sourceTaint) {
-              const loc = node.init.loc?.start || {};
-              env.set(node.id.name, TaintSet.from(new TaintLabel(sourceTaint, ctx.file, loc.line || 0, loc.column || 0, resolvedPath)));
-            }
+          const resolvedPath = `${resolvedObj}.${prop}`;
+          const sourceTaint = checkMemberSource({ type: "MemberExpression", object: { type: "Identifier", name: resolvedObj }, property: node.init.property, computed: false });
+          if (sourceTaint) {
+            const loc = node.init.loc?.start || {};
+            env.set(node.id.name, TaintSet.from(new TaintLabel(sourceTaint, ctx.file, loc.line || 0, loc.column || 0, resolvedPath)));
           }
         }
       }
@@ -44347,7 +44418,23 @@ ${rootStack}`;
     if (node.operator !== "=") {
       finalTaint = evaluateExpr(node.left, env, ctx).clone().merge(rhsTaint);
     }
-    assignToPattern(node.left, finalTaint, env, ctx);
+    if (node.operator === "=" && node.left.type === "ArrayPattern" && node.right.type === "ArrayExpression") {
+      const elems = node.right.elements;
+      const elemTaints = elems.map((e) => e ? evaluateExpr(e, env, ctx) : TaintSet.empty());
+      for (let i = 0; i < node.left.elements.length; i++) {
+        const pat = node.left.elements[i];
+        if (!pat) continue;
+        if (pat.type === "RestElement") {
+          const restTaint = TaintSet.empty();
+          for (let j = i; j < elemTaints.length; j++) restTaint.merge(elemTaints[j]);
+          assignToPattern(pat.argument, restTaint, env, ctx);
+          break;
+        }
+        assignToPattern(pat, i < elemTaints.length ? elemTaints[i] : TaintSet.empty(), env, ctx);
+      }
+    } else {
+      assignToPattern(node.left, finalTaint, env, ctx);
+    }
     registerReturnedFunctions(node.left, ctx);
     if (ctx._pendingCustomEventType) {
       const evName = nodeToString(node.left) || (node.left.type === "Identifier" ? node.left.name : null);
@@ -44489,6 +44576,12 @@ ${rootStack}`;
         if (!pattern.computed && pattern.property?.name) {
           const objStr = nodeToString(pattern.object);
           if (objStr) env.set(`${objStr}.${pattern.property.name}`, taint);
+          const GLOBAL_PREFIXES = /* @__PURE__ */ new Set(["window", "self", "globalThis"]);
+          if (pattern.object.type === "Identifier" && GLOBAL_PREFIXES.has(pattern.object.name)) {
+            const propName = pattern.property.name;
+            env.set(propName, taint);
+            env.set(`global:${propName}`, taint);
+          }
         }
         break;
       }
@@ -44614,6 +44707,27 @@ ${rootStack}`;
         return TaintSet.empty();
       case "ConditionalExpression": {
         evaluateExpr(node.test, env, ctx);
+        const constCond = isConstantBool(node.test);
+        if (constCond === true) {
+          const branch = node.consequent;
+          const result = evaluateExpr(branch, env, ctx);
+          if (!ctx.returnedFuncNode && branch.type === "Identifier") {
+            const refKey = resolveId(branch, ctx);
+            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+            if (funcRef) ctx.returnedFuncNode = funcRef;
+          }
+          return result;
+        }
+        if (constCond === false) {
+          const branch = node.alternate;
+          const result = evaluateExpr(branch, env, ctx);
+          if (!ctx.returnedFuncNode && branch.type === "Identifier") {
+            const refKey = resolveId(branch, ctx);
+            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+            if (funcRef) ctx.returnedFuncNode = funcRef;
+          }
+          return result;
+        }
         const checkedVar = extractSchemeCheck(node.test, true);
         const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
         if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
@@ -44779,6 +44893,10 @@ ${rootStack}`;
   function evaluateCallExpr(node, env, ctx) {
     let calleeStr = nodeToString(node.callee);
     const methodName = node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression" ? node.callee.property?.name || "" : "";
+    if (calleeStr && node.callee.type === "Identifier") {
+      const alias = env.aliases.get(calleeStr);
+      if (alias) calleeStr = alias;
+    }
     if (!calleeStr && node.callee.type === "SequenceExpression") {
       const last = node.callee.expressions[node.callee.expressions.length - 1];
       if (last) {
@@ -44787,6 +44905,9 @@ ${rootStack}`;
       }
     }
     if (node.callee.type === "CallExpression" || node.callee.type === "OptionalCallExpression") {
+      evaluateExpr(node.callee, env, ctx);
+    }
+    if (node.callee.type === "NewExpression") {
       evaluateExpr(node.callee, env, ctx);
     }
     const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
@@ -44868,6 +44989,22 @@ ${rootStack}`;
       return merged;
     }
     if (calleeStr === "Object.fromEntries") {
+      return argTaints[0]?.clone() || TaintSet.empty();
+    }
+    if (calleeStr === "Reflect.get" && node.arguments.length >= 2) {
+      const objNode = node.arguments[0];
+      const propNode = node.arguments[1];
+      const objStr = nodeToString(objNode);
+      if (objStr && isStringLiteral(propNode)) {
+        const propName = stringLiteralValue(propNode);
+        const propTaint = env.get(`${objStr}.${propName}`);
+        if (propTaint.tainted) return propTaint;
+        if (objNode.type === "Identifier") {
+          const key = resolveId(objNode, ctx);
+          const keyTaint = env.get(`${key}.${propName}`);
+          if (keyTaint.tainted) return keyTaint;
+        }
+      }
       return argTaints[0]?.clone() || TaintSet.empty();
     }
     if (calleeStr === "Object.defineProperty" && node.arguments.length >= 3) {
@@ -44970,6 +45107,26 @@ ${rootStack}`;
     if (propagated !== null) return propagated;
     return analyzeCalledFunction(node, calleeStr, argTaints, env, ctx);
   }
+  function walkCallsToResolve(node, resolveName, env, ctx, taintOut) {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
+      if (node.callee?.type === "Identifier" && node.callee.name === resolveName && node.arguments[0]) {
+        const argTaint = evaluateExpr(node.arguments[0], env, ctx);
+        taintOut.merge(argTaint);
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "loc" || key === "start" || key === "end" || key === "_closureEnv") continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (item && typeof item === "object" && item.type) walkCallsToResolve(item, resolveName, env, ctx, taintOut);
+        }
+      } else if (child && typeof child === "object" && child.type) {
+        walkCallsToResolve(child, resolveName, env, ctx, taintOut);
+      }
+    }
+  }
   function evaluateNewExpr(node, env, ctx) {
     const constructorName = nodeToString(node.callee);
     const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
@@ -44982,6 +45139,22 @@ ${rootStack}`;
     if (constructorName === "Function") {
       const allArgIndices = argTaints.map((_, i) => i);
       checkSinkCall(node, { type: "XSS", taintedArgs: allArgIndices }, argTaints, "new Function()", env, ctx);
+    }
+    if (constructorName === "Promise" && node.arguments[0]) {
+      let callback = node.arguments[0];
+      if (callback.type === "ArrowFunctionExpression" || callback.type === "FunctionExpression") {
+        const childEnv = env.child();
+        const resolveName = callback.params[0]?.type === "Identifier" ? callback.params[0].name : null;
+        if (resolveName) {
+          if (callback.body.type === "BlockStatement") {
+            const result = analyzeInlineFunction(callback, childEnv, ctx);
+            const resolveTaint = TaintSet.empty();
+            walkCallsToResolve(callback.body, resolveName, env, ctx, resolveTaint);
+            if (resolveTaint.tainted) return resolveTaint;
+            return result;
+          }
+        }
+      }
     }
     if (constructorName === "CustomEvent" && node.arguments.length >= 2) {
       const eventTypeNode = node.arguments[0];
@@ -45722,6 +45895,20 @@ ${rootStack}`;
         }
       }
     }
+    if (!funcNode && (callNode.callee?.type === "MemberExpression" || callNode.callee?.type === "OptionalMemberExpression") && callNode.callee.object?.type === "ObjectExpression" && !callNode.callee.computed) {
+      const methodName = callNode.callee.property?.name;
+      if (methodName) {
+        for (const prop of callNode.callee.object.properties) {
+          if ((prop.type === "ObjectProperty" || prop.type === "Property" || prop.type === "ObjectMethod") && prop.key) {
+            const pName = prop.key.name || prop.key.value;
+            if (pName === methodName) {
+              funcNode = prop.type === "ObjectMethod" ? prop : prop.value;
+              break;
+            }
+          }
+        }
+      }
+    }
     if (!funcNode && (callNode.callee?.type === "MemberExpression" || callNode.callee?.type === "OptionalMemberExpression")) {
       const fullPath = nodeToString(callNode.callee);
       if (fullPath && ctx.funcMap.has(fullPath)) funcNode = ctx.funcMap.get(fullPath);
@@ -45877,6 +46064,11 @@ ${rootStack}`;
         if (taint.tainted && !key.startsWith("this.") && !paramNames.has(key) && key !== "this") {
           funcNode._closureEnv.set(key, taint);
         }
+      }
+    }
+    for (const [key, taint] of childEnv.bindings) {
+      if (taint.tainted && key.includes(".") && !key.startsWith("this.") && !key.startsWith("global:")) {
+        env.set(key, taint);
       }
     }
     return result;

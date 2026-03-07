@@ -40,6 +40,23 @@ export const MEMBER_SOURCES = {
   'self.location.pathname': 'url.location.pathname',
   // window
   'window.name': 'window.name',
+  // Cross-window/frame sources (opener, parent, top)
+  'opener.location.href': 'url.location.href',
+  'opener.location.hash': 'url.location.hash',
+  'opener.location.search': 'url.location.search',
+  'opener.location.pathname': 'url.location.pathname',
+  'window.opener.location.href': 'url.location.href',
+  'window.opener.location.hash': 'url.location.hash',
+  'window.opener.location.search': 'url.location.search',
+  'window.opener.location.pathname': 'url.location.pathname',
+  'parent.location.href': 'url.location.href',
+  'parent.location.hash': 'url.location.hash',
+  'parent.location.search': 'url.location.search',
+  'parent.location.pathname': 'url.location.pathname',
+  'top.location.href': 'url.location.href',
+  'top.location.hash': 'url.location.hash',
+  'top.location.search': 'url.location.search',
+  'top.location.pathname': 'url.location.pathname',
 };
 
 // Call expression sources: function calls that return tainted data
@@ -62,6 +79,7 @@ export const CALL_SOURCES = {
   'fetch': 'passthrough',       // tainted URL → tainted response for .then chains
   'String': 'passthrough',
   'JSON.stringify': 'passthrough',
+  'structuredClone': 'passthrough',
 };
 
 // Constructor sources: new Foo(tainted) where result is tainted

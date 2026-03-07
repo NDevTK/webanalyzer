@@ -9317,8 +9317,1676 @@ test('var x = function foo() { return tainted; }() → innerHTML', () => {
 });
 
 // ╔═══════════════════════════════════════════════════════╗
+// ║  ROUND 10 — Advanced AST patterns                      ║
+// ╚═══════════════════════════════════════════════════════╝
+
+// ── structuredClone passthrough ──
+console.log('\n--- structuredClone ---');
+
+test('structuredClone(tainted) preserves taint → innerHTML', () => {
+  const { findings } = analyze(`
+    var data = structuredClone(location.hash);
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through new URL().searchParams ──
+console.log('\n--- URL searchParams chain ---');
+
+test('new URL(tainted).searchParams.get() → innerHTML', () => {
+  const { findings } = analyze(`
+    var url = new URL(location.href);
+    var q = url.searchParams.get('q');
+    document.body.innerHTML = q;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through fetch → response.text() → then ──
+console.log('\n--- fetch response.text ---');
+
+test('fetch(tainted).then(r => r.text()).then(t => innerHTML)', () => {
+  const { findings } = analyze(`
+    fetch(location.hash).then(function(r) {
+      return r.text();
+    }).then(function(text) {
+      document.body.innerHTML = text;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through window.opener ──
+console.log('\n--- window.opener ---');
+
+test('window.opener.location.hash → innerHTML (cross-window)', () => {
+  const { findings } = analyze(`
+    var x = window.opener.location.hash;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through parent frame ──
+test('parent.location.search → innerHTML (cross-frame)', () => {
+  const { findings } = analyze(`
+    var x = parent.location.search;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through multiple property alias chains ──
+console.log('\n--- Property alias chain ---');
+
+test('var loc = window.location; var h = loc.hash → innerHTML', () => {
+  const { findings } = analyze(`
+    var loc = window.location;
+    var h = loc.hash;
+    document.body.innerHTML = h;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('var doc = document; doc.cookie → innerHTML', () => {
+  const { findings } = analyze(`
+    var doc = document;
+    document.body.innerHTML = doc.cookie;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through conditional chaining ──
+console.log('\n--- Conditional chaining ---');
+
+test('x?.y?.z where x.y.z is tainted → innerHTML', () => {
+  const { findings } = analyze(`
+    var config = { user: { name: location.hash } };
+    document.body.innerHTML = config?.user?.name;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through assignment in ternary ──
+console.log('\n--- Assignment in ternary ---');
+
+test('cond ? (x = tainted) : (x = safe) → innerHTML', () => {
+  const { findings } = analyze(`
+    var x;
+    true ? (x = location.hash) : (x = 'safe');
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through 3-file chain ──
+console.log('\n--- 3-file taint chain ---');
+
+test('cross-file: file A sources, file B transforms, file C sinks', () => {
+  const findings = analyzeMultiple([
+    { source: `
+      window.rawInput = location.hash;
+    `, file: 'source.js' },
+    { source: `
+      window.processed = '<div>' + rawInput + '</div>';
+    `, file: 'transform.js' },
+    { source: `
+      document.body.innerHTML = processed;
+    `, file: 'render.js' },
+  ]);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through class with private-like naming ──
+console.log('\n--- Class private convention ---');
+
+test('class with _private property: set tainted → method reads → innerHTML', () => {
+  const { findings } = analyze(`
+    class Store {
+      constructor() { this._data = null; }
+      setData(d) { this._data = d; }
+      getData() { return this._data; }
+    }
+    var s = new Store();
+    s.setData(location.hash);
+    document.body.innerHTML = s.getData();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through callback stored in object ──
+console.log('\n--- Callback stored in object ---');
+
+test('obj.callback = fn; later obj.callback(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var handlers = {};
+    handlers.render = function(html) { document.body.innerHTML = html; };
+    handlers.render(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Promise constructor ──
+console.log('\n--- Promise constructor ---');
+
+test('new Promise(resolve => resolve(tainted)).then(sink)', () => {
+  const { findings } = analyze(`
+    var p = new Promise(function(resolve) {
+      resolve(location.hash);
+    });
+    p.then(function(val) {
+      document.body.innerHTML = val;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through array push then iteration ──
+console.log('\n--- Array push then iterate ---');
+
+test('arr.push(tainted) → forEach → innerHTML', () => {
+  const { findings } = analyze(`
+    var items = [];
+    items.push(location.hash);
+    items.forEach(function(item) {
+      document.body.innerHTML = item;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through setTimeout with closure (not string) ──
+console.log('\n--- setTimeout closure ---');
+
+test('setTimeout(function() { innerHTML = tainted }, 0)', () => {
+  const { findings } = analyze(`
+    var x = location.hash;
+    setTimeout(function() {
+      document.body.innerHTML = x;
+    }, 0);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through logical OR default ──
+console.log('\n--- Logical OR default ---');
+
+test('var x = params.get("q") || location.hash → innerHTML', () => {
+  const { findings } = analyze(`
+    var params = new URLSearchParams(location.search);
+    var x = params.get('q') || location.hash;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Object.assign target property access ──
+console.log('\n--- Object.assign target access ---');
+
+test('Object.assign(target, src) → target.prop → innerHTML', () => {
+  const { findings } = analyze(`
+    var src = { content: location.hash };
+    var target = {};
+    Object.assign(target, src);
+    document.body.innerHTML = target.content;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through iterable protocol ──
+console.log('\n--- Custom iterable ---');
+
+test('for-of over object with Symbol.iterator returning tainted', () => {
+  const { findings } = analyze(`
+    var data = [location.hash];
+    for (var item of data) {
+      document.body.innerHTML = item;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: DOMPurify in wrapper with multiple args ──
+console.log('\n--- Safe: sanitizer in different wrappers ---');
+
+test('safe: render(DOMPurify.sanitize(tainted), target)', () => {
+  const { findings } = analyze(`
+    function render(html, el) { el.innerHTML = html; }
+    render(DOMPurify.sanitize(location.hash), document.body);
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Safe: tainted in JSON.stringify only ──
+test('safe: JSON.stringify(tainted) → fetch body (not a DOM sink)', () => {
+  const { findings } = analyze(`
+    var data = JSON.stringify({ input: location.hash });
+    fetch('/api/save', { method: 'POST', body: data });
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through multiple assignment targets ──
+console.log('\n--- Multiple assignment ---');
+
+test('a = b = tainted → innerHTML uses a', () => {
+  const { findings } = analyze(`
+    var a, b;
+    a = b = location.hash;
+    document.body.innerHTML = a;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through string.replace callback ──
+console.log('\n--- String replace callback ---');
+
+test('tainted.replace(regex, callback) → innerHTML', () => {
+  const { findings } = analyze(`
+    var result = location.hash.replace(/./g, function(ch) { return ch.toUpperCase(); });
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through early return guard ──
+console.log('\n--- Early return guard ---');
+
+test('function with if(!x) return; then innerHTML = x detects', () => {
+  const { findings } = analyze(`
+    function render(x) {
+      if (!x) return;
+      document.body.innerHTML = x;
+    }
+    render(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through chained method on new object ──
+console.log('\n--- Chained new constructor method ---');
+
+test('new Foo(tainted).render() → innerHTML', () => {
+  const { findings } = analyze(`
+    function Renderer(html) { this.html = html; }
+    Renderer.prototype.render = function() { document.body.innerHTML = this.html; };
+    new Renderer(location.hash).render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: tainted used only in fetch URL (not a DOM sink) ──
+console.log('\n--- Safe: fetch URL only ---');
+
+test('safe: fetch("/api?q=" + tainted) is not a DOM XSS', () => {
+  const { findings } = analyze(`
+    fetch('/api/search?q=' + encodeURIComponent(location.hash));
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through destructured function parameter ──
+console.log('\n--- Destructured function param ---');
+
+test('function({html}) { innerHTML = html } called with tainted obj', () => {
+  const { findings } = analyze(`
+    function render({ html }) {
+      document.body.innerHTML = html;
+    }
+    render({ html: location.hash });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Map.set then iteration ──
+console.log('\n--- Map iteration ---');
+
+test('map.set(k, tainted) → for-of → innerHTML', () => {
+  const { findings } = analyze(`
+    var m = new Map();
+    m.set('content', location.hash);
+    for (var entry of m) {
+      document.body.innerHTML = entry[1];
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: tainted → Number() → string concat → innerHTML ──
+console.log('\n--- Safe: numeric sanitize then concat ---');
+
+test('safe: "Page " + Number(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var page = 'Page ' + Number(location.hash.slice(1));
+    document.body.innerHTML = page;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through eval with variable ──
+console.log('\n--- eval with variable ---');
+
+test('var code = tainted; eval(code) → XSS', () => {
+  const { findings } = analyze(`
+    var code = location.hash.slice(1);
+    eval(code);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through constructor.prototype chain ──
+console.log('\n--- Constructor prototype chain ---');
+
+test('constructor sets this.x, prototype method reads it → innerHTML', () => {
+  const { findings } = analyze(`
+    function Component(html) {
+      this.html = html;
+    }
+    Component.prototype.mount = function() {
+      document.body.innerHTML = this.html;
+    };
+    var c = new Component(location.hash);
+    c.mount();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Cross-file: event-driven architecture ──
+console.log('\n--- Cross-file event-driven ---');
+
+test('cross-file: file A creates event bus, file B emits, file C listens', () => {
+  const findings = analyzeMultiple([
+    { source: `
+      window.bus = {
+        handlers: {},
+        on: function(evt, fn) { this.handlers[evt] = fn; },
+        emit: function(evt, data) {
+          if (this.handlers[evt]) this.handlers[evt](data);
+        }
+      };
+    `, file: 'bus.js' },
+    { source: `
+      bus.on('render', function(html) {
+        document.body.innerHTML = html;
+      });
+    `, file: 'view.js' },
+    { source: `
+      bus.emit('render', location.hash);
+    `, file: 'controller.js' },
+  ]);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through nested property assignment ──
+console.log('\n--- Nested property assignment ---');
+
+test('obj.config.html = tainted → obj.config.html → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = { config: {} };
+    obj.config.html = location.hash;
+    document.body.innerHTML = obj.config.html;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: tainted in attribute that is safe ──
+console.log('\n--- Safe: safe attribute ---');
+
+test('safe: element.title = tainted is not a sink', () => {
+  const { findings } = analyze(`
+    document.body.title = location.hash;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through Array.prototype.reduce to string ──
+console.log('\n--- Array reduce to string ---');
+
+test('taintedArr.reduce((acc, x) => acc + x, "") → innerHTML', () => {
+  const { findings } = analyze(`
+    var items = location.hash.split(',');
+    var html = items.reduce(function(acc, x) { return acc + '<li>' + x + '</li>'; }, '');
+    document.body.innerHTML = html;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through postMessage to self ──
+console.log('\n--- postMessage to self ---');
+
+test('window.postMessage(tainted) → message handler → innerHTML', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      document.body.innerHTML = e.data;
+    });
+    window.postMessage(location.hash, '*');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: encodeURIComponent in template ──
+console.log('\n--- Safe: encoded template ---');
+
+test('safe: `?q=${encodeURIComponent(tainted)}` → location.href is safe navigation', () => {
+  const { findings } = analyze(`
+    var q = encodeURIComponent(location.hash);
+    location.href = '/search?q=' + q;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through rest params ──
+console.log('\n--- Rest params ---');
+
+test('function(...args) { innerHTML = args[0] } called with tainted', () => {
+  const { findings } = analyze(`
+    function render(...args) {
+      document.body.innerHTML = args[0];
+    }
+    render(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through computed class method ──
+console.log('\n--- Computed class method name ---');
+
+test('class with method name as variable → call → innerHTML', () => {
+  const { findings } = analyze(`
+    class Renderer {
+      show(html) { document.body.innerHTML = html; }
+    }
+    var r = new Renderer();
+    r.show(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through async/await with try/catch ──
+console.log('\n--- Async/await try/catch ---');
+
+test('async function: try { x = await tainted } catch { } → innerHTML', () => {
+  const { findings } = analyze(`
+    async function load() {
+      var x;
+      try {
+        x = await Promise.resolve(location.hash);
+      } catch(e) {
+        x = 'fallback';
+      }
+      document.body.innerHTML = x;
+    }
+    load();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: Object.freeze prevents mutation ──
+console.log('\n--- Safe: frozen config ---');
+
+test('safe: frozen safe config → innerHTML reads safe value', () => {
+  const { findings } = analyze(`
+    var config = Object.freeze({ html: '<b>safe</b>' });
+    document.body.innerHTML = config.html;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through string Template.raw tag ──
+console.log('\n--- String.raw with taint ---');
+
+test('String.raw with tainted interpolation → eval', () => {
+  const { findings } = analyze(`
+    var code = location.hash.slice(1);
+    eval(String.raw\`\${code}\`);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ╔═══════════════════════════════════════════════════════╗
 // ║  BASELINE — production libraries should have 0 FPs    ║
 // ╚═══════════════════════════════════════════════════════╝
+
+// ══════════════════════════════════════════════════════════════
+// ROUND 11 — Advanced AST patterns
+// ══════════════════════════════════════════════════════════════
+
+// ── Currying / partial application ──
+console.log('\n--- Currying / partial application ---');
+
+test('curried function: f(tainted)(safe) → innerHTML', () => {
+  const { findings } = analyze(`
+    function curry(a) {
+      return function(b) { return a + b; };
+    }
+    var g = curry(location.hash);
+    document.body.innerHTML = g(' suffix');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('curried arrow: f(tainted)(safe) → innerHTML', () => {
+  const { findings } = analyze(`
+    const f = a => b => a + b;
+    const g = f(location.hash);
+    document.body.innerHTML = g('!');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: curried function with safe args only', () => {
+  const { findings } = analyze(`
+    const f = a => b => a + b;
+    const g = f('hello');
+    document.body.innerHTML = g(' world');
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Chained assignments ──
+console.log('\n--- Chained assignments ---');
+
+test('chained assignment: a = b = tainted → sink(a)', () => {
+  const { findings } = analyze(`
+    var a, b;
+    a = b = location.hash;
+    document.body.innerHTML = a;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('chained assignment: a = b = tainted → sink(b)', () => {
+  const { findings } = analyze(`
+    var a, b;
+    a = b = location.hash;
+    document.body.innerHTML = b;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Throw/catch taint flow ──
+console.log('\n--- Throw/catch taint flow ---');
+
+test('throw tainted → catch(e) → sink(e)', () => {
+  const { findings } = analyze(`
+    try {
+      throw location.hash;
+    } catch(e) {
+      document.body.innerHTML = e;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('throw new Error(tainted) → catch(e) → sink(e.message)', () => {
+  const { findings } = analyze(`
+    try {
+      throw new Error(location.hash);
+    } catch(e) {
+      document.body.innerHTML = e.message;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: throw safe string → catch(e) → sink(e)', () => {
+  const { findings } = analyze(`
+    try {
+      throw 'static error';
+    } catch(e) {
+      document.body.innerHTML = e;
+    }
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Comma/sequence expression ──
+console.log('\n--- Comma/sequence expression ---');
+
+test('sequence expr returns last (tainted): sink((safe, tainted))', () => {
+  const { findings } = analyze(`
+    var x = (0, location.hash);
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: sequence expr returns last (safe): sink((tainted, safe))', () => {
+  const { findings } = analyze(`
+    var x = (location.hash, 'safe string');
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Destructuring defaults from tainted ──
+console.log('\n--- Destructuring defaults ---');
+
+test('object destructuring default from tainted source', () => {
+  const { findings } = analyze(`
+    var tainted = location.hash;
+    var { x = tainted } = {};
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('array destructuring default from tainted source', () => {
+  const { findings } = analyze(`
+    var tainted = location.hash;
+    var [a = tainted] = [];
+    document.body.innerHTML = a;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: destructuring default not used when property exists', () => {
+  const { findings } = analyze(`
+    var tainted = location.hash;
+    var { x = tainted } = { x: 'safe' };
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Error constructor taint ──
+console.log('\n--- Error constructor taint ---');
+
+test('new Error(tainted).message → innerHTML', () => {
+  const { findings } = analyze(`
+    var err = new Error(location.hash);
+    document.body.innerHTML = err.message;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: comparison/relational operators ──
+console.log('\n--- Safe: comparison/relational operators ---');
+
+test('safe: tainted === "value" → innerHTML (boolean)', () => {
+  const { findings } = analyze(`
+    var x = location.hash === '#admin';
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted > 0 → innerHTML (boolean)', () => {
+  const { findings } = analyze(`
+    var x = location.hash.length > 0;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted in obj → innerHTML (boolean)', () => {
+  const { findings } = analyze(`
+    var key = location.hash;
+    var x = key in { admin: 1, user: 2 };
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted instanceof Error → innerHTML (boolean)', () => {
+  const { findings } = analyze(`
+    var x = location.hash instanceof Error;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Safe: bitwise operations ──
+console.log('\n--- Safe: bitwise operations ---');
+
+test('safe: tainted | 0 → innerHTML (coerced to int)', () => {
+  const { findings } = analyze(`
+    var x = location.hash | 0;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted >>> 0 → innerHTML (unsigned int)', () => {
+  const { findings } = analyze(`
+    var x = location.hash >>> 0;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted & 0xFF → innerHTML (bitwise and)', () => {
+  const { findings } = analyze(`
+    var x = location.hash & 0xFF;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted ^ tainted → innerHTML (XOR)', () => {
+  const { findings } = analyze(`
+    var h = location.hash;
+    var x = h ^ h;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Deep method chaining on tainted string ──
+console.log('\n--- Deep method chaining ---');
+
+test('tainted.split(".").reverse().join("/") → innerHTML', () => {
+  const { findings } = analyze(`
+    var parts = location.hash.split('.');
+    var reversed = parts.reverse();
+    var result = reversed.join('/');
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('tainted.toLowerCase().trim().slice(1) → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = location.hash.toLowerCase().trim().slice(1);
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Promise.race ──
+console.log('\n--- Promise.race ---');
+
+test('Promise.race([taintedPromise]).then → innerHTML', () => {
+  const { findings } = analyze(`
+    var p = Promise.resolve(location.hash);
+    Promise.race([p]).then(function(val) {
+      document.body.innerHTML = val;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Nested ternary ──
+console.log('\n--- Nested ternary ---');
+
+test('nested ternary: true ? (false ? safe : tainted) : safe → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = true ? (false ? 'safe' : location.hash) : 'also safe';
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: nested ternary: true ? (true ? safe : tainted) : tainted', () => {
+  const { findings } = analyze(`
+    var x = true ? (true ? 'safe' : location.hash) : location.search;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Map.forEach with tainted values ──
+console.log('\n--- Map.forEach ---');
+
+test('map.forEach with tainted value → innerHTML', () => {
+  const { findings } = analyze(`
+    var m = new Map();
+    m.set('key', location.hash);
+    m.forEach(function(val) {
+      document.body.innerHTML = val;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── eval aliases ──
+console.log('\n--- eval aliases ---');
+
+test('window.eval(tainted) is XSS', () => {
+  const { findings } = analyze(`
+    var x = location.hash;
+    window.eval(x);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('var e = eval; e(tainted) is XSS', () => {
+  const { findings } = analyze(`
+    var e = eval;
+    var x = location.hash;
+    e(x);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── new Function with parameter ──
+console.log('\n--- new Function variants ---');
+
+test('new Function("a", taintedBody) is XSS', () => {
+  const { findings } = analyze(`
+    var body = location.hash;
+    var fn = new Function('a', body);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('new Function(taintedBody)() is XSS', () => {
+  const { findings } = analyze(`
+    var code = location.hash;
+    new Function(code)();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Object.freeze preserves taint ──
+console.log('\n--- Object.freeze/seal ---');
+
+test('Object.freeze(taintedObj).prop → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = { html: location.hash };
+    var frozen = Object.freeze(obj);
+    document.body.innerHTML = frozen.html;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('Object.seal preserves taint → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = { data: location.hash };
+    Object.seal(obj);
+    document.body.innerHTML = obj.data;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: .length is always numeric ──
+console.log('\n--- Safe: .length ---');
+
+test('safe: tainted.length → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = location.hash.length;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: taintedArray.length → innerHTML', () => {
+  const { findings } = analyze(`
+    var arr = location.hash.split('');
+    document.body.innerHTML = arr.length;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Safe: .indexOf / .lastIndexOf return numbers ──
+console.log('\n--- Safe: index methods ---');
+
+test('safe: str.indexOf(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var idx = 'hello world'.indexOf(location.hash);
+    document.body.innerHTML = idx;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted.lastIndexOf("x") → innerHTML', () => {
+  const { findings } = analyze(`
+    var idx = location.hash.lastIndexOf('x');
+    document.body.innerHTML = idx;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Safe: .includes / .has return booleans ──
+console.log('\n--- Safe: boolean-returning methods ---');
+
+test('safe: arr.includes(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var found = ['a', 'b'].includes(location.hash);
+    document.body.innerHTML = found;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: map.has(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var m = new Map();
+    m.set('key', 'val');
+    var found = m.has(location.hash);
+    document.body.innerHTML = found;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: set.has(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var s = new Set(['a', 'b']);
+    var found = s.has(location.hash);
+    document.body.innerHTML = found;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Async IIFE ──
+console.log('\n--- Async IIFE ---');
+
+test('async IIFE sinks tainted inside', () => {
+  const { findings } = analyze(`
+    (async function() {
+      var x = location.hash;
+      document.body.innerHTML = x;
+    })();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Array.from on string ──
+console.log('\n--- Array.from on tainted ---');
+
+test('Array.from(taintedString).join("") → innerHTML', () => {
+  const { findings } = analyze(`
+    var chars = Array.from(location.hash);
+    var result = chars.join('');
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Memoization / cache pattern ──
+console.log('\n--- Memoization / cache pattern ---');
+
+test('cache stores tainted, later read → innerHTML', () => {
+  const { findings } = analyze(`
+    var cache = {};
+    cache.data = location.hash;
+    function render() {
+      document.body.innerHTML = cache.data;
+    }
+    render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: delete / void ──
+console.log('\n--- Safe: delete / void ---');
+
+test('safe: delete obj[tainted] → innerHTML (boolean)', () => {
+  const { findings } = analyze(`
+    var obj = { a: 1 };
+    var result = delete obj[location.hash];
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Cross-scope closure capture ──
+console.log('\n--- Cross-scope closure capture ---');
+
+test('nested function captures tainted from grandparent scope', () => {
+  const { findings } = analyze(`
+    function outer() {
+      var x = location.hash;
+      function middle() {
+        function inner() {
+          document.body.innerHTML = x;
+        }
+        inner();
+      }
+      middle();
+    }
+    outer();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Builder pattern ──
+console.log('\n--- Builder pattern ---');
+
+test('builder pattern: set(tainted).build().html → innerHTML', () => {
+  const { findings } = analyze(`
+    function Builder() { this.data = ''; }
+    Builder.prototype.set = function(val) { this.data = val; return this; };
+    Builder.prototype.build = function() { return { html: this.data }; };
+    var result = new Builder().set(location.hash).build();
+    document.body.innerHTML = result.html;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Double decode passthrough ──
+console.log('\n--- Double decode ---');
+
+test('decodeURIComponent(decodeURIComponent(tainted)) → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = decodeURIComponent(decodeURIComponent(location.hash));
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: numeric coercion patterns ──
+console.log('\n--- Safe: numeric coercion ---');
+
+test('safe: tainted * 1 → innerHTML (numeric)', () => {
+  const { findings } = analyze(`
+    var x = location.hash * 1;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted % 10 → innerHTML (modulo)', () => {
+  const { findings } = analyze(`
+    var x = location.hash % 10;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── for-in with tainted object property access ──
+console.log('\n--- for-in property access ---');
+
+test('for-in over tainted obj, access value → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = { key: location.hash };
+    for (var k in obj) {
+      document.body.innerHTML = obj[k];
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Array splice ──
+console.log('\n--- Array splice ---');
+
+test('splice returns tainted elements → innerHTML', () => {
+  const { findings } = analyze(`
+    var arr = [location.hash, 'safe'];
+    var removed = arr.splice(0, 1);
+    document.body.innerHTML = removed[0];
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Optional chaining with taint ──
+console.log('\n--- Optional chaining ---');
+
+test('obj?.taintedProp → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = { data: location.hash };
+    document.body.innerHTML = obj?.data;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('nested optional chaining: a?.b?.c tainted → innerHTML', () => {
+  const { findings } = analyze(`
+    var a = { b: { c: location.hash } };
+    document.body.innerHTML = a?.b?.c;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: String.fromCharCode ──
+console.log('\n--- Safe: String.fromCharCode ---');
+
+test('safe: String.fromCharCode(tainted.charCodeAt(0)) → innerHTML', () => {
+  const { findings } = analyze(`
+    var code = location.hash.charCodeAt(0);
+    var ch = String.fromCharCode(code);
+    document.body.innerHTML = ch;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through conditional callback ──
+console.log('\n--- Conditional callback ---');
+
+test('array method callback receives taint → sink inside callback', () => {
+  const { findings } = analyze(`
+    var items = [location.hash];
+    items.forEach(function(item) {
+      document.body.innerHTML = item;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through variable swap ──
+console.log('\n--- Variable swap ---');
+
+test('destructuring swap: [a, b] = [b, a] with tainted a → sink(b)', () => {
+  const { findings } = analyze(`
+    var a = location.hash;
+    var b = 'safe';
+    [a, b] = [b, a];
+    document.body.innerHTML = b;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: destructuring swap: tainted a swapped away from sink', () => {
+  const { findings } = analyze(`
+    var a = location.hash;
+    var b = 'safe';
+    [a, b] = [b, a];
+    document.body.innerHTML = a;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ══════════════════════════════════════════════════════════════
+// ROUND 12 — Advanced AST patterns
+// ══════════════════════════════════════════════════════════════
+
+// ── for-of with array destructuring ──
+console.log('\n--- for-of with destructuring ---');
+
+test('for-of with [k, v] destructuring from Map → sink(v)', () => {
+  const { findings } = analyze(`
+    var m = new Map();
+    m.set('x', location.hash);
+    for (var entry of m) {
+      document.body.innerHTML = entry;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('for-of with destructured pair from array of tuples → sink', () => {
+  const { findings } = analyze(`
+    var pairs = [['key', location.hash]];
+    for (var pair of pairs) {
+      document.body.innerHTML = pair;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Closure modified after capture ──
+console.log('\n--- Closure modification ---');
+
+test('outer variable set tainted after inner function defined → inner sinks', () => {
+  const { findings } = analyze(`
+    var x = 'safe';
+    function render() {
+      document.body.innerHTML = x;
+    }
+    x = location.hash;
+    render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Multiple sources merge ──
+console.log('\n--- Multiple sources merge ---');
+
+test('two sources concatenated → innerHTML', () => {
+  const { findings } = analyze(`
+    var a = location.hash;
+    var b = location.search;
+    document.body.innerHTML = a + b;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── String accumulator in loop ──
+console.log('\n--- String accumulator in loop ---');
+
+test('string concatenation in loop accumulates taint → innerHTML', () => {
+  const { findings } = analyze(`
+    var parts = location.hash.split(',');
+    var result = '';
+    for (var i = 0; i < parts.length; i++) {
+      result += parts[i];
+    }
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Immediately-called object method ──
+console.log('\n--- Immediately-called object method ---');
+
+test('({fn() { return tainted }}).fn() → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = ({
+      fn: function() { return location.hash; }
+    }).fn();
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: exponentiation / numeric operators ──
+console.log('\n--- Safe: exponentiation ---');
+
+test('safe: tainted ** 2 → innerHTML (numeric)', () => {
+  const { findings } = analyze(`
+    var x = location.hash ** 2;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Safe: multiple var declarations ──
+console.log('\n--- Safe: multiple var declarations ---');
+
+test('safe: var a = tainted, b = safe; sink(b)', () => {
+  const { findings } = analyze(`
+    var a = location.hash, b = 'safe string';
+    document.body.innerHTML = b;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('var a = safe, b = tainted; sink(b) is XSS', () => {
+  const { findings } = analyze(`
+    var a = 'safe', b = location.hash;
+    document.body.innerHTML = b;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: RegExp.test returns boolean ──
+console.log('\n--- Safe: RegExp.test ---');
+
+test('safe: /pattern/.test(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var result = /^admin$/.test(location.hash);
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: new RegExp(safe).test(tainted) → innerHTML', () => {
+  const { findings } = analyze(`
+    var re = new RegExp('^admin$');
+    var result = re.test(location.hash);
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Safe: new Date().getTime() ──
+console.log('\n--- Safe: Date methods ---');
+
+test('safe: new Date(tainted).getTime() → innerHTML', () => {
+  const { findings } = analyze(`
+    var ts = new Date(location.hash).getTime();
+    document.body.innerHTML = ts;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: Date.now() → innerHTML', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = Date.now();
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through class static field ──
+console.log('\n--- Class static patterns ---');
+
+test('class static field set from tainted → method reads → innerHTML', () => {
+  const { findings } = analyze(`
+    class Config {
+      static init(val) { Config.data = val; }
+      static render() { document.body.innerHTML = Config.data; }
+    }
+    Config.init(location.hash);
+    Config.render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Array.from with mapping function ──
+console.log('\n--- Array.from with mapper ---');
+
+test('Array.from(source, mapper) with tainted source → innerHTML', () => {
+  const { findings } = analyze(`
+    var chars = Array.from(location.hash, function(c) { return c; });
+    document.body.innerHTML = chars.join('');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: Object.is ──
+console.log('\n--- Safe: Object.is ---');
+
+test('safe: Object.is(tainted, expected) → innerHTML (boolean)', () => {
+  const { findings } = analyze(`
+    var result = Object.is(location.hash, '#admin');
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through nested object property access ──
+console.log('\n--- Nested object property access ---');
+
+test('deep nested property: a.b.c tainted → innerHTML', () => {
+  const { findings } = analyze(`
+    var a = { b: { c: location.hash } };
+    document.body.innerHTML = a.b.c;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: deep nested property: obj.safe vs obj.tainted → sink(obj.safe)', () => {
+  const { findings } = analyze(`
+    var obj = {};
+    obj.safe = 'hello';
+    obj.tainted = location.hash;
+    document.body.innerHTML = obj.safe;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through WeakMap ──
+console.log('\n--- WeakMap ---');
+
+test('WeakMap.set(key, tainted) → WeakMap.get(key) → innerHTML', () => {
+  const { findings } = analyze(`
+    var wm = new WeakMap();
+    var key = {};
+    wm.set(key, location.hash);
+    document.body.innerHTML = wm.get(key);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Reflect.get ──
+console.log('\n--- Reflect API ---');
+
+test('Reflect.get(obj, prop) with tainted property value → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = { x: location.hash };
+    var val = Reflect.get(obj, 'x');
+    document.body.innerHTML = val;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through chained ternary in assignment ──
+console.log('\n--- Chained ternary assignment ---');
+
+test('a = cond1 ? cond2 ? tainted : safe : safe → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = location.hash;
+    var y = true ? (x.length > 0 ? x : 'default') : 'fallback';
+    document.body.innerHTML = y;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: tainted used only as condition, not value ──
+console.log('\n--- Safe: tainted as condition only ---');
+
+test('safe: tainted used in condition, safe value in sink', () => {
+  const { findings } = analyze(`
+    var x = location.hash;
+    if (x) {
+      document.body.innerHTML = 'hello';
+    }
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('safe: tainted in loop condition, safe body', () => {
+  const { findings } = analyze(`
+    var items = location.hash.split(',');
+    while (items.length > 0) {
+      items.pop();
+      document.body.innerHTML = 'processing';
+    }
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through catch with re-throw chain ──
+console.log('\n--- Catch re-throw ---');
+
+test('try → throw tainted → catch → re-throw → outer catch → sink', () => {
+  const { findings } = analyze(`
+    try {
+      try {
+        throw location.hash;
+      } catch(inner) {
+        throw inner;
+      }
+    } catch(outer) {
+      document.body.innerHTML = outer;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Promise.resolve().then() ──
+console.log('\n--- Promise.resolve chain ---');
+
+test('Promise.resolve(tainted).then(v => sink(v))', () => {
+  const { findings } = analyze(`
+    Promise.resolve(location.hash).then(function(val) {
+      document.body.innerHTML = val;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through immediately invoked arrow ──
+console.log('\n--- Immediately invoked arrow ---');
+
+test('(() => location.hash)() → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = (() => location.hash)();
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through variable shadowing ──
+console.log('\n--- Variable shadowing ---');
+
+test('inner scope shadows with tainted → sink uses inner', () => {
+  const { findings } = analyze(`
+    var x = 'safe';
+    (function() {
+      var x = location.hash;
+      document.body.innerHTML = x;
+    })();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: inner scope shadows with safe, outer is tainted → sink uses inner', () => {
+  const { findings } = analyze(`
+    var x = location.hash;
+    (function() {
+      var x = 'safe';
+      document.body.innerHTML = x;
+    })();
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through object method returning this.prop ──
+console.log('\n--- Object method returning property ---');
+
+test('object method returns this-like property → innerHTML', () => {
+  const { findings } = analyze(`
+    var widget = {
+      data: location.hash,
+      render: function() { return this.data; }
+    };
+    document.body.innerHTML = widget.render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: string literal method calls ──
+console.log('\n--- Safe: string literal operations ---');
+
+test('safe: "static".split("").join("") → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = 'static string'.split('').join('');
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through default function parameter from global ──
+console.log('\n--- Default param from global ---');
+
+test('function with default param = location.hash → innerHTML', () => {
+  const { findings } = analyze(`
+    function render(content = location.hash) {
+      document.body.innerHTML = content;
+    }
+    render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('safe: function with default param, called with safe arg', () => {
+  const { findings } = analyze(`
+    function render(content = location.hash) {
+      document.body.innerHTML = content;
+    }
+    render('safe content');
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through labeled block ──
+console.log('\n--- Labeled statement ---');
+
+test('labeled block with tainted inside → innerHTML', () => {
+  const { findings } = analyze(`
+    var x = location.hash;
+    outer: {
+      if (x.length === 0) break outer;
+      document.body.innerHTML = x;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through chained Map operations ──
+console.log('\n--- Chained Map ops ---');
+
+test('new Map([[k, tainted]]) → get(k) → innerHTML', () => {
+  const { findings } = analyze(`
+    var m = new Map([['key', location.hash]]);
+    document.body.innerHTML = m.get('key');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: numeric toString ──
+console.log('\n--- Safe: numeric toString ---');
+
+test('safe: (tainted | 0).toString() → innerHTML', () => {
+  const { findings } = analyze(`
+    var n = location.hash | 0;
+    document.body.innerHTML = n.toString();
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through function.call with tainted arg ──
+console.log('\n--- Function.call with tainted ---');
+
+test('fn.call(null, tainted) → innerHTML inside fn', () => {
+  const { findings } = analyze(`
+    function render(html) {
+      document.body.innerHTML = html;
+    }
+    render.call(null, location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Taint through Object.values → forEach ──
+console.log('\n--- Object.values taint ---');
+
+test('Object.values(taintedObj) → forEach → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = { key: location.hash };
+    Object.values(obj).forEach(function(v) {
+      document.body.innerHTML = v;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Safe: catch clears taint ──
+console.log('\n--- Safe: catch clears taint ---');
+
+test('safe: catch assigns safe value before sink', () => {
+  const { findings } = analyze(`
+    var x;
+    try {
+      x = location.hash;
+      throw new Error('fail');
+    } catch(e) {
+      x = 'safe fallback';
+    }
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ── Taint through switch fallthrough ──
+console.log('\n--- Switch fallthrough ---');
+
+test('switch fallthrough: tainted case falls to sink', () => {
+  const { findings } = analyze(`
+    var x = location.hash;
+    var out;
+    switch(x.charAt(0)) {
+      case '#':
+        out = x;
+      case '!':
+        document.body.innerHTML = out;
+        break;
+      default:
+        break;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ── Script Injection: script.src ──
+console.log('\n--- Dynamic script loading ---');
+
+test('script.src = tainted is Script Injection', () => {
+  const { findings } = analyze(`
+    var s = document.createElement('script');
+    s.src = location.hash;
+    document.body.appendChild(s);
+  `);
+  expect(findings).toHaveType('Script Injection');
+});
+
+// ── Cross-file: tainted passed through callback ──
+console.log('\n--- Cross-file callback ---');
+
+test('cross-file: file A defines callback sink, file B invokes with tainted', () => {
+  const findings = analyzeMultiple([
+    { file: 'api.js', source: `
+      window.onData = function(data) {
+        document.body.innerHTML = data;
+      };
+    `},
+    { file: 'main.js', source: `
+      window.onData(location.hash);
+    `}
+  ]);
+  expect(findings).toHaveType('XSS');
+});
 
 console.log('\n--- Baseline: production libraries ---');
 
