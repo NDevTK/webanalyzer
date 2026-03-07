@@ -206,6 +206,9 @@ export function checkCallSource(calleeStr) {
 }
 
 // Check if a call expression is a sink, return sink info
+// Sinks that should only match as global/window calls, not arbitrary method names
+const GLOBAL_ONLY_SINKS = new Set(['setTimeout', 'setInterval', 'eval', 'Function']);
+
 export function checkCallSink(calleeStr, methodName) {
   // Direct match
   if (CALL_SINKS[calleeStr]) return CALL_SINKS[calleeStr];
@@ -213,7 +216,18 @@ export function checkCallSink(calleeStr, methodName) {
   for (const [pattern, info] of Object.entries(CALL_SINKS)) {
     const parts = pattern.split('.');
     const method = parts[parts.length - 1];
-    if (method === methodName) return info;
+    if (method === methodName) {
+      // For global-only sinks, only match if called as global or on window
+      if (GLOBAL_ONLY_SINKS.has(method)) {
+        if (!calleeStr || calleeStr === method ||
+            calleeStr === `window.${method}` || calleeStr === `globalThis.${method}` ||
+            calleeStr === `self.${method}`) {
+          return info;
+        }
+        continue;
+      }
+      return info;
+    }
   }
   return null;
 }

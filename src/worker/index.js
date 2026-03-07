@@ -222,6 +222,10 @@ function setupMessageHandlerTaint(ast, env, file) {
     if (callee.type !== 'MemberExpression') return;
     if (callee.property?.name !== 'addEventListener') return;
 
+    // Skip self.addEventListener('message', ...) — worker receiving from same-origin parent
+    const objName = callee.object?.type === 'Identifier' ? callee.object.name : null;
+    if (objName === 'self') return;
+
     const firstArg = node.arguments[0];
     if (!firstArg) return;
     const eventName = firstArg.value;
@@ -253,8 +257,7 @@ function setupMessageHandlerTaint(ast, env, file) {
   walkAST(ast.program, (node) => {
     if (node.type !== 'AssignmentExpression') return;
     const leftStr = nodeToString(node.left);
-    if (leftStr !== 'window.onmessage' && leftStr !== 'onmessage' &&
-        leftStr !== 'self.onmessage') return;
+    if (leftStr !== 'window.onmessage' && leftStr !== 'onmessage') return;
 
     const handler = node.right;
     if (handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression') return;

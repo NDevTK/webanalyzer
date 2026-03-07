@@ -43681,12 +43681,21 @@ ${rootStack}`;
     if (!str) return null;
     return MEMBER_SOURCES[str] || null;
   }
+  var GLOBAL_ONLY_SINKS = /* @__PURE__ */ new Set(["setTimeout", "setInterval", "eval", "Function"]);
   function checkCallSink(calleeStr, methodName) {
     if (CALL_SINKS[calleeStr]) return CALL_SINKS[calleeStr];
     for (const [pattern, info] of Object.entries(CALL_SINKS)) {
       const parts = pattern.split(".");
       const method = parts[parts.length - 1];
-      if (method === methodName) return info;
+      if (method === methodName) {
+        if (GLOBAL_ONLY_SINKS.has(method)) {
+          if (!calleeStr || calleeStr === method || calleeStr === `window.${method}` || calleeStr === `globalThis.${method}` || calleeStr === `self.${method}`) {
+            return info;
+          }
+          continue;
+        }
+        return info;
+      }
     }
     return null;
   }
@@ -47150,6 +47159,8 @@ ${rootStack}`;
     if (left.object?.type === "MemberExpression" && !left.object.computed) {
       const objProp = left.object.property?.name;
       if (objProp === "__proto__" || objProp === "prototype") {
+        const assignedProp = !left.computed && left.property?.name;
+        if (assignedProp === "constructor") return;
         const rhsTaint = evaluateExpr(node.right, env, ctx);
         const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
         const combinedTaint = rhsTaint.tainted ? rhsTaint : keyTaint;
@@ -47629,6 +47640,8 @@ ${rootStack}`;
       const callee = node.callee;
       if (callee.type !== "MemberExpression") return;
       if (callee.property?.name !== "addEventListener") return;
+      const objName = callee.object?.type === "Identifier" ? callee.object.name : null;
+      if (objName === "self") return;
       const firstArg = node.arguments[0];
       if (!firstArg) return;
       const eventName = firstArg.value;
@@ -47656,7 +47669,7 @@ ${rootStack}`;
     walkAST(ast.program, (node) => {
       if (node.type !== "AssignmentExpression") return;
       const leftStr = nodeToString(node.left);
-      if (leftStr !== "window.onmessage" && leftStr !== "onmessage" && leftStr !== "self.onmessage") return;
+      if (leftStr !== "window.onmessage" && leftStr !== "onmessage") return;
       const handler = node.right;
       if (handler.type !== "ArrowFunctionExpression" && handler.type !== "FunctionExpression") return;
       const checksOrigin = containsOriginCheck(handler.body);

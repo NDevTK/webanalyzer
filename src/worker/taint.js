@@ -4121,6 +4121,10 @@ export function checkPrototypePollution(node, env, ctx) {
   if (left.object?.type === 'MemberExpression' && !left.object.computed) {
     const objProp = left.object.property?.name;
     if (objProp === '__proto__' || objProp === 'prototype') {
+      // Skip standard constructor assignment (e.g., A.prototype.constructor = A)
+      const assignedProp = !left.computed && left.property?.name;
+      if (assignedProp === 'constructor') return;
+
       const rhsTaint = evaluateExpr(node.right, env, ctx);
       // Check tainted value OR tainted key
       const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
