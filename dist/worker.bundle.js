@@ -43340,27 +43340,41 @@ ${rootStack}`;
     }
   }
   function buildIf(stmt, current, cfg, ctx) {
-    current.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
-    const thenBlock = cfg.createBlock();
     const joinBlock = cfg.createBlock();
-    thenBlock.branchCondition = stmt.test;
-    thenBlock.branchPolarity = true;
-    current.connect(thenBlock);
-    const afterThen = buildStatement(stmt.consequent, thenBlock, cfg, ctx);
-    if (afterThen) afterThen.connect(joinBlock);
-    if (stmt.alternate) {
-      const elseBlock = cfg.createBlock();
-      elseBlock.branchCondition = stmt.test;
-      elseBlock.branchPolarity = false;
-      current.connect(elseBlock);
-      const afterElse = buildStatement(stmt.alternate, elseBlock, cfg, ctx);
-      if (afterElse) afterElse.connect(joinBlock);
-    } else {
-      if (!afterThen) {
-        joinBlock.branchCondition = stmt.test;
-        joinBlock.branchPolarity = false;
+    let cur = stmt;
+    let curBlock = current;
+    while (cur && cur.type === "IfStatement") {
+      curBlock.addNode({ type: "_Test", test: cur.test, loc: cur.loc });
+      const thenBlock = cfg.createBlock();
+      thenBlock.branchCondition = cur.test;
+      thenBlock.branchPolarity = true;
+      curBlock.connect(thenBlock);
+      const afterThen = buildStatement(cur.consequent, thenBlock, cfg, ctx);
+      if (afterThen) afterThen.connect(joinBlock);
+      if (cur.alternate) {
+        if (cur.alternate.type === "IfStatement") {
+          const elseBlock2 = cfg.createBlock();
+          elseBlock2.branchCondition = cur.test;
+          elseBlock2.branchPolarity = false;
+          curBlock.connect(elseBlock2);
+          curBlock = elseBlock2;
+          cur = cur.alternate;
+          continue;
+        }
+        const elseBlock = cfg.createBlock();
+        elseBlock.branchCondition = cur.test;
+        elseBlock.branchPolarity = false;
+        curBlock.connect(elseBlock);
+        const afterElse = buildStatement(cur.alternate, elseBlock, cfg, ctx);
+        if (afterElse) afterElse.connect(joinBlock);
+      } else {
+        if (!afterThen) {
+          joinBlock.branchCondition = cur.test;
+          joinBlock.branchPolarity = false;
+        }
+        curBlock.connect(joinBlock);
       }
-      current.connect(joinBlock);
+      break;
     }
     return joinBlock.predecessors.length > 0 ? joinBlock : null;
   }
