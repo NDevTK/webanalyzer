@@ -78,15 +78,23 @@ export class TaintEnv {
   }
 
   get(key) {
-    if (this.bindings.has(key)) return this.bindings.get(key);
-    if (this.parent) return this.parent.get(key);
+    let cur = this;
+    while (cur) {
+      if (cur.bindings.has(key)) return cur.bindings.get(key);
+      cur = cur.parent;
+    }
     return TaintSet.empty();
   }
 
   set(key, taintSet) { this.bindings.set(key, taintSet); }
 
   has(key) {
-    return this.bindings.has(key) || (this.parent ? this.parent.has(key) : false);
+    let cur = this;
+    while (cur) {
+      if (cur.bindings.has(key)) return true;
+      cur = cur.parent;
+    }
+    return false;
   }
 
   child() { return new TaintEnv(this); }
@@ -558,7 +566,7 @@ function findReturnedFunction(funcNode) {
 
 // Returns true/false if the node is a constant truthy/falsy literal, null if unknown
 // When ctx is provided, can resolve Identifier references to their constant values
-function isConstantBool(node, ctx) {
+function isConstantBoolLeaf(node, ctx) {
   if (!node) return null;
   if (node.type === 'BooleanLiteral') return node.value;
   if (node.type === 'Literal' && typeof node.value === 'boolean') return node.value;
@@ -568,31 +576,46 @@ function isConstantBool(node, ctx) {
     return node.value !== '';
   if (node.type === 'NullLiteral' || (node.type === 'Literal' && node.value === null)) return false;
   if (node.type === 'Identifier' && node.name === 'undefined') return false;
-  // Resolve Identifier to constant value via scope info
   if (node.type === 'Identifier' && ctx?.scopeInfo) {
     const bindingKey = ctx.scopeInfo.resolve(node);
     if (bindingKey) {
       const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-      if (declNode?.type === 'VariableDeclarator' && declNode.init) {
-        return isConstantBool(declNode.init, ctx);
-      }
-    }
-  }
-  // Recursively resolve LogicalExpression: (null || 'safe') → truthy, (false && x) → falsy
-  if (node.type === 'LogicalExpression') {
-    const leftBool = isConstantBool(node.left, ctx);
-    const rightBool = isConstantBool(node.right, ctx);
-    if (node.operator === '||') {
-      if (leftBool === true) return true;          // truthy || anything → truthy
-      if (leftBool === false) return rightBool;     // falsy || right → right
-    } else if (node.operator === '&&') {
-      if (leftBool === false) return false;         // falsy && anything → falsy
-      if (leftBool === true) return rightBool;      // truthy && right → right
-    } else if (node.operator === '??') {
-      if (leftBool !== null && leftBool !== undefined) return leftBool; // non-nullish ?? anything → left
+      if (declNode?.type === 'VariableDeclarator' && declNode.init)
+        return isConstantBoolLeaf(declNode.init, null); // null ctx prevents further resolution
     }
   }
   return null;
+}
+function isConstantBool(node, ctx) {
+  if (!node) return null;
+  if (node.type !== 'LogicalExpression') return isConstantBoolLeaf(node, ctx);
+  // Flatten into work stack to avoid recursion on deeply nested chains
+  // Stack items: nodes to evaluate, processed right-to-left
+  const work = []; // { op, node } — node is a non-LogicalExpression leaf
+  let cur = node;
+  while (cur.type === 'LogicalExpression') {
+    work.push({ op: cur.operator, node: cur.right });
+    cur = cur.left;
+  }
+  // cur is the leftmost non-LogicalExpression node; work is in reverse order
+  let result = isConstantBool(cur, ctx);
+  for (let i = work.length - 1; i >= 0; i--) {
+    const { op, node: rhs } = work[i];
+    const rhsVal = () => isConstantBool(rhs, ctx);
+    if (op === '||') {
+      if (result === true) return true;
+      if (result === false) { result = rhsVal(); continue; }
+      return null;
+    } else if (op === '&&') {
+      if (result === false) return false;
+      if (result === true) { result = rhsVal(); continue; }
+      return null;
+    } else if (op === '??') {
+      if (result !== null && result !== undefined) continue;
+      return null;
+    }
+  }
+  return result;
 }
 function findProtocolMember(node) {
   // Returns the base object name if node is X.protocol
@@ -1659,63 +1682,90 @@ export function evaluateExpr(node, env, ctx) {
       return evaluateExpr(node.left, env, ctx);
 
     case 'BinaryExpression': {
-      const leftT = evaluateExpr(node.left, env, ctx);
-      const rightT = evaluateExpr(node.right, env, ctx);
-      const op = node.operator;
-      // String concatenation: propagate taint
-      // Also check for toString/valueOf coercion: '' + obj invokes obj.toString()
-      if (op === '+') {
-        let result = leftT.clone().merge(rightT);
-        // Check if either operand is an object with a toString/valueOf method
-        for (const operand of [node.left, node.right]) {
-          if (operand.type === 'Identifier' && !result.tainted) {
-            const objName = operand.name;
-            const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
-            if (toStringFunc && toStringFunc.body) {
-              const synthCall = { type: 'CallExpression', callee: operand, arguments: [], loc: operand.loc };
-              const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
-              result = result.merge(toStringTaint);
+      // Flatten left-recursive chains to avoid stack overflow: a + b + c → [a, b, c]
+      const parts = [];
+      let bn = node;
+      while (bn.type === 'BinaryExpression') {
+        parts.push({ op: bn.operator, right: bn.right });
+        bn = bn.left;
+      }
+      // bn is the leftmost non-BinaryExpression
+      let result = evaluateExpr(bn, env, ctx);
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const { op, right } = parts[i];
+        // Comparison/relational: return boolean — kill taint
+        if (op === '===' || op === '==' || op === '!==' || op === '!=' ||
+            op === '>' || op === '<' || op === '>=' || op === '<=' ||
+            op === 'instanceof' || op === 'in') {
+          evaluateExpr(right, env, ctx); // side effects
+          return TaintSet.empty();
+        }
+        // Arithmetic/bitwise: return number — kill taint
+        if (op === '-' || op === '*' || op === '/' || op === '%' || op === '**' ||
+            op === '|' || op === '&' || op === '^' || op === '<<' || op === '>>' || op === '>>>') {
+          evaluateExpr(right, env, ctx); // side effects
+          return TaintSet.empty();
+        }
+        const rightT = evaluateExpr(right, env, ctx);
+        if (op === '+') {
+          result = result.clone().merge(rightT);
+          // Check toString/valueOf coercion on both operands
+          const leftNode = i === parts.length - 1 ? bn : parts[i + 1].right;
+          for (const operand of [leftNode, right]) {
+            if (operand.type === 'Identifier' && !result.tainted) {
+              const objName = operand.name;
+              const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
+              if (toStringFunc && toStringFunc.body) {
+                const synthCall = { type: 'CallExpression', callee: operand, arguments: [], loc: operand.loc };
+                const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
+                result = result.merge(toStringTaint);
+              }
             }
           }
+        } else {
+          result = result.clone().merge(rightT);
         }
-        return result;
       }
-      // Comparison/relational: return boolean — kill taint
-      if (op === '===' || op === '==' || op === '!==' || op === '!=' ||
-          op === '>' || op === '<' || op === '>=' || op === '<=' ||
-          op === 'instanceof' || op === 'in') return TaintSet.empty();
-      // Arithmetic/bitwise: return number — kill taint
-      if (op === '-' || op === '*' || op === '/' || op === '%' || op === '**' ||
-          op === '|' || op === '&' || op === '^' || op === '<<' || op === '>>' || op === '>>>') return TaintSet.empty();
-      return leftT.clone().merge(rightT);
+      return result;
     }
 
     case 'LogicalExpression': {
-      const leftVal = evaluateExpr(node.left, env, ctx);
-      // Short-circuit: false && x → false (never evaluates right), true || x → true
-      // Short-circuit with constant left operand
-      if (node.operator === '&&' || node.operator === '||') {
-        const constLeft = isConstantBool(node.left, ctx);
-        if (node.operator === '&&' && constLeft === false) return TaintSet.empty();
-        if (node.operator === '||' && constLeft === true) return leftVal.clone();
+      // Flatten left-recursive chain to avoid stack overflow: a || b || c → [a, b, c]
+      const parts = []; // {op, node} pairs; first entry has op=null
+      let ln = node;
+      while (ln.type === 'LogicalExpression') {
+        parts.push({ op: ln.operator, right: ln.right });
+        ln = ln.left;
       }
-      // Nullish coalescing: null/undefined ?? x → right side only
-      // nonNullish ?? x → left side only (short-circuits right)
-      if (node.operator === '??') {
-        const ln = node.left;
-        const isNullish = (ln.type === 'NullLiteral') ||
-          (ln.type === 'Literal' && ln.value === null) ||
-          (ln.type === 'Identifier' && ln.name === 'undefined');
-        if (isNullish) return evaluateExpr(node.right, env, ctx);
-        // If left is a non-nullish constant (string, number, boolean, object literal),
-        // ?? short-circuits and never evaluates right
-        const isNonNullishConst = (ln.type === 'StringLiteral') ||
-          (ln.type === 'NumericLiteral') || (ln.type === 'BooleanLiteral') ||
-          (ln.type === 'Literal' && ln.value !== null && ln.value !== undefined) ||
-          (ln.type === 'ObjectExpression') || (ln.type === 'ArrayExpression');
-        if (isNonNullishConst) return leftVal.clone();
+      // ln is the leftmost non-LogicalExpression
+      let result = evaluateExpr(ln, env, ctx);
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const { op, right } = parts[i];
+        if (op === '&&') {
+          const constLeft = isConstantBool(ln, ctx);
+          if (constLeft === false) return TaintSet.empty();
+          result = result.clone().merge(evaluateExpr(right, env, ctx));
+        } else if (op === '||') {
+          const constLeft = isConstantBool(ln, ctx);
+          if (constLeft === true) { /* short-circuit: skip right */ }
+          else result = result.clone().merge(evaluateExpr(right, env, ctx));
+        } else if (op === '??') {
+          const isNullish = (ln.type === 'NullLiteral') ||
+            (ln.type === 'Literal' && ln.value === null) ||
+            (ln.type === 'Identifier' && ln.name === 'undefined');
+          if (isNullish) {
+            result = evaluateExpr(right, env, ctx);
+          } else {
+            const isNonNullishConst = (ln.type === 'StringLiteral') ||
+              (ln.type === 'NumericLiteral') || (ln.type === 'BooleanLiteral') ||
+              (ln.type === 'Literal' && ln.value !== null && ln.value !== undefined) ||
+              (ln.type === 'ObjectExpression') || (ln.type === 'ArrayExpression');
+            if (!isNonNullishConst) result = result.clone().merge(evaluateExpr(right, env, ctx));
+          }
+        }
+        ln = parts[i].right; // for next iteration's constLeft check, use this level's right as context
       }
-      return leftVal.clone().merge(evaluateExpr(node.right, env, ctx));
+      return result;
     }
 
     case 'UnaryExpression':
@@ -1731,49 +1781,48 @@ export function evaluateExpr(node, env, ctx) {
       return TaintSet.empty();
 
     case 'ConditionalExpression': {
-      evaluateExpr(node.test, env, ctx);
-      // Constant-fold: if condition is known, only evaluate the taken branch
-      const constCond = isConstantBool(node.test);
-      if (constCond === true) {
-        const branch = node.consequent;
-        const result = evaluateExpr(branch, env, ctx);
-        // Register function reference for constant-folded ternary: var f = true ? fnA : fnB
-        if (!ctx.returnedFuncNode && branch.type === 'Identifier') {
-          const refKey = resolveId(branch, ctx);
-          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
-          if (funcRef) ctx.returnedFuncNode = funcRef;
-        }
-        return result;
-      }
-      if (constCond === false) {
-        const branch = node.alternate;
-        const result = evaluateExpr(branch, env, ctx);
-        if (!ctx.returnedFuncNode && branch.type === 'Identifier') {
-          const refKey = resolveId(branch, ctx);
-          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
-          if (funcRef) ctx.returnedFuncNode = funcRef;
-        }
-        return result;
-      }
-      // Apply scheme check from test to consequent branch (same as if-statement path sensitivity)
-      const checkedVar = extractSchemeCheck(node.test, true);
-      const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
-      if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
-      const consequentTaint = evaluateExpr(node.consequent, env, ctx);
-      if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
-      const alternateTaint = evaluateExpr(node.alternate, env, ctx);
-      // If either branch is a function reference, register it so ternary function selection works
-      // e.g., var render = cond ? renderHTML : renderText; render(tainted)
-      if (!ctx.returnedFuncNode) {
-        for (const branch of [node.consequent, node.alternate]) {
-          if (branch.type === 'Identifier') {
+      // Flatten right-recursive ternary chains: a ? b : c ? d : e → iterate
+      let result = TaintSet.empty();
+      let cn = node;
+      while (cn.type === 'ConditionalExpression') {
+        evaluateExpr(cn.test, env, ctx);
+        const constCond = isConstantBool(cn.test);
+        if (constCond === true) {
+          const branch = cn.consequent;
+          result = evaluateExpr(branch, env, ctx);
+          if (!ctx.returnedFuncNode && branch.type === 'Identifier') {
             const refKey = resolveId(branch, ctx);
             const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
-            if (funcRef) { ctx.returnedFuncNode = funcRef; break; }
+            if (funcRef) ctx.returnedFuncNode = funcRef;
           }
+          return result;
         }
+        if (constCond === false) {
+          cn = cn.alternate; // continue loop — alternate may be another ConditionalExpression
+          continue;
+        }
+        // Unknown condition: evaluate consequent, then continue with alternate
+        const checkedVar = extractSchemeCheck(cn.test, true);
+        const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
+        if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
+        const consequentTaint = evaluateExpr(cn.consequent, env, ctx);
+        if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
+        result = result.merge(consequentTaint);
+        if (!ctx.returnedFuncNode && cn.consequent.type === 'Identifier') {
+          const refKey = resolveId(cn.consequent, ctx);
+          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.consequent.name);
+          if (funcRef) ctx.returnedFuncNode = funcRef;
+        }
+        cn = cn.alternate;
       }
-      return consequentTaint.clone().merge(alternateTaint);
+      // cn is the final alternate (not a ConditionalExpression)
+      const altTaint = evaluateExpr(cn, env, ctx);
+      if (!ctx.returnedFuncNode && cn.type === 'Identifier') {
+        const refKey = resolveId(cn, ctx);
+        const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.name);
+        if (funcRef) ctx.returnedFuncNode = funcRef;
+      }
+      return result.merge(altTaint);
     }
 
     case 'TemplateLiteral': {
@@ -1887,68 +1936,77 @@ export function evaluateExpr(node, env, ctx) {
 
 // ── Member expression ──
 function evaluateMemberExpr(node, env, ctx) {
-  const sourceLabel = checkMemberSource(node);
-  if (sourceLabel) {
-    const loc = node.loc?.start || {};
-    return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(node)));
-  }
+  // Iterative evaluation for MemberExpression chains to avoid stack overflow on minified code.
+  // Walk the chain, checking sources/env/getters at each level. Only recurse for computed access.
+  let cur = node;
+  while (cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression') {
+    const sourceLabel = checkMemberSource(cur);
+    if (sourceLabel) {
+      const loc = cur.loc?.start || {};
+      return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur)));
+    }
 
-  // Resolve aliases: replace root identifier with its alias and re-check as source
-  {
-    const fullStr = nodeToString(node);
+    // Resolve aliases: replace root identifier with its alias and re-check as source
+    const fullStr = nodeToString(cur);
     if (fullStr) {
       const resolvedStr = resolveAliasedPath(fullStr, env);
       if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
-        const loc = node.loc?.start || {};
+        const loc = cur.loc?.start || {};
         return TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr));
       }
     }
-    // Also handle single-hop: obj aliased to global, check alias.property
-    if (!node.computed && node.object?.type === 'Identifier') {
-      const alias = env.aliases.get(node.object.name);
-      if (alias && node.property) {
-        const deepPath = `${alias}.${node.property.name || node.property.value}`;
+    if (!cur.computed && cur.object?.type === 'Identifier') {
+      const alias = env.aliases.get(cur.object.name);
+      if (alias && cur.property) {
+        const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
         if (MEMBER_SOURCES[deepPath]) {
-          const loc = node.loc?.start || {};
+          const loc = cur.loc?.start || {};
           return TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath));
         }
       }
     }
-  }
 
-  const fullPath = nodeToString(node);
-  if (fullPath) {
-    // If per-property taint exists (even if clean), it's authoritative for this property
-    if (env.has(fullPath)) return env.get(fullPath).clone();
-  }
-  // Scope-resolved lookup: if object is an Identifier, try resolvedKey.propName
-  if (!node.computed && node.object?.type === 'Identifier' && node.property) {
-    const resolvedObjKey = resolveId(node.object, ctx);
-    const memberProp = node.property.name || node.property.value;
-    if (memberProp) {
-      const scopedPath = `${resolvedObjKey}.${memberProp}`;
-      if (env.has(scopedPath)) return env.get(scopedPath).clone();
+    const fullPath = fullStr;
+    if (fullPath) {
+      if (env.has(fullPath)) return env.get(fullPath).clone();
     }
-  }
-  if (fullPath) {
-    // Check for getter: invoke getter body to determine taint
-    const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
-    if (getterFunc && getterFunc.body) {
-      const childEnv = (getterFunc._closureEnv || env).child();
-      const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
-      if (getterTaint.tainted) return getterTaint;
+    // Scope-resolved lookup
+    if (!cur.computed && cur.object?.type === 'Identifier' && cur.property) {
+      const resolvedObjKey = resolveId(cur.object, ctx);
+      const memberProp = cur.property.name || cur.property.value;
+      if (memberProp) {
+        const scopedPath = `${resolvedObjKey}.${memberProp}`;
+        if (env.has(scopedPath)) return env.get(scopedPath).clone();
+      }
     }
-  }
+    if (fullPath) {
+      const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
+      if (getterFunc && getterFunc.body) {
+        const childEnv = (getterFunc._closureEnv || env).child();
+        const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
+        if (getterTaint.tainted) return getterTaint;
+      }
+    }
 
-  // Properties that always produce a number, boolean, or non-string reference — kill taint
-  const propName = !node.computed && node.property ? (node.property.name || node.property.value) : null;
-  if (propName && (NUMERIC_PROPS.has(propName) || propName === 'constructor' || propName === 'prototype')) {
-    evaluateExpr(node.object, env, ctx); // still evaluate for side effects
-    return TaintSet.empty();
-  }
+    const propName = !cur.computed && cur.property ? (cur.property.name || cur.property.value) : null;
+    if (propName && (NUMERIC_PROPS.has(propName) || propName === 'constructor' || propName === 'prototype')) {
+      return TaintSet.empty();
+    }
 
-  const objTaint = evaluateExpr(node.object, env, ctx);
-  if (node.computed) {
+    // Computed access: evaluate object + key, handle property lookups, then return
+    if (cur.computed) {
+      const objTaint = evaluateExpr(cur.object, env, ctx);
+      return evaluateComputedMember(cur, objTaint, env, ctx);
+    }
+
+    // Non-computed: continue walking up the chain
+    cur = cur.object;
+  }
+  // Reached the root (non-MemberExpression node)
+  return evaluateExpr(cur, env, ctx);
+}
+
+function evaluateComputedMember(node, objTaint, env, ctx) {
     const keyTaint = evaluateExpr(node.property, env, ctx);
     // For computed access with a constant key (obj['key'], arr[0], obj[constVar]),
     // do per-property lookup — precise, not overapproximated
@@ -2024,7 +2082,6 @@ function evaluateMemberExpr(node, env, ctx) {
     // If the object itself is tainted (e.g. from JSON.parse), reading any property is tainted
     if (objTaint.tainted) return objTaint.clone();
     // If key is tainted but object has no tainted values, the read value is safe
-  }
   return objTaint;
 }
 
@@ -4071,6 +4128,7 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
 }
 
 function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
+  if (!sinkInfo.taintedArgs) return;
   for (const argIdx of sinkInfo.taintedArgs) {
     const argTaint = argTaints[argIdx];
     if (!argTaint || !argTaint.tainted) continue;

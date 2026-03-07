@@ -43784,15 +43784,23 @@ ${rootStack}`;
       this.aliases = /* @__PURE__ */ new Map();
     }
     get(key) {
-      if (this.bindings.has(key)) return this.bindings.get(key);
-      if (this.parent) return this.parent.get(key);
+      let cur = this;
+      while (cur) {
+        if (cur.bindings.has(key)) return cur.bindings.get(key);
+        cur = cur.parent;
+      }
       return TaintSet.empty();
     }
     set(key, taintSet) {
       this.bindings.set(key, taintSet);
     }
     has(key) {
-      return this.bindings.has(key) || (this.parent ? this.parent.has(key) : false);
+      let cur = this;
+      while (cur) {
+        if (cur.bindings.has(key)) return true;
+        cur = cur.parent;
+      }
+      return false;
     }
     child() {
       return new _TaintEnv(this);
@@ -44170,7 +44178,7 @@ ${rootStack}`;
     }
     return null;
   }
-  function isConstantBool(node, ctx) {
+  function isConstantBoolLeaf(node, ctx) {
     if (!node) return null;
     if (node.type === "BooleanLiteral") return node.value;
     if (node.type === "Literal" && typeof node.value === "boolean") return node.value;
@@ -44184,25 +44192,45 @@ ${rootStack}`;
       const bindingKey = ctx.scopeInfo.resolve(node);
       if (bindingKey) {
         const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-        if (declNode?.type === "VariableDeclarator" && declNode.init) {
-          return isConstantBool(declNode.init, ctx);
-        }
-      }
-    }
-    if (node.type === "LogicalExpression") {
-      const leftBool = isConstantBool(node.left, ctx);
-      const rightBool = isConstantBool(node.right, ctx);
-      if (node.operator === "||") {
-        if (leftBool === true) return true;
-        if (leftBool === false) return rightBool;
-      } else if (node.operator === "&&") {
-        if (leftBool === false) return false;
-        if (leftBool === true) return rightBool;
-      } else if (node.operator === "??") {
-        if (leftBool !== null && leftBool !== void 0) return leftBool;
+        if (declNode?.type === "VariableDeclarator" && declNode.init)
+          return isConstantBoolLeaf(declNode.init, null);
       }
     }
     return null;
+  }
+  function isConstantBool(node, ctx) {
+    if (!node) return null;
+    if (node.type !== "LogicalExpression") return isConstantBoolLeaf(node, ctx);
+    const work = [];
+    let cur = node;
+    while (cur.type === "LogicalExpression") {
+      work.push({ op: cur.operator, node: cur.right });
+      cur = cur.left;
+    }
+    let result = isConstantBool(cur, ctx);
+    for (let i = work.length - 1; i >= 0; i--) {
+      const { op, node: rhs } = work[i];
+      const rhsVal = () => isConstantBool(rhs, ctx);
+      if (op === "||") {
+        if (result === true) return true;
+        if (result === false) {
+          result = rhsVal();
+          continue;
+        }
+        return null;
+      } else if (op === "&&") {
+        if (result === false) return false;
+        if (result === true) {
+          result = rhsVal();
+          continue;
+        }
+        return null;
+      } else if (op === "??") {
+        if (result !== null && result !== void 0) continue;
+        return null;
+      }
+    }
+    return result;
   }
   function findProtocolMember(node) {
     if (node?.type === "MemberExpression" && node.property?.name === "protocol") {
@@ -45113,43 +45141,74 @@ ${rootStack}`;
         processAssignment(node, env, ctx);
         return evaluateExpr(node.left, env, ctx);
       case "BinaryExpression": {
-        const leftT = evaluateExpr(node.left, env, ctx);
-        const rightT = evaluateExpr(node.right, env, ctx);
-        const op = node.operator;
-        if (op === "+") {
-          let result = leftT.clone().merge(rightT);
-          for (const operand of [node.left, node.right]) {
-            if (operand.type === "Identifier" && !result.tainted) {
-              const objName = operand.name;
-              const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
-              if (toStringFunc && toStringFunc.body) {
-                const synthCall = { type: "CallExpression", callee: operand, arguments: [], loc: operand.loc };
-                const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
-                result = result.merge(toStringTaint);
+        const parts = [];
+        let bn = node;
+        while (bn.type === "BinaryExpression") {
+          parts.push({ op: bn.operator, right: bn.right });
+          bn = bn.left;
+        }
+        let result = evaluateExpr(bn, env, ctx);
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const { op, right } = parts[i];
+          if (op === "===" || op === "==" || op === "!==" || op === "!=" || op === ">" || op === "<" || op === ">=" || op === "<=" || op === "instanceof" || op === "in") {
+            evaluateExpr(right, env, ctx);
+            return TaintSet.empty();
+          }
+          if (op === "-" || op === "*" || op === "/" || op === "%" || op === "**" || op === "|" || op === "&" || op === "^" || op === "<<" || op === ">>" || op === ">>>") {
+            evaluateExpr(right, env, ctx);
+            return TaintSet.empty();
+          }
+          const rightT = evaluateExpr(right, env, ctx);
+          if (op === "+") {
+            result = result.clone().merge(rightT);
+            const leftNode = i === parts.length - 1 ? bn : parts[i + 1].right;
+            for (const operand of [leftNode, right]) {
+              if (operand.type === "Identifier" && !result.tainted) {
+                const objName = operand.name;
+                const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
+                if (toStringFunc && toStringFunc.body) {
+                  const synthCall = { type: "CallExpression", callee: operand, arguments: [], loc: operand.loc };
+                  const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
+                  result = result.merge(toStringTaint);
+                }
               }
             }
+          } else {
+            result = result.clone().merge(rightT);
           }
-          return result;
         }
-        if (op === "===" || op === "==" || op === "!==" || op === "!=" || op === ">" || op === "<" || op === ">=" || op === "<=" || op === "instanceof" || op === "in") return TaintSet.empty();
-        if (op === "-" || op === "*" || op === "/" || op === "%" || op === "**" || op === "|" || op === "&" || op === "^" || op === "<<" || op === ">>" || op === ">>>") return TaintSet.empty();
-        return leftT.clone().merge(rightT);
+        return result;
       }
       case "LogicalExpression": {
-        const leftVal = evaluateExpr(node.left, env, ctx);
-        if (node.operator === "&&" || node.operator === "||") {
-          const constLeft = isConstantBool(node.left, ctx);
-          if (node.operator === "&&" && constLeft === false) return TaintSet.empty();
-          if (node.operator === "||" && constLeft === true) return leftVal.clone();
+        const parts = [];
+        let ln = node;
+        while (ln.type === "LogicalExpression") {
+          parts.push({ op: ln.operator, right: ln.right });
+          ln = ln.left;
         }
-        if (node.operator === "??") {
-          const ln = node.left;
-          const isNullish = ln.type === "NullLiteral" || ln.type === "Literal" && ln.value === null || ln.type === "Identifier" && ln.name === "undefined";
-          if (isNullish) return evaluateExpr(node.right, env, ctx);
-          const isNonNullishConst = ln.type === "StringLiteral" || ln.type === "NumericLiteral" || ln.type === "BooleanLiteral" || ln.type === "Literal" && ln.value !== null && ln.value !== void 0 || ln.type === "ObjectExpression" || ln.type === "ArrayExpression";
-          if (isNonNullishConst) return leftVal.clone();
+        let result = evaluateExpr(ln, env, ctx);
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const { op, right } = parts[i];
+          if (op === "&&") {
+            const constLeft = isConstantBool(ln, ctx);
+            if (constLeft === false) return TaintSet.empty();
+            result = result.clone().merge(evaluateExpr(right, env, ctx));
+          } else if (op === "||") {
+            const constLeft = isConstantBool(ln, ctx);
+            if (constLeft === true) {
+            } else result = result.clone().merge(evaluateExpr(right, env, ctx));
+          } else if (op === "??") {
+            const isNullish = ln.type === "NullLiteral" || ln.type === "Literal" && ln.value === null || ln.type === "Identifier" && ln.name === "undefined";
+            if (isNullish) {
+              result = evaluateExpr(right, env, ctx);
+            } else {
+              const isNonNullishConst = ln.type === "StringLiteral" || ln.type === "NumericLiteral" || ln.type === "BooleanLiteral" || ln.type === "Literal" && ln.value !== null && ln.value !== void 0 || ln.type === "ObjectExpression" || ln.type === "ArrayExpression";
+              if (!isNonNullishConst) result = result.clone().merge(evaluateExpr(right, env, ctx));
+            }
+          }
+          ln = parts[i].right;
         }
-        return leftVal.clone().merge(evaluateExpr(node.right, env, ctx));
+        return result;
       }
       case "UnaryExpression":
         if (node.operator === "!" || node.operator === "typeof" || node.operator === "+" || node.operator === "-" || node.operator === "~" || node.operator === "void" || node.operator === "delete") {
@@ -45160,47 +45219,45 @@ ${rootStack}`;
       case "UpdateExpression":
         return TaintSet.empty();
       case "ConditionalExpression": {
-        evaluateExpr(node.test, env, ctx);
-        const constCond = isConstantBool(node.test);
-        if (constCond === true) {
-          const branch = node.consequent;
-          const result = evaluateExpr(branch, env, ctx);
-          if (!ctx.returnedFuncNode && branch.type === "Identifier") {
-            const refKey = resolveId(branch, ctx);
-            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
-            if (funcRef) ctx.returnedFuncNode = funcRef;
-          }
-          return result;
-        }
-        if (constCond === false) {
-          const branch = node.alternate;
-          const result = evaluateExpr(branch, env, ctx);
-          if (!ctx.returnedFuncNode && branch.type === "Identifier") {
-            const refKey = resolveId(branch, ctx);
-            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
-            if (funcRef) ctx.returnedFuncNode = funcRef;
-          }
-          return result;
-        }
-        const checkedVar = extractSchemeCheck(node.test, true);
-        const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
-        if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
-        const consequentTaint = evaluateExpr(node.consequent, env, ctx);
-        if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
-        const alternateTaint = evaluateExpr(node.alternate, env, ctx);
-        if (!ctx.returnedFuncNode) {
-          for (const branch of [node.consequent, node.alternate]) {
-            if (branch.type === "Identifier") {
+        let result = TaintSet.empty();
+        let cn = node;
+        while (cn.type === "ConditionalExpression") {
+          evaluateExpr(cn.test, env, ctx);
+          const constCond = isConstantBool(cn.test);
+          if (constCond === true) {
+            const branch = cn.consequent;
+            result = evaluateExpr(branch, env, ctx);
+            if (!ctx.returnedFuncNode && branch.type === "Identifier") {
               const refKey = resolveId(branch, ctx);
               const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
-              if (funcRef) {
-                ctx.returnedFuncNode = funcRef;
-                break;
-              }
+              if (funcRef) ctx.returnedFuncNode = funcRef;
             }
+            return result;
           }
+          if (constCond === false) {
+            cn = cn.alternate;
+            continue;
+          }
+          const checkedVar = extractSchemeCheck(cn.test, true);
+          const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
+          if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
+          const consequentTaint = evaluateExpr(cn.consequent, env, ctx);
+          if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
+          result = result.merge(consequentTaint);
+          if (!ctx.returnedFuncNode && cn.consequent.type === "Identifier") {
+            const refKey = resolveId(cn.consequent, ctx);
+            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.consequent.name);
+            if (funcRef) ctx.returnedFuncNode = funcRef;
+          }
+          cn = cn.alternate;
         }
-        return consequentTaint.clone().merge(alternateTaint);
+        const altTaint = evaluateExpr(cn, env, ctx);
+        if (!ctx.returnedFuncNode && cn.type === "Identifier") {
+          const refKey = resolveId(cn, ctx);
+          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.name);
+          if (funcRef) ctx.returnedFuncNode = funcRef;
+        }
+        return result.merge(altTaint);
       }
       case "TemplateLiteral": {
         const t = TaintSet.empty();
@@ -45292,119 +45349,124 @@ ${rootStack}`;
     }
   }
   function evaluateMemberExpr(node, env, ctx) {
-    const sourceLabel = checkMemberSource(node);
-    if (sourceLabel) {
-      const loc = node.loc?.start || {};
-      return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(node)));
-    }
-    {
-      const fullStr = nodeToString(node);
+    let cur = node;
+    while (cur.type === "MemberExpression" || cur.type === "OptionalMemberExpression") {
+      const sourceLabel = checkMemberSource(cur);
+      if (sourceLabel) {
+        const loc = cur.loc?.start || {};
+        return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur)));
+      }
+      const fullStr = nodeToString(cur);
       if (fullStr) {
         const resolvedStr = resolveAliasedPath(fullStr, env);
         if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
-          const loc = node.loc?.start || {};
+          const loc = cur.loc?.start || {};
           return TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr));
         }
       }
-      if (!node.computed && node.object?.type === "Identifier") {
-        const alias = env.aliases.get(node.object.name);
-        if (alias && node.property) {
-          const deepPath = `${alias}.${node.property.name || node.property.value}`;
+      if (!cur.computed && cur.object?.type === "Identifier") {
+        const alias = env.aliases.get(cur.object.name);
+        if (alias && cur.property) {
+          const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
           if (MEMBER_SOURCES[deepPath]) {
-            const loc = node.loc?.start || {};
+            const loc = cur.loc?.start || {};
             return TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath));
           }
         }
       }
-    }
-    const fullPath = nodeToString(node);
-    if (fullPath) {
-      if (env.has(fullPath)) return env.get(fullPath).clone();
-    }
-    if (!node.computed && node.object?.type === "Identifier" && node.property) {
-      const resolvedObjKey = resolveId(node.object, ctx);
-      const memberProp = node.property.name || node.property.value;
-      if (memberProp) {
-        const scopedPath = `${resolvedObjKey}.${memberProp}`;
-        if (env.has(scopedPath)) return env.get(scopedPath).clone();
+      const fullPath = fullStr;
+      if (fullPath) {
+        if (env.has(fullPath)) return env.get(fullPath).clone();
       }
-    }
-    if (fullPath) {
-      const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
-      if (getterFunc && getterFunc.body) {
-        const childEnv = (getterFunc._closureEnv || env).child();
-        const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
-        if (getterTaint.tainted) return getterTaint;
-      }
-    }
-    const propName = !node.computed && node.property ? node.property.name || node.property.value : null;
-    if (propName && (NUMERIC_PROPS.has(propName) || propName === "constructor" || propName === "prototype")) {
-      evaluateExpr(node.object, env, ctx);
-      return TaintSet.empty();
-    }
-    const objTaint = evaluateExpr(node.object, env, ctx);
-    if (node.computed) {
-      const keyTaint = evaluateExpr(node.property, env, ctx);
-      let litKey = null;
-      if (isStringLiteral(node.property)) {
-        litKey = stringLiteralValue(node.property);
-      } else if (node.property.type === "NumericLiteral" || node.property.type === "Literal" && typeof node.property.value === "number") {
-        litKey = String(node.property.value);
-      } else {
-        const resolved = resolveToConstant(node.property, env, ctx);
-        if (resolved !== void 0) litKey = String(resolved);
-      }
-      const isDirectLiteral = isStringLiteral(node.property) || node.property.type === "NumericLiteral" || node.property.type === "Literal" && (typeof node.property.value === "string" || typeof node.property.value === "number");
-      if (litKey !== null && isDirectLiteral) {
-        const objStr2 = nodeToString(node.object);
-        if (objStr2) {
-          if (env.has(`${objStr2}.${litKey}`)) return env.get(`${objStr2}.${litKey}`).clone();
-          if (/^\d+$/.test(litKey) && env.has(`${objStr2}.#idx_${litKey}`)) return env.get(`${objStr2}.#idx_${litKey}`).clone();
-        }
-        if (node.object?.type === "Identifier") {
-          const resolvedKey = resolveId(node.object, ctx);
-          if (env.has(`${resolvedKey}.${litKey}`)) return env.get(`${resolvedKey}.${litKey}`).clone();
-          if (/^\d+$/.test(litKey) && env.has(`${resolvedKey}.#idx_${litKey}`)) return env.get(`${resolvedKey}.#idx_${litKey}`).clone();
+      if (!cur.computed && cur.object?.type === "Identifier" && cur.property) {
+        const resolvedObjKey = resolveId(cur.object, ctx);
+        const memberProp = cur.property.name || cur.property.value;
+        if (memberProp) {
+          const scopedPath = `${resolvedObjKey}.${memberProp}`;
+          if (env.has(scopedPath)) return env.get(scopedPath).clone();
         }
       }
-      if (litKey !== null && !isDirectLiteral) {
-        const objStr2 = nodeToString(node.object);
-        if (objStr2) {
-          if (env.has(`${objStr2}.${litKey}`)) {
-            const specific = env.get(`${objStr2}.${litKey}`);
-            if (specific.tainted) return specific.clone();
-          }
-        }
-        if (node.object?.type === "Identifier") {
-          const resolvedKey = resolveId(node.object, ctx);
-          if (env.has(`${resolvedKey}.${litKey}`)) {
-            const specific = env.get(`${resolvedKey}.${litKey}`);
-            if (specific.tainted) return specific.clone();
-          }
+      if (fullPath) {
+        const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
+        if (getterFunc && getterFunc.body) {
+          const childEnv = (getterFunc._closureEnv || env).child();
+          const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
+          if (getterTaint.tainted) return getterTaint;
         }
       }
-      const objStr = nodeToString(node.object);
-      if (objStr) {
-        const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
-        if (taintedProps.size > 0) {
-          const merged = TaintSet.empty();
-          for (const [, taint] of taintedProps) merged.merge(taint);
-          return merged;
+      const propName = !cur.computed && cur.property ? cur.property.name || cur.property.value : null;
+      if (propName && (NUMERIC_PROPS.has(propName) || propName === "constructor" || propName === "prototype")) {
+        return TaintSet.empty();
+      }
+      if (cur.computed) {
+        const objTaint = evaluateExpr(cur.object, env, ctx);
+        return evaluateComputedMember(cur, objTaint, env, ctx);
+      }
+      cur = cur.object;
+    }
+    return evaluateExpr(cur, env, ctx);
+  }
+  function evaluateComputedMember(node, objTaint, env, ctx) {
+    const keyTaint = evaluateExpr(node.property, env, ctx);
+    let litKey = null;
+    if (isStringLiteral(node.property)) {
+      litKey = stringLiteralValue(node.property);
+    } else if (node.property.type === "NumericLiteral" || node.property.type === "Literal" && typeof node.property.value === "number") {
+      litKey = String(node.property.value);
+    } else {
+      const resolved = resolveToConstant(node.property, env, ctx);
+      if (resolved !== void 0) litKey = String(resolved);
+    }
+    const isDirectLiteral = isStringLiteral(node.property) || node.property.type === "NumericLiteral" || node.property.type === "Literal" && (typeof node.property.value === "string" || typeof node.property.value === "number");
+    if (litKey !== null && isDirectLiteral) {
+      const objStr2 = nodeToString(node.object);
+      if (objStr2) {
+        if (env.has(`${objStr2}.${litKey}`)) return env.get(`${objStr2}.${litKey}`).clone();
+        if (/^\d+$/.test(litKey) && env.has(`${objStr2}.#idx_${litKey}`)) return env.get(`${objStr2}.#idx_${litKey}`).clone();
+      }
+      if (node.object?.type === "Identifier") {
+        const resolvedKey = resolveId(node.object, ctx);
+        if (env.has(`${resolvedKey}.${litKey}`)) return env.get(`${resolvedKey}.${litKey}`).clone();
+        if (/^\d+$/.test(litKey) && env.has(`${resolvedKey}.#idx_${litKey}`)) return env.get(`${resolvedKey}.#idx_${litKey}`).clone();
+      }
+    }
+    if (litKey !== null && !isDirectLiteral) {
+      const objStr2 = nodeToString(node.object);
+      if (objStr2) {
+        if (env.has(`${objStr2}.${litKey}`)) {
+          const specific = env.get(`${objStr2}.${litKey}`);
+          if (specific.tainted) return specific.clone();
         }
       }
       if (node.object?.type === "Identifier") {
         const resolvedKey = resolveId(node.object, ctx);
-        if (resolvedKey !== objStr) {
-          const resolvedProps = env.getTaintedWithPrefix(`${resolvedKey}.`);
-          if (resolvedProps.size > 0) {
-            const merged = TaintSet.empty();
-            for (const [, taint] of resolvedProps) merged.merge(taint);
-            return merged;
-          }
+        if (env.has(`${resolvedKey}.${litKey}`)) {
+          const specific = env.get(`${resolvedKey}.${litKey}`);
+          if (specific.tainted) return specific.clone();
         }
       }
-      if (objTaint.tainted) return objTaint.clone();
     }
+    const objStr = nodeToString(node.object);
+    if (objStr) {
+      const taintedProps = env.getTaintedWithPrefix(`${objStr}.`);
+      if (taintedProps.size > 0) {
+        const merged = TaintSet.empty();
+        for (const [, taint] of taintedProps) merged.merge(taint);
+        return merged;
+      }
+    }
+    if (node.object?.type === "Identifier") {
+      const resolvedKey = resolveId(node.object, ctx);
+      if (resolvedKey !== objStr) {
+        const resolvedProps = env.getTaintedWithPrefix(`${resolvedKey}.`);
+        if (resolvedProps.size > 0) {
+          const merged = TaintSet.empty();
+          for (const [, taint] of resolvedProps) merged.merge(taint);
+          return merged;
+        }
+      }
+    }
+    if (objTaint.tainted) return objTaint.clone();
     return objTaint;
   }
   function isCalleeMatch(node, objectName, methodName, env) {
@@ -47127,6 +47189,7 @@ ${rootStack}`;
     });
   }
   function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
+    if (!sinkInfo.taintedArgs) return;
     for (const argIdx of sinkInfo.taintedArgs) {
       const argTaint = argTaints[argIdx];
       if (!argTaint || !argTaint.tainted) continue;
