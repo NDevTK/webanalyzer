@@ -79,7 +79,8 @@ enableToggle.addEventListener('change', async () => {
 
 clearBtn.addEventListener('click', async () => {
   await clearAllFindingsInDB();
-  await sendMessage({ type: 'clearFindings' });
+  sendMessage({ type: 'clearFindings' });
+  activeFilters.clear();
   renderFindings([]);
 });
 
