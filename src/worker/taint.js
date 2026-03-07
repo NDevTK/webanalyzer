@@ -181,6 +181,7 @@ class AnalysisContext {
     this.scopeInfo = scopeInfo;   // ScopeInfo from @babel/traverse (may be null)
     this.returnTaint = TaintSet.empty();
     this.returnElementTaints = null; // per-element taints for array returns: [TaintSet, TaintSet, ...]
+    this.returnPropertyTaints = null; // per-property taints for object returns: Map<string, TaintSet>
     // Shared across entire call chain — prevents re-analyzing same function with same taint
     this.analyzedCalls = analyzedCalls || new Map();
     this.returnedFuncNode = null;  // tracks function nodes returned from calls
@@ -502,16 +503,23 @@ function isNumericLiteral(node, value) {
 function resolveToConstant(node, _env, ctx) {
   if (!node) return undefined;
   if (isStringLiteral(node)) return node.value;
-  if (node.type === 'Identifier' && ctx.scopeInfo) {
+  if (node.type === 'NumericLiteral' || (node.type === 'Literal' && typeof node.value === 'number')) return node.value;
+  if (node.type === 'Identifier' && ctx?.scopeInfo) {
     // Resolve via scope info to find the declaration node
     const bindingKey = ctx.scopeInfo.resolve(node);
     if (bindingKey) {
       const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-      // VariableDeclarator: var key = 'hash'
-      if (declNode?.type === 'VariableDeclarator' && declNode.init && isStringLiteral(declNode.init)) {
-        return declNode.init.value;
+      // VariableDeclarator: var key = 'hash' or var key = expr
+      if (declNode?.type === 'VariableDeclarator' && declNode.init) {
+        return resolveToConstant(declNode.init, _env, ctx);
       }
     }
+  }
+  // BinaryExpression '+': 'user' + 'Input' → 'userInput'
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    const left = resolveToConstant(node.left, _env, ctx);
+    const right = resolveToConstant(node.right, _env, ctx);
+    if (left !== undefined && right !== undefined) return String(left) + String(right);
   }
   return undefined;
 }
@@ -654,6 +662,17 @@ function processNode(node, env, ctx) {
         if (arg.type === 'ArrayExpression' && arg.elements.length > 0) {
           ctx.returnElementTaints = arg.elements.map(e => e ? evaluateExpr(e, env, ctx) : TaintSet.empty());
         }
+        // Track per-property taints for object returns: return { a: tainted, b: safe }
+        if (arg.type === 'ObjectExpression' && arg.properties.length > 0) {
+          const propTaints = new Map();
+          for (const prop of arg.properties) {
+            if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+              const pName = prop.key.name || prop.key.value;
+              if (pName) propTaints.set(pName, evaluateExpr(prop.value, env, ctx));
+            }
+          }
+          if (propTaints.size > 0) ctx.returnPropertyTaints = propTaints;
+        }
       }
       break;
 
@@ -677,8 +696,14 @@ function processNode(node, env, ctx) {
           const mname = member.key?.name || member.key?.value;
           if (!mname) continue;
           if (member.static) {
-            ctx.funcMap.set(`${className}.${mname}`, member);
-            ctx.funcMap.set(mname, member);
+            const getterPrefix = member.kind === 'get' ? 'getter:' : '';
+            ctx.funcMap.set(`${getterPrefix}${className}.${mname}`, member);
+            ctx.funcMap.set(`${getterPrefix}${mname}`, member);
+            // Also register without getter prefix for regular method calls
+            if (!getterPrefix) {
+              ctx.funcMap.set(`${className}.${mname}`, member);
+              ctx.funcMap.set(mname, member);
+            }
           } else if (mname === 'constructor') {
             hasConstructor = true;
             if (superName) {
@@ -961,6 +986,20 @@ function processVarDeclarator(node, env, ctx) {
           assignToPattern(prop.value, taint, env, ctx);
         }
       }
+    } else if (ctx.returnPropertyTaints) {
+      // Per-property destructuring from function call: var { a, b } = getData()
+      const retProps = ctx.returnPropertyTaints;
+      ctx.returnPropertyTaints = null;
+      for (const prop of node.id.properties) {
+        if (prop.type === 'RestElement') { assignToPattern(prop.argument, taint, env, ctx); continue; }
+        const keyName = prop.key ? (prop.key.name || prop.key.value) : null;
+        const target = prop.value?.type === 'AssignmentPattern' ? prop.value.left : prop.value;
+        if (keyName && retProps.has(keyName)) {
+          assignToPattern(target, retProps.get(keyName), env, ctx);
+        } else {
+          assignToPattern(target || prop, taint, env, ctx);
+        }
+      }
     } else {
       assignToPattern(node.id, taint, env, ctx);
     }
@@ -1096,6 +1135,17 @@ function processVarDeclarator(node, env, ctx) {
     }
   }
 
+  // Store per-property taint from function returning object: var result = getConfig()
+  if (node.id.type === 'Identifier' && ctx.returnPropertyTaints) {
+    const varName = node.id.name;
+    for (const [propName, propTaint] of ctx.returnPropertyTaints) {
+      env.set(`${varName}.${propName}`, propTaint);
+      const resolvedKey = resolveId(node.id, ctx);
+      if (resolvedKey !== varName) env.set(`${resolvedKey}.${propName}`, propTaint);
+    }
+    ctx.returnPropertyTaints = null;
+  }
+
   // For `new Constructor()` — propagate this.* taint to instance.*
   if (node.init.type === 'NewExpression' && node.id.type === 'Identifier') {
     // Extract constructor name from AST: new Widget() → 'Widget', new ns.Widget() → 'ns.Widget'
@@ -1151,7 +1201,16 @@ function processAssignment(node, env, ctx) {
       }
     } else if (node.operator === '||=') {
       // x ||= rhs: only assigns if x is falsy
-      finalTaint = leftTaint.clone().merge(rhsTaint);
+      // If left is a known truthy constant, short-circuit (keep left)
+      const leftConst = resolveToConstant(node.left, env, ctx);
+      if (leftConst !== undefined && leftConst) {
+        finalTaint = leftTaint.clone();
+      } else if (leftTaint.tainted) {
+        // Left is tainted (truthy in runtime), but conservatively merge both
+        finalTaint = leftTaint.clone().merge(rhsTaint);
+      } else {
+        finalTaint = leftTaint.clone().merge(rhsTaint);
+      }
     } else if (node.operator === '&&=') {
       // x &&= rhs: only assigns if x is truthy
       // If left is a known falsy constant, skip assignment
@@ -1439,6 +1498,23 @@ function assignToPattern(pattern, taint, env, ctx) {
           env.set(`global:${propName}`, taint);
         }
       }
+      // Computed property write: obj[key] = val where key resolves to a constant
+      if (pattern.computed) {
+        const objStr = nodeToString(pattern.object);
+        if (objStr) {
+          const resolved = resolveToConstant(pattern.property, null, ctx);
+          if (resolved !== undefined) {
+            env.set(`${objStr}.${resolved}`, taint);
+            // Also store per-index taint for arrays: arr.#idx_0
+            if (/^\d+$/.test(String(resolved))) {
+              env.set(`${objStr}.#idx_${resolved}`, taint);
+            }
+          } else {
+            // Dynamic key: fall back to tainting the whole object
+            if (taint.tainted) env.set(objStr, env.get(objStr).clone().merge(taint));
+          }
+        }
+      }
       break;
     }
 
@@ -1556,6 +1632,9 @@ export function evaluateExpr(node, env, ctx) {
       const key = resolveId(node, ctx);
       const taint = env.get(key);
       if (taint.tainted) return taint.clone();
+      // If scope-resolved key exists in env (even if safe), trust it — don't fall through
+      // This prevents inner block-scoped safe variables from being shadowed by global tainted ones
+      if (key !== node.name && env.has(key)) return TaintSet.empty();
       // Fall back: check global: prefix (cross-file globals set via assignToPattern)
       const globalTaint = env.get(`global:${node.name}`);
       if (globalTaint.tainted) return globalTaint.clone();
@@ -1583,7 +1662,23 @@ export function evaluateExpr(node, env, ctx) {
       const rightT = evaluateExpr(node.right, env, ctx);
       const op = node.operator;
       // String concatenation: propagate taint
-      if (op === '+') return leftT.clone().merge(rightT);
+      // Also check for toString/valueOf coercion: '' + obj invokes obj.toString()
+      if (op === '+') {
+        let result = leftT.clone().merge(rightT);
+        // Check if either operand is an object with a toString/valueOf method
+        for (const operand of [node.left, node.right]) {
+          if (operand.type === 'Identifier' && !result.tainted) {
+            const objName = operand.name;
+            const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
+            if (toStringFunc && toStringFunc.body) {
+              const synthCall = { type: 'CallExpression', callee: operand, arguments: [], loc: operand.loc };
+              const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
+              result = result.merge(toStringTaint);
+            }
+          }
+        }
+        return result;
+      }
       // Comparison/relational: return boolean — kill taint
       if (op === '===' || op === '==' || op === '!==' || op === '!=' ||
           op === '>' || op === '<' || op === '>=' || op === '<=' ||
@@ -1844,9 +1939,9 @@ function evaluateMemberExpr(node, env, ctx) {
     }
   }
 
-  // Properties that always produce a number or boolean — kill taint
+  // Properties that always produce a number, boolean, or non-string reference — kill taint
   const propName = !node.computed && node.property ? (node.property.name || node.property.value) : null;
-  if (propName && NUMERIC_PROPS.has(propName)) {
+  if (propName && (NUMERIC_PROPS.has(propName) || propName === 'constructor' || propName === 'prototype')) {
     evaluateExpr(node.object, env, ctx); // still evaluate for side effects
     return TaintSet.empty();
   }
@@ -1854,20 +1949,52 @@ function evaluateMemberExpr(node, env, ctx) {
   const objTaint = evaluateExpr(node.object, env, ctx);
   if (node.computed) {
     const keyTaint = evaluateExpr(node.property, env, ctx);
-    // For computed access with a string literal key (obj['safe']), do per-property lookup
-    // just like non-computed access (obj.safe) — precise, not overapproximated
+    // For computed access with a constant key (obj['key'], arr[0], obj[constVar]),
+    // do per-property lookup — precise, not overapproximated
+    let litKey = null;
     if (isStringLiteral(node.property)) {
-      const litKey = stringLiteralValue(node.property);
+      litKey = stringLiteralValue(node.property);
+    } else if (node.property.type === 'NumericLiteral' || (node.property.type === 'Literal' && typeof node.property.value === 'number')) {
+      litKey = String(node.property.value);
+    } else {
+      // Try to resolve identifier to constant: obj[key] where key = 'prop'
+      const resolved = resolveToConstant(node.property, env, ctx);
+      if (resolved !== undefined) litKey = String(resolved);
+    }
+    // Only trust resolved key when it came directly from a literal (not a variable that might change)
+    const isDirectLiteral = isStringLiteral(node.property) ||
+      node.property.type === 'NumericLiteral' ||
+      (node.property.type === 'Literal' && (typeof node.property.value === 'string' || typeof node.property.value === 'number'));
+    if (litKey !== null && isDirectLiteral) {
       const objStr = nodeToString(node.object);
       if (objStr) {
-        const specificTaint = env.get(`${objStr}.${litKey}`);
-        if (env.has(`${objStr}.${litKey}`)) return specificTaint.clone();
+        if (env.has(`${objStr}.${litKey}`)) return env.get(`${objStr}.${litKey}`).clone();
+        if (/^\d+$/.test(litKey) && env.has(`${objStr}.#idx_${litKey}`)) return env.get(`${objStr}.#idx_${litKey}`).clone();
       }
       if (node.object?.type === 'Identifier') {
         const resolvedKey = resolveId(node.object, ctx);
-        const specificTaint = env.get(`${resolvedKey}.${litKey}`);
-        if (env.has(`${resolvedKey}.${litKey}`)) return specificTaint.clone();
+        if (env.has(`${resolvedKey}.${litKey}`)) return env.get(`${resolvedKey}.${litKey}`).clone();
+        if (/^\d+$/.test(litKey) && env.has(`${resolvedKey}.#idx_${litKey}`)) return env.get(`${resolvedKey}.#idx_${litKey}`).clone();
       }
+    }
+    // For variable-resolved keys (obj[key] where key='prop'), do per-property lookup
+    // but also fall through to prefix check to handle mutable variables (loop counters)
+    if (litKey !== null && !isDirectLiteral) {
+      const objStr = nodeToString(node.object);
+      if (objStr) {
+        if (env.has(`${objStr}.${litKey}`)) {
+          const specific = env.get(`${objStr}.${litKey}`);
+          if (specific.tainted) return specific.clone();
+        }
+      }
+      if (node.object?.type === 'Identifier') {
+        const resolvedKey = resolveId(node.object, ctx);
+        if (env.has(`${resolvedKey}.${litKey}`)) {
+          const specific = env.get(`${resolvedKey}.${litKey}`);
+          if (specific.tainted) return specific.clone();
+        }
+      }
+      // Fall through to prefix check for overapproximation (variable might hold different values)
     }
     // For dynamic computed access obj[key], check if any obj.* properties are tainted
     // When the key is tainted, the attacker controls which property is selected,
@@ -2315,6 +2442,16 @@ function evaluateCallExpr(node, env, ctx) {
   const propagated = handleBuiltinMethod(methodName, node, argTaints, env, ctx);
   if (propagated !== null) return propagated;
 
+  // Chained method on returned object: factory().method()
+  // After evaluating the callee object (a CallExpression), ctx.returnedMethods may have the method
+  if (methodName && ctx.returnedMethods && ctx.returnedMethods[methodName] &&
+      (node.callee?.type === 'MemberExpression' || node.callee?.type === 'OptionalMemberExpression') &&
+      (node.callee.object?.type === 'CallExpression' || node.callee.object?.type === 'OptionalCallExpression')) {
+    const funcNode = ctx.returnedMethods[methodName];
+    ctx.returnedMethods = null;
+    ctx.funcMap.set(methodName, funcNode);
+  }
+
   return analyzeCalledFunction(node, calleeStr, argTaints, env, ctx);
 }
 
@@ -2507,9 +2644,13 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
   switch (methodName) {
     case 'slice': case 'substring': case 'substr': case 'trim': case 'trimStart':
     case 'trimEnd': case 'toLowerCase': case 'toUpperCase': case 'normalize':
-    case 'repeat': case 'padStart': case 'padEnd': case 'at': case 'charAt':
+    case 'repeat': case 'at': case 'charAt':
     case 'valueOf': case 'toString':
       return objTaint.clone();
+
+    case 'padStart': case 'padEnd':
+      // padStart/padEnd(targetLength, padString) — result includes both obj and pad string
+      return objTaint.clone().merge(argTaints[1] || TaintSet.empty());
 
     case 'match': case 'matchAll':
       // Returns array of matches — preserve taint from the source string
@@ -3429,6 +3570,7 @@ function analyzeInlineFunction(funcNode, env, ctx) {
   if (innerCtx.returnedFuncNode) ctx.returnedFuncNode = innerCtx.returnedFuncNode;
   if (innerCtx.returnedMethods) ctx.returnedMethods = innerCtx.returnedMethods;
   if (innerCtx.returnElementTaints) ctx.returnElementTaints = innerCtx.returnElementTaints;
+  if (innerCtx.returnPropertyTaints) ctx.returnPropertyTaints = innerCtx.returnPropertyTaints;
 
   // Propagate function entries discovered during inline analysis back to the caller:
   // - Array-stored callbacks (key ends with [])
