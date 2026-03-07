@@ -35,7 +35,7 @@ export function analyze(source, { file = 'test.js', isModule = false, globalEnv 
   const findings = analyzeCFG(cfg, env, file, funcMap, globalEnv || new TaintEnv(), scopeInfo);
 
   // Also scan for prototype pollution
-  const ppCtx = { file, funcMap, findings, globalEnv: env, scopeInfo, returnTaint: TaintSet.empty(), analyzedCalls: new Set() };
+  const ppCtx = { file, funcMap, findings, globalEnv: env, scopeInfo, returnTaint: TaintSet.empty(), analyzedCalls: new Set(), protoMethodMap: new Map(), classBodyMap: new Map(), superClassMap: new Map() };
   walkAST(ast.program, (node) => {
     if (node.type === 'AssignmentExpression') checkPrototypePollution(node, env, ppCtx);
   });

@@ -43854,13 +43854,16 @@ ${rootStack}`;
       this.globalEnv = globalEnv;
       this.scopeInfo = scopeInfo;
       this.returnTaint = TaintSet.empty();
-      this.analyzedCalls = analyzedCalls || /* @__PURE__ */ new Set();
+      this.analyzedCalls = analyzedCalls || /* @__PURE__ */ new Map();
       this.returnedFuncNode = null;
       this.returnedMethods = null;
       this.scriptElements = /* @__PURE__ */ new Set();
       this.thrownTaint = TaintSet.empty();
       this.generatorTaint = /* @__PURE__ */ new Map();
       this.eventListeners = /* @__PURE__ */ new Map();
+      this.classBodyMap = /* @__PURE__ */ new Map();
+      this.superClassMap = /* @__PURE__ */ new Map();
+      this.protoMethodMap = /* @__PURE__ */ new Map();
     }
   };
   function resolveId(node, ctx) {
@@ -44146,6 +44149,7 @@ ${rootStack}`;
         if (node.id && node.body && node.body.body) {
           const className = node.id.name;
           const superName = node.superClass ? nodeToString(node.superClass) : null;
+          let hasConstructor = false;
           for (const member of node.body.body) {
             if (member.type !== "ClassMethod" && member.type !== "MethodDefinition") continue;
             const mname = member.key?.name || member.key?.value;
@@ -44154,11 +44158,31 @@ ${rootStack}`;
               ctx.funcMap.set(`${className}.${mname}`, member);
               ctx.funcMap.set(mname, member);
             } else if (mname === "constructor") {
-              if (superName) member._superClass = superName;
+              hasConstructor = true;
+              if (superName) {
+                member._superClass = superName;
+                ctx.superClassMap.set(className, superName);
+              }
+              ctx.classBodyMap.set(className, node.body.body);
               ctx.funcMap.set(className, member);
             } else {
-              ctx.funcMap.set(mname, member);
+              ctx.funcMap.set(`${className}#${mname}`, member);
+              if (!ctx.funcMap.has(mname)) ctx.funcMap.set(mname, member);
             }
+          }
+          if (!hasConstructor) {
+            const synth = {
+              type: "ClassMethod",
+              key: { name: "constructor" },
+              params: [],
+              body: { type: "BlockStatement", body: [] }
+            };
+            if (superName) {
+              synth._superClass = superName;
+              ctx.superClassMap.set(className, superName);
+            }
+            ctx.classBodyMap.set(className, node.body.body);
+            ctx.funcMap.set(className, synth);
           }
         }
         break;
@@ -44190,26 +44214,28 @@ ${rootStack}`;
       case "VariableDeclaration":
         for (const decl of node.declarations) processVarDeclarator(decl, env, ctx);
         break;
-      default:
+      case "ExpressionStatement":
         if (node.expression) evaluateExpr(node.expression, env, ctx);
-        else evaluateExpr(node, env, ctx);
+        break;
+      default:
+        evaluateExpr(node, env, ctx);
         break;
     }
   }
   function assignObjectPatternFromSource(pattern, srcStr, fallbackTaint, env, ctx) {
-    const hasPerPropData = env.getTaintedWithPrefix(`${srcStr}.`).size > 0 || pattern.properties.some((p) => {
-      const k = p.key ? p.key.name || p.key.value : null;
-      return k && env.has(`${srcStr}.${k}`);
-    });
     for (const prop of pattern.properties) {
       if (prop.type === "RestElement") {
         assignToPattern(prop.argument, fallbackTaint, env, ctx);
         continue;
       }
       const keyName = prop.key ? prop.key.name || prop.key.value : null;
-      if (keyName && hasPerPropData) {
-        const propTaint = env.get(`${srcStr}.${keyName}`);
-        assignToPattern(prop.value, propTaint, env, ctx);
+      if (keyName) {
+        const propKey = `${srcStr}.${keyName}`;
+        if (env.has(propKey)) {
+          assignToPattern(prop.value, env.get(propKey), env, ctx);
+        } else {
+          assignToPattern(prop.value, fallbackTaint, env, ctx);
+        }
       } else {
         assignToPattern(prop.value, fallbackTaint, env, ctx);
       }
@@ -44227,10 +44253,18 @@ ${rootStack}`;
       }
     }
   }
-  function isCreateScriptElement(node) {
+  function isCreateScriptElement(node, env) {
     if (node.type !== "CallExpression") return false;
-    const calleeStr = nodeToString(node.callee);
-    if (calleeStr !== "document.createElement") return false;
+    const callee = node.callee;
+    if (!callee || callee.type !== "MemberExpression" || callee.computed) return false;
+    if (callee.property?.name !== "createElement") return false;
+    const obj = callee.object;
+    if (obj.type === "Identifier") {
+      if (obj.name !== "document") {
+        const alias = env?.aliases?.get(obj.name);
+        if (alias !== "document") return false;
+      }
+    } else return false;
     const arg = node.arguments[0];
     return arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === "script";
   }
@@ -44286,7 +44320,7 @@ ${rootStack}`;
         ctx.funcMap.set(node.id.name, refFunc);
       }
     }
-    if (node.id.type === "Identifier" && isCreateScriptElement(node.init)) {
+    if (node.id.type === "Identifier" && isCreateScriptElement(node.init, env)) {
       ctx.scriptElements.add(resolveId(node.id, ctx));
       ctx.scriptElements.add(node.id.name);
     }
@@ -44318,6 +44352,44 @@ ${rootStack}`;
         }
       } else {
         assignToPattern(node.id, taint, env, ctx);
+      }
+    } else if (node.id.type === "ArrayPattern" && node.init.type === "Identifier") {
+      const srcName = node.init.name;
+      const hasPerElem = node.id.elements.some((_, i) => env.has(`${srcName}.#idx_${i}`));
+      if (hasPerElem) {
+        for (let i = 0; i < node.id.elements.length; i++) {
+          const pat = node.id.elements[i];
+          if (!pat) continue;
+          if (pat.type === "RestElement") {
+            const restTaint = TaintSet.empty();
+            const allIdxTaints = env.getTaintedWithPrefix(`${srcName}.#idx_`);
+            for (const [key, t] of allIdxTaints) {
+              const idx = parseInt(key.slice(key.lastIndexOf("_") + 1), 10);
+              if (idx >= i) restTaint.merge(t);
+            }
+            if (!restTaint.tainted) restTaint.merge(taint);
+            assignToPattern(pat.argument, restTaint, env, ctx);
+            break;
+          }
+          const elemTaint = env.get(`${srcName}.#idx_${i}`);
+          assignToPattern(pat, elemTaint, env, ctx);
+        }
+      } else {
+        assignToPattern(node.id, taint, env, ctx);
+      }
+    } else if (node.id.type === "ArrayPattern" && node.init.type === "ArrayExpression") {
+      const elems = node.init.elements;
+      const elemTaints = elems.map((e) => e ? evaluateExpr(e, env, ctx) : TaintSet.empty());
+      for (let i = 0; i < node.id.elements.length; i++) {
+        const pat = node.id.elements[i];
+        if (!pat) continue;
+        if (pat.type === "RestElement") {
+          const restTaint = TaintSet.empty();
+          for (let j = i; j < elemTaints.length; j++) restTaint.merge(elemTaints[j]);
+          assignToPattern(pat.argument, restTaint, env, ctx);
+          break;
+        }
+        assignToPattern(pat, i < elemTaints.length ? elemTaints[i] : TaintSet.empty(), env, ctx);
       }
     } else {
       assignToPattern(node.id, taint, env, ctx);
@@ -44394,8 +44466,19 @@ ${rootStack}`;
     if (node.id.type === "Identifier" && node.init.type === "ObjectExpression") {
       storeObjectPropertyTaints(node.id.name, node.init, env, ctx);
     }
+    if (node.id.type === "Identifier" && node.init.type === "ArrayExpression") {
+      for (let i = 0; i < node.init.elements.length; i++) {
+        const elem = node.init.elements[i];
+        if (elem) {
+          const elemTaint = evaluateExpr(elem, env, ctx);
+          env.set(`${node.id.name}.#idx_${i}`, elemTaint);
+        }
+      }
+    }
     if (node.init.type === "NewExpression" && node.id.type === "Identifier") {
+      ctx._lastNewCallee = nodeToString(node.init.callee);
       propagateThisToInstance(node.id.name, env, ctx);
+      ctx._lastNewCallee = null;
       const ctorName = nodeToString(node.init.callee);
       if (ctorName === "URL" && node.init.arguments[0]) {
         const argStr = nodeToString(node.init.arguments[0]);
@@ -44406,7 +44489,7 @@ ${rootStack}`;
   function processAssignment(node, env, ctx) {
     ctx.returnedFuncNode = null;
     ctx.returnedMethods = null;
-    if (node.operator === "=" && node.left.type === "Identifier" && isCreateScriptElement(node.right)) {
+    if (node.operator === "=" && node.left.type === "Identifier" && isCreateScriptElement(node.right, env)) {
       ctx.scriptElements.add(resolveId(node.left, ctx));
       ctx.scriptElements.add(node.left.name);
     }
@@ -44456,6 +44539,12 @@ ${rootStack}`;
         if (node.left.type === "MemberExpression" && node.left.property?.name) {
           const propName = node.left.property.name;
           if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, node.right);
+        }
+        if (node.left.type === "MemberExpression" && !node.left.computed && node.left.object?.type === "MemberExpression" && !node.left.object.computed && node.left.object.property?.name === "prototype" && node.left.object.object?.type === "Identifier") {
+          const className = node.left.object.object.name;
+          const methodName = node.left.property.name;
+          if (ctx.protoMethodMap && !ctx.protoMethodMap.has(className)) ctx.protoMethodMap.set(className, []);
+          ctx.protoMethodMap.get(className).push({ methodName, funcNode: node.right });
         }
       }
       if (!leftStr && node.left.type === "MemberExpression" && node.left.computed) {
@@ -44531,8 +44620,8 @@ ${rootStack}`;
       }
     }
     if (node.operator === "=") {
-      const leftStr = nodeToString(node.left);
-      if (leftStr === "window.onmessage" || leftStr === "onmessage" || leftStr === "self.onmessage") {
+      const isOnmessage = node.left.type === "Identifier" && node.left.name === "onmessage" || node.left.type === "MemberExpression" && !node.left.computed && node.left.property?.name === "onmessage" && node.left.object?.type === "Identifier" && (node.left.object.name === "window" || node.left.object.name === "self" || node.left.object.name === "globalThis");
+      if (isOnmessage) {
         let handler = node.right;
         if (handler.type === "Identifier") {
           const refKey = resolveId(handler, ctx);
@@ -44642,12 +44731,23 @@ ${rootStack}`;
     }
     for (const [k, t] of toSet) env.set(k, t);
     const constructorFuncs = [];
-    for (const [key, funcNode] of ctx.funcMap) {
-      if (key.includes(".prototype.")) {
-        const parts = key.split(".prototype.");
-        if (parts.length === 2) {
-          constructorFuncs.push([`${instanceName}.${parts[1]}`, funcNode]);
-          constructorFuncs.push([parts[1], funcNode]);
+    const ctorCalleeForProto = ctx._lastNewCallee;
+    if (ctorCalleeForProto && ctx.protoMethodMap.has(ctorCalleeForProto)) {
+      for (const { methodName, funcNode } of ctx.protoMethodMap.get(ctorCalleeForProto)) {
+        constructorFuncs.push([`${instanceName}.${methodName}`, funcNode]);
+        constructorFuncs.push([methodName, funcNode]);
+      }
+    }
+    const ctorCallee = ctx._lastNewCallee;
+    if (ctorCallee) {
+      const classBody = ctx.classBodyMap.get(ctorCallee);
+      if (classBody) {
+        for (const member of classBody) {
+          if (member.type !== "ClassMethod" && member.type !== "MethodDefinition") continue;
+          const mname = member.key?.name || member.key?.value;
+          if (mname && mname !== "constructor" && !member.static) {
+            constructorFuncs.push([`${instanceName}.${mname}`, member]);
+          }
         }
       }
     }
@@ -44662,7 +44762,7 @@ ${rootStack}`;
         if (taint.tainted) return taint.clone();
         const globalTaint = env.get(`global:${node.name}`);
         if (globalTaint.tainted) return globalTaint.clone();
-        return env.get(node.name).clone();
+        return TaintSet.empty();
       }
       case "MemberExpression":
       case "OptionalMemberExpression":
@@ -44798,6 +44898,7 @@ ${rootStack}`;
       case "NullLiteral":
       case "BigIntLiteral":
       case "RegExpLiteral":
+      case "Literal":
         return TaintSet.empty();
       case "ThisExpression":
         return env.get("this");
@@ -44867,6 +44968,28 @@ ${rootStack}`;
       if (objTaint.tainted) return objTaint.clone();
     }
     return objTaint;
+  }
+  function isCalleeMatch(node, objectName, methodName, env) {
+    const callee = node.callee;
+    if (!callee) return false;
+    if (callee.type === "MemberExpression" && !callee.computed) {
+      const prop = callee.property?.name;
+      if (prop !== methodName) return false;
+      if (callee.object.type === "Identifier") {
+        const objName = callee.object.name;
+        if (objName === objectName) return true;
+        const alias = env?.aliases?.get(objName);
+        if (alias === objectName) return true;
+      }
+    }
+    return false;
+  }
+  function isCalleeIdentifier(node, name, env) {
+    const callee = node.callee;
+    if (!callee || callee.type !== "Identifier") return false;
+    if (callee.name === name) return true;
+    const alias = env?.aliases?.get(callee.name);
+    return alias === name;
   }
   var NUMERIC_PROPS = /* @__PURE__ */ new Set([
     "length",
@@ -44968,7 +45091,7 @@ ${rootStack}`;
         }
       }
     }
-    if ((calleeStr === "setTimeout" || calleeStr === "setInterval" || calleeStr === "queueMicrotask" || calleeStr === "requestAnimationFrame") && node.arguments[0]) {
+    if ((isCalleeIdentifier(node, "setTimeout", env) || isCalleeIdentifier(node, "setInterval", env) || isCalleeIdentifier(node, "queueMicrotask", env) || isCalleeIdentifier(node, "requestAnimationFrame", env)) && node.arguments[0]) {
       let callback = node.arguments[0];
       if (callback.type === "Identifier") {
         const refKey = resolveId(callback, ctx);
@@ -44983,15 +45106,15 @@ ${rootStack}`;
         }
       }
     }
-    if (calleeStr === "Array.from" || calleeStr === "Array.of") {
+    if (isCalleeMatch(node, "Array", "from", env) || isCalleeMatch(node, "Array", "of", env)) {
       const merged = TaintSet.empty();
       for (const t of argTaints) merged.merge(t);
       return merged;
     }
-    if (calleeStr === "Object.fromEntries") {
+    if (isCalleeMatch(node, "Object", "fromEntries", env)) {
       return argTaints[0]?.clone() || TaintSet.empty();
     }
-    if (calleeStr === "Reflect.get" && node.arguments.length >= 2) {
+    if (isCalleeMatch(node, "Reflect", "get", env) && node.arguments.length >= 2) {
       const objNode = node.arguments[0];
       const propNode = node.arguments[1];
       const objStr = nodeToString(objNode);
@@ -45007,22 +45130,34 @@ ${rootStack}`;
       }
       return argTaints[0]?.clone() || TaintSet.empty();
     }
-    if (calleeStr === "Object.defineProperty" && node.arguments.length >= 3) {
+    if (isCalleeMatch(node, "Object", "defineProperty", env) && node.arguments.length >= 3) {
       const objNode = node.arguments[0];
       const propNode = node.arguments[1];
       const descNode = node.arguments[2];
       if (objNode && propNode && descNode && descNode.type === "ObjectExpression") {
+        const objStr = nodeToString(objNode);
+        const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
         for (const prop of descNode.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key && (prop.key.name === "value" || prop.key.value === "value")) {
-            const valTaint = evaluateExpr(prop.value, env, ctx);
-            if (valTaint.tainted) {
-              const objStr = nodeToString(objNode);
-              const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
-              if (objStr && propName) {
+          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+            const descPropName = prop.key.name || prop.key.value;
+            if (descPropName === "value") {
+              const valTaint = evaluateExpr(prop.value, env, ctx);
+              if (valTaint.tainted && objStr && propName) {
                 env.set(`${objStr}.${propName}`, valTaint);
                 if (objNode.type === "Identifier") {
                   const key = resolveId(objNode, ctx);
                   env.set(`${key}.${propName}`, valTaint);
+                }
+              }
+            }
+            if (descPropName === "get" && objStr && propName) {
+              const getterFunc = prop.value;
+              if (getterFunc && (getterFunc.type === "FunctionExpression" || getterFunc.type === "ArrowFunctionExpression")) {
+                getterFunc._closureEnv = env;
+                ctx.funcMap.set(`getter:${objStr}.${propName}`, getterFunc);
+                if (objNode.type === "Identifier") {
+                  const key = resolveId(objNode, ctx);
+                  ctx.funcMap.set(`getter:${key}.${propName}`, getterFunc);
                 }
               }
             }
@@ -45031,7 +45166,7 @@ ${rootStack}`;
       }
       return TaintSet.empty();
     }
-    if (calleeStr === "Object.create" && node.arguments.length >= 2) {
+    if (isCalleeMatch(node, "Object", "create", env) && node.arguments.length >= 2) {
       const descMapNode = node.arguments[1];
       if (descMapNode && descMapNode.type === "ObjectExpression") {
         const resultTaint = TaintSet.empty();
@@ -45051,7 +45186,7 @@ ${rootStack}`;
         return resultTaint;
       }
     }
-    if (calleeStr === "Reflect.apply" && node.arguments.length >= 3) {
+    if (isCalleeMatch(node, "Reflect", "apply", env) && node.arguments.length >= 3) {
       const fnNode = node.arguments[0];
       const argsArrayTaint = argTaints[2] || TaintSet.empty();
       const funcName = nodeToString(fnNode);
@@ -45062,11 +45197,11 @@ ${rootStack}`;
       }
       return argsArrayTaint.clone();
     }
-    if (calleeStr === "Object.freeze" || calleeStr === "Object.seal" || calleeStr === "Object.preventExtensions") {
+    if (isCalleeMatch(node, "Object", "freeze", env) || isCalleeMatch(node, "Object", "seal", env) || isCalleeMatch(node, "Object", "preventExtensions", env)) {
       return argTaints[0]?.clone() || TaintSet.empty();
     }
-    if (calleeStr === "Object.keys") return TaintSet.empty();
-    if (calleeStr === "Object.values" || calleeStr === "Object.entries") {
+    if (isCalleeMatch(node, "Object", "keys", env)) return TaintSet.empty();
+    if (isCalleeMatch(node, "Object", "values", env) || isCalleeMatch(node, "Object", "entries", env)) {
       const argTaint = argTaints[0] || TaintSet.empty();
       if (argTaint.tainted) return argTaint.clone();
       const argNode = node.arguments[0];
@@ -45083,7 +45218,7 @@ ${rootStack}`;
       }
       return TaintSet.empty();
     }
-    if (calleeStr === "Object.assign" && node.arguments.length >= 2) {
+    if (isCalleeMatch(node, "Object", "assign", env) && node.arguments.length >= 2) {
       const merged = argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
       const targetNode = node.arguments[0];
       if (targetNode) {
@@ -45103,6 +45238,12 @@ ${rootStack}`;
       return TaintSet.from(new TaintLabel(CALL_SOURCES[calleeStr], ctx.file, loc.line || 0, loc.column || 0, calleeStr + "()"));
     }
     if (calleeStr && isPassthrough(calleeStr)) return argTaints[0]?.clone() || TaintSet.empty();
+    if (methodName && (node.callee?.type === "MemberExpression" || node.callee?.type === "OptionalMemberExpression")) {
+      const fullPath = nodeToString(node.callee);
+      if (fullPath && ctx.funcMap.has(fullPath)) {
+        return analyzeCalledFunction(node, calleeStr, argTaints, env, ctx);
+      }
+    }
     const propagated = handleBuiltinMethod(methodName, node, argTaints, env, ctx);
     if (propagated !== null) return propagated;
     return analyzeCalledFunction(node, calleeStr, argTaints, env, ctx);
@@ -45114,6 +45255,10 @@ ${rootStack}`;
         const argTaint = evaluateExpr(node.arguments[0], env, ctx);
         taintOut.merge(argTaint);
       }
+    }
+    if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression" || node.type === "FunctionDeclaration") {
+      const shadowsResolve = node.params?.some((p) => p.type === "Identifier" && p.name === resolveName);
+      if (shadowsResolve) return;
     }
     for (const key of Object.keys(node)) {
       if (key === "loc" || key === "start" || key === "end" || key === "_closureEnv") continue;
@@ -45128,7 +45273,11 @@ ${rootStack}`;
     }
   }
   function evaluateNewExpr(node, env, ctx) {
-    const constructorName = nodeToString(node.callee);
+    let constructorName = nodeToString(node.callee);
+    if (constructorName && node.callee.type === "Identifier") {
+      const alias = env.aliases.get(constructorName);
+      if (alias) constructorName = alias;
+    }
     const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
     if (constructorName && CONSTRUCTOR_SOURCES[constructorName]) {
       const argTaint = argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
@@ -45184,7 +45333,7 @@ ${rootStack}`;
       if (funcNode && funcNode.body) {
         const callSig = `new:${constructorName}:${argTaints.map((t) => t.tainted ? "1" : "0").join("")}`;
         if (!ctx.analyzedCalls.has(callSig)) {
-          ctx.analyzedCalls.add(callSig);
+          ctx.analyzedCalls.set(callSig, TaintSet.empty());
           const childEnv = (funcNode._closureEnv || env).child();
           childEnv.set("this", TaintSet.empty());
           for (let i = 0; i < funcNode.params.length; i++) {
@@ -45253,6 +45402,8 @@ ${rootStack}`;
         }
         return objTaint.clone();
       }
+      case "fill":
+        return argTaints[0]?.clone() || TaintSet.empty();
       case "concat":
         return objTaint.clone().merge(argTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
       case "replace":
@@ -45271,10 +45422,20 @@ ${rootStack}`;
       case "flat":
       case "reverse":
       case "sort":
+        return objTaint.clone();
       case "values":
       case "keys":
-      case "entries":
-        return objTaint.clone();
+      case "entries": {
+        const result = objTaint.clone();
+        if (node.callee?.object) {
+          const iterObjStr = nodeToString(node.callee.object);
+          if (iterObjStr) {
+            const perKeyTaints = env.getTaintedWithPrefix(`${iterObjStr}.#key_`);
+            for (const [, t] of perKeyTaints) result.merge(t);
+          }
+        }
+        return result;
+      }
       case "flatMap": {
         const cbTaint = analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
         return objTaint.clone().merge(cbTaint);
@@ -45336,11 +45497,13 @@ ${rootStack}`;
       case "add": {
         const valueTaint = argTaints[0] || TaintSet.empty();
         if (valueTaint.tainted && node.callee?.object) {
-          const objStr = nodeToString(node.callee.object);
-          if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
           if (node.callee.object.type === "Identifier") {
             const key = resolveId(node.callee.object, ctx);
             env.set(key, env.get(key).clone().merge(valueTaint));
+            env.set(`global:${node.callee.object.name}`, env.get(key).clone());
+          } else {
+            const objStr = nodeToString(node.callee.object);
+            if (objStr) env.set(objStr, env.get(objStr).clone().merge(valueTaint));
           }
         }
         return objTaint.clone();
@@ -45349,16 +45512,16 @@ ${rootStack}`;
       case "unshift":
         if (node.callee?.object) {
           const objStr = nodeToString(node.callee.object);
-          if (objStr) {
-            const merged = env.get(objStr).clone();
-            for (const t of argTaints) merged.merge(t);
-            env.set(objStr, merged);
-          }
           if (node.callee.object.type === "Identifier") {
             const key = resolveId(node.callee.object, ctx);
             const merged = env.get(key).clone();
             for (const t of argTaints) merged.merge(t);
             env.set(key, merged);
+            env.set(`global:${node.callee.object.name}`, merged);
+          } else if (objStr) {
+            const merged = env.get(objStr).clone();
+            for (const t of argTaints) merged.merge(t);
+            env.set(objStr, merged);
           }
           for (const arg of node.arguments) {
             if (arg.type === "FunctionExpression" || arg.type === "ArrowFunctionExpression") {
@@ -45566,6 +45729,14 @@ ${rootStack}`;
     }
     return evaluateExpr(callback.body, childEnv, ctx);
   }
+  function isOriginAccess(node) {
+    if (!node) return false;
+    if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
+      if (!node.computed && node.property?.name === "origin") return true;
+      if (node.computed && isStringLiteral(node.property) && stringLiteralValue(node.property) === "origin") return true;
+    }
+    return false;
+  }
   function callbackChecksOrigin(node, ctx) {
     if (!node || typeof node !== "object") return false;
     const checks = [];
@@ -45577,57 +45748,53 @@ ${rootStack}`;
   function collectOriginChecks(node, checks, ctx) {
     if (!node || typeof node !== "object") return;
     if (node.type === "BinaryExpression" && (node.operator === "===" || node.operator === "==" || node.operator === "!==" || node.operator === "!=")) {
-      const l = nodeToString(node.left), r = nodeToString(node.right);
-      const originSide = l && l.endsWith(".origin") ? "left" : r && r.endsWith(".origin") ? "right" : null;
+      const originSide = isOriginAccess(node.left) ? "left" : isOriginAccess(node.right) ? "right" : null;
       if (originSide) {
         const otherNode = originSide === "left" ? node.right : node.left;
         const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
         if (otherStr !== null) {
           checks.push(classifyOriginLiteral(otherStr));
         } else {
-          checks.push("strong");
+          const otherIsTainted = ctx && ctx.globalEnv && (otherNode.type === "Identifier" && ctx.globalEnv.get(otherNode.name).tainted);
+          checks.push(otherIsTainted ? "weak" : "strong");
         }
         return;
       }
     }
     if (node.type === "CallExpression" && node.callee?.type === "MemberExpression") {
-      const objStr = nodeToString(node.callee.object);
       const method = node.callee.property?.name;
-      if (objStr && objStr.endsWith(".origin") && method) {
+      if (isOriginAccess(node.callee.object) && method) {
         checks.push(classifyOriginMethod(method, node));
         return;
       }
       if (method === "includes" || method === "has") {
         const arg = node.arguments[0];
-        if (arg) {
-          const argStr = nodeToString(arg);
-          if (argStr && argStr.endsWith(".origin")) {
-            checks.push("strong");
-            return;
-          }
+        if (arg && isOriginAccess(arg)) {
+          checks.push("strong");
+          return;
         }
       }
       if (method === "test") {
         const arg = node.arguments[0];
-        if (arg) {
-          const argStr = nodeToString(arg);
-          if (argStr && argStr.endsWith(".origin")) {
-            const pattern = node.callee.object?.regex?.pattern || node.callee.object?.pattern || "";
-            checks.push(classifyOriginRegex(pattern));
-            return;
-          }
+        if (arg && isOriginAccess(arg)) {
+          const pattern = node.callee.object?.regex?.pattern || node.callee.object?.pattern || "";
+          checks.push(classifyOriginRegex(pattern));
+          return;
         }
       }
     }
     if (node.type === "CallExpression") {
-      const hasOriginArg = node.arguments?.some((arg) => {
-        const str = nodeToString(arg);
-        return str && str.endsWith(".origin");
-      });
+      const hasOriginArg = node.arguments?.some((arg) => isOriginAccess(arg));
       if (hasOriginArg) {
-        const calleeName = nodeToString(node.callee);
-        if (calleeName && ctx) {
-          const funcNode = ctx.funcMap.get(calleeName);
+        if (ctx) {
+          let funcNode = null;
+          if (node.callee.type === "Identifier") {
+            const key = resolveId(node.callee, ctx);
+            funcNode = ctx.funcMap.get(key) || ctx.funcMap.get(node.callee.name);
+          } else {
+            const calleeName = nodeToString(node.callee);
+            if (calleeName) funcNode = ctx.funcMap.get(calleeName);
+          }
           if (funcNode) {
             const quality = analyzeOriginValidator(funcNode, ctx);
             checks.push(quality);
@@ -45798,6 +45965,9 @@ ${rootStack}`;
       ctx.scopeInfo,
       ctx.analyzedCalls
     );
+    innerCtx.classBodyMap = ctx.classBodyMap;
+    innerCtx.superClassMap = ctx.superClassMap;
+    innerCtx.protoMethodMap = ctx.protoMethodMap;
     const blockEnvs = /* @__PURE__ */ new Map();
     blockEnvs.set(innerCfg.entry.id, env.clone());
     const worklist = [innerCfg.entry];
@@ -45859,13 +46029,11 @@ ${rootStack}`;
       funcNode = ctx.funcMap.get(calleeStr);
     }
     if (!funcNode && callNode.callee?.type === "Super") {
-      for (const [, fn] of ctx.funcMap) {
-        if (fn && fn._superClass) {
-          const parentCtor = ctx.funcMap.get(fn._superClass);
-          if (parentCtor) {
-            funcNode = parentCtor;
-            break;
-          }
+      for (const [, parentClass] of ctx.superClassMap) {
+        const parentCtor = ctx.funcMap.get(parentClass);
+        if (parentCtor) {
+          funcNode = parentCtor;
+          break;
         }
       }
     }
@@ -45931,8 +46099,8 @@ ${rootStack}`;
     }
     if (!funcNode || !funcNode.body) return TaintSet.empty();
     const callSig = `${calleeStr || "anon"}:${argTaints.map((t) => t.tainted ? "1" : "0").join("")}`;
-    if (ctx.analyzedCalls.has(callSig)) return TaintSet.empty();
-    ctx.analyzedCalls.add(callSig);
+    if (ctx.analyzedCalls.has(callSig)) return ctx.analyzedCalls.get(callSig)?.clone() || TaintSet.empty();
+    ctx.analyzedCalls.set(callSig, TaintSet.empty());
     const closureEnv = funcNode._closureEnv || env;
     const childEnv = closureEnv.child();
     if (callNode.callee?.type === "MemberExpression" || callNode.callee?.type === "OptionalMemberExpression") {
@@ -46071,6 +46239,7 @@ ${rootStack}`;
         env.set(key, taint);
       }
     }
+    if (result.tainted) ctx.analyzedCalls.set(callSig, result);
     return result;
   }
   function processForBinding(node, env, ctx) {
@@ -46082,11 +46251,58 @@ ${rootStack}`;
         iterableTaint = iterableTaint.clone();
         for (const [, taint] of perKeyTaints) iterableTaint.merge(taint);
       }
+      const perIdxTaints = env.getTaintedWithPrefix(`${iterStr}.#idx_`);
+      if (perIdxTaints.size > 0) {
+        iterableTaint = iterableTaint.clone();
+        for (const [, taint] of perIdxTaints) iterableTaint.merge(taint);
+      }
+    }
+    if (!iterableTaint.tainted && iterStr) {
+      const iterFunc = ctx.funcMap.get(`${iterStr}[]`);
+      if (iterFunc && (iterFunc.type === "FunctionExpression" || iterFunc.type === "ArrowFunctionExpression")) {
+        const closureTaint = TaintSet.empty();
+        collectClosureTaint(iterFunc.body, env, ctx, closureTaint, /* @__PURE__ */ new Set());
+        if (closureTaint.tainted) iterableTaint = closureTaint;
+      }
     }
     if (node.left.type === "VariableDeclaration") {
       for (const decl of node.left.declarations) assignToPattern(decl.id, iterableTaint, env, ctx);
     } else {
       assignToPattern(node.left, iterableTaint, env, ctx);
+    }
+  }
+  function collectClosureTaint(node, env, ctx, taintOut, visited) {
+    if (!node || typeof node !== "object" || visited.has(node)) return;
+    visited.add(node);
+    if (node.type === "Identifier") {
+      const t = env.get(node.name);
+      if (t.tainted) taintOut.merge(t);
+      const perIdx = env.getTaintedWithPrefix(`${node.name}.#idx_`);
+      for (const [, pt] of perIdx) taintOut.merge(pt);
+      const perKey = env.getTaintedWithPrefix(`${node.name}.#key_`);
+      for (const [, pt] of perKey) taintOut.merge(pt);
+      return;
+    }
+    if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
+      const str = nodeToString(node);
+      if (str) {
+        const t = env.get(str);
+        if (t.tainted) {
+          taintOut.merge(t);
+          return;
+        }
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "loc" || key === "start" || key === "end" || key === "_closureEnv") continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (item && typeof item === "object" && item.type) collectClosureTaint(item, env, ctx, taintOut, visited);
+        }
+      } else if (child && typeof child === "object" && child.type) {
+        collectClosureTaint(child, env, ctx, taintOut, visited);
+      }
     }
   }
   function classifyNavigationType(sinkInfo, env, rhsNode) {
