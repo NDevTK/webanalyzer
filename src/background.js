@@ -234,11 +234,12 @@ function handleFindings(tabId, newFindings) {
 
 function showNotification(tabId, count, findings) {
   const types = [...new Set(findings.map(f => f.type))].join(', ');
-  chrome.notifications.create(`finding-${tabId}-${Date.now()}`, {
+  const notifId = `finding-${tabId}-${Date.now()}`;
+  chrome.notifications.create(notifId, {
     type: 'basic',
     iconUrl: 'icons/icon128.png',
     title: `WebAppSec: ${count} new finding${count > 1 ? 's' : ''}`,
-    message: `${types} detected. Click the extension icon for details.`,
+    message: `${types} detected. Click to view details.`,
     priority: 2,
   });
 }
@@ -250,6 +251,12 @@ function updateBadge(tabId) {
   chrome.action.setBadgeText({ text, tabId }).catch(() => {});
   chrome.action.setBadgeBackgroundColor({ color, tabId }).catch(() => {});
 }
+
+// ── Notification click → open side panel ──
+chrome.notifications.onClicked.addListener((notifId) => {
+  chrome.notifications.clear(notifId);
+  chrome.sidePanel.open({ windowId: chrome.windows.WINDOW_ID_CURRENT });
+});
 
 // ── Helpers ──
 function sendToOffscreen(msg) {
@@ -281,9 +288,7 @@ async function restoreState() {
 }
 
 // ── Side panel: open on action click ──
-chrome.action.onClicked.addListener((tab) => {
-  chrome.sidePanel.open({ tabId: tab.id });
-});
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
 // ── Startup ──
 restoreState();
