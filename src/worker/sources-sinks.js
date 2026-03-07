@@ -108,6 +108,8 @@ export const ASSIGNMENT_SINKS = {
   'document.location': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'window.location': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'location': { type: 'XSS', argIndex: 'rhs', navigation: true },
+  // CSS injection
+  'cssText': { type: 'XSS', argIndex: 'rhs' },
   // Domain manipulation
   'document.domain': { type: 'XSS', argIndex: 'rhs' },
 };

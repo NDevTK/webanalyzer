@@ -124,6 +124,7 @@ function buildStatement(stmt, current, cfg, ctx) {
 
     case 'VariableDeclaration':
       for (const decl of stmt.declarations) {
+        if (stmt.kind === 'let' || stmt.kind === 'const') decl._blockScoped = true;
         current.addNode(decl);
       }
       return current;
@@ -284,7 +285,10 @@ function buildFor(stmt, current, cfg, ctx) {
   // Init
   if (stmt.init) {
     if (stmt.init.type === 'VariableDeclaration') {
-      for (const decl of stmt.init.declarations) current.addNode(decl);
+      for (const decl of stmt.init.declarations) {
+        if (stmt.init.kind === 'let' || stmt.init.kind === 'const') decl._blockScoped = true;
+        current.addNode(decl);
+      }
     } else {
       current.addNode(stmt.init);
     }
