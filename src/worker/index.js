@@ -4,12 +4,11 @@
 
 import { parse } from '@babel/parser';
 import { buildCFG } from './cfg.js';
-import { analyzeCFG, TaintEnv, TaintSet, TaintLabel, evaluateExpr, checkPrototypePollution } from './taint.js';
+import { analyzeCFG, TaintEnv, TaintSet, checkPrototypePollution } from './taint.js';
 import {
   ModuleGraph, extractImports, extractExports,
   extractGlobalDeclarations, resolveImportTaint, checkPostMessageHandler,
 } from './module-graph.js';
-import { nodeToString, EVENT_SOURCES } from './sources-sinks.js';
 import { buildScopeInfo } from './scope.js';
 const moduleGraph = new ModuleGraph();
 
@@ -182,14 +181,11 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
   // 4. Build initial taint environment
   const env = isModule ? importEnv : pageCtx.globalEnv.child();
 
-  // 5. Scan for postMessage handlers and set up taint for event.data
-  setupMessageHandlerTaint(ast, env, file, isWorker);
-
-  // 6. Build CFG for program body
+  // 5. Build CFG for program body
   const cfg = buildCFG(ast.program);
 
-  // 7. Run taint analysis with scope info
-  const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo);
+  // 6. Run taint analysis with scope info (isWorker suppresses message handler taint)
+  const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker);
 
   // 8. Check for prototype pollution patterns
   scanPrototypePollution(ast, env, file, findings, scopeInfo);
@@ -212,72 +208,6 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
   return findings;
 }
 
-// ── Set up taint for message event handlers ──
-function setupMessageHandlerTaint(ast, env, file, isWorker) {
-  // In worker scripts, message handlers receive from same-origin parent — not a taint source
-  if (isWorker) return;
-
-  // Walk AST looking for addEventListener('message', fn) patterns
-  walkAST(ast.program, (node) => {
-    if (node.type !== 'CallExpression') return;
-
-    const callee = node.callee;
-    if (callee.type !== 'MemberExpression') return;
-    if (callee.property?.name !== 'addEventListener') return;
-
-    const firstArg = node.arguments[0];
-    if (!firstArg) return;
-    const eventName = firstArg.value;
-    if (eventName !== 'message') return;
-
-    const handler = node.arguments[1];
-    if (!handler) return;
-    if (handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression') return;
-
-    // Check if handler validates origin
-    const checksOrigin = containsOriginCheck(handler.body);
-
-    if (!checksOrigin && handler.params[0]) {
-      // Mark the event parameter's .data property as tainted
-      const paramName = handler.params[0].type === 'Identifier' ? handler.params[0].name : null;
-      if (paramName) {
-        const loc = handler.loc?.start || {};
-        const label = new TaintLabel(
-          'postMessage.data', file, loc.line || 0, loc.column || 0,
-          `${paramName}.data (no origin check)`
-        );
-        env.set(`${paramName}.data`, TaintSet.from(label));
-        env.set(paramName, TaintSet.from(label));
-      }
-    }
-  });
-
-  // Also handle window.onmessage = function(e) { ... }
-  walkAST(ast.program, (node) => {
-    if (node.type !== 'AssignmentExpression') return;
-    const leftStr = nodeToString(node.left);
-    if (leftStr !== 'window.onmessage' && leftStr !== 'onmessage' &&
-        leftStr !== 'self.onmessage') return;
-
-    const handler = node.right;
-    if (handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression') return;
-
-    const checksOrigin = containsOriginCheck(handler.body);
-
-    if (!checksOrigin && handler.params[0]) {
-      const paramName = handler.params[0].name;
-      if (paramName) {
-        const loc = handler.loc?.start || {};
-        const label = new TaintLabel(
-          'postMessage.data', file, loc.line || 0, loc.column || 0,
-          `${paramName}.data (no origin check)`
-        );
-        env.set(`${paramName}.data`, TaintSet.from(label));
-        env.set(paramName, TaintSet.from(label));
-      }
-    }
-  });
-}
 
 // ── Scan for prototype pollution ──
 function scanPrototypePollution(ast, env, file, findings, scopeInfo) {
@@ -529,54 +459,6 @@ function walkAST(node, visitor) {
   }
 }
 
-// Check if a node is a MemberExpression accessing .origin by AST structure
-function isOriginMemberAccess(node) {
-  if (!node) return false;
-  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
-    if (!node.computed && node.property?.name === 'origin') return true;
-    if (node.computed && node.property?.type === 'StringLiteral' && node.property.value === 'origin') return true;
-    if (node.computed && node.property?.type === 'Literal' && node.property.value === 'origin') return true;
-  }
-  return false;
-}
-
-function containsOriginCheck(node) {
-  if (!node || typeof node !== 'object') return false;
-
-  // Pattern: e.origin === '...' / e.origin !== '...'
-  if (node.type === 'BinaryExpression' &&
-      (node.operator === '===' || node.operator === '==' ||
-       node.operator === '!==' || node.operator === '!=')) {
-    if (isOriginMemberAccess(node.left) || isOriginMemberAccess(node.right)) {
-      return true;
-    }
-  }
-
-  // Pattern: allowlist.has(e.origin) / allowlist.includes(e.origin)
-  if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
-    const method = node.callee.property?.name;
-    if ((method === 'has' || method === 'includes' || method === 'indexOf') &&
-        node.arguments.length >= 1 && isOriginMemberAccess(node.arguments[0])) {
-      return true;
-    }
-  }
-
-  for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end') continue;
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        if (item && typeof item === 'object' && item.type) {
-          if (containsOriginCheck(item)) return true;
-        }
-      }
-    } else if (child && typeof child === 'object' && child.type) {
-      if (containsOriginCheck(child)) return true;
-    }
-  }
-
-  return false;
-}
 
 function deduplicateFindings(findings) {
   const seen = new Set();

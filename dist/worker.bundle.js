@@ -43601,7 +43601,7 @@ ${rootStack}`;
     "window.location": { type: "XSS", argIndex: "rhs", navigation: true },
     "location": { type: "XSS", argIndex: "rhs", navigation: true },
     // CSS injection
-    "cssText": { type: "XSS", argIndex: "rhs" },
+    "cssText": { type: "CSS Injection", argIndex: "rhs" },
     // Domain manipulation
     "document.domain": { type: "XSS", argIndex: "rhs" }
   };
@@ -43890,9 +43890,10 @@ ${rootStack}`;
     }
     return `global:${node.name}`;
   }
-  function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo) {
+  function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker) {
     const findings = [];
     const ctx = new AnalysisContext(file, funcMap, findings, globalEnv || new TaintEnv(), scopeInfo);
+    ctx.isWorker = !!isWorker;
     const blockEnvs = /* @__PURE__ */ new Map();
     blockEnvs.set(cfg.entry.id, env.clone());
     const worklist = [cfg.entry];
@@ -44932,7 +44933,7 @@ ${rootStack}`;
     }
     if (node.operator === "=") {
       const isOnmessage = node.left.type === "Identifier" && node.left.name === "onmessage" || node.left.type === "MemberExpression" && !node.left.computed && node.left.property?.name === "onmessage" && node.left.object?.type === "Identifier" && (node.left.object.name === "window" || node.left.object.name === "self" || node.left.object.name === "globalThis");
-      if (isOnmessage) {
+      if (isOnmessage && !ctx.isWorker) {
         let handler = node.right;
         if (handler.type === "Identifier") {
           const refKey = resolveId(handler, ctx);
@@ -45643,11 +45644,13 @@ ${rootStack}`;
           ]);
           if (DANGEROUS_ATTRS.has(attrName)) {
             const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
+            const isCss = attrName === "style";
+            const type = isCss ? "CSS Injection" : "XSS";
             const loc = node.loc?.start || {};
             ctx.findings.push({
-              type: "XSS",
-              severity: isEventHandler ? "critical" : "high",
-              title: `XSS: tainted data flows to setAttribute('${attrName}')`,
+              type,
+              severity: isCss ? "high" : isEventHandler ? "critical" : "high",
+              title: `${type}: tainted data flows to setAttribute('${attrName}')`,
               sink: { expression: `${objName || "element"}.setAttribute('${attrName}')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
               source: srcTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
               path: buildTaintPath(srcTaint, `${objName || "element"}.setAttribute('${attrName}')`)
@@ -46429,7 +46432,7 @@ ${rootStack}`;
         assignToPattern(callback.params[0], TaintSet.from(label), childEnv, ctx);
       }
     }
-    if (eventName === "message" && callback.params[0]) {
+    if (eventName === "message" && callback.params[0] && !ctx.isWorker) {
       const originCheck = callbackChecksOrigin(callback.body, ctx);
       if (originCheck !== "strong") {
         const paramName = callback.params[0].type === "Identifier" ? callback.params[0].name : null;
@@ -47619,9 +47622,8 @@ ${rootStack}`;
       importEnv = resolveImportTaint(pageCtx, file, imports);
     }
     const env = isModule ? importEnv : pageCtx.globalEnv.child();
-    setupMessageHandlerTaint(ast, env, file, isWorker);
     const cfg = buildCFG(ast.program);
-    const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo);
+    const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker);
     scanPrototypePollution(ast, env, file, findings, scopeInfo);
     if (!isModule) {
       pageCtx.globalEnv.replaceFrom(env);
@@ -47633,61 +47635,6 @@ ${rootStack}`;
       storeExportTaint(ast, env, file, pageCtx);
     }
     return findings;
-  }
-  function setupMessageHandlerTaint(ast, env, file, isWorker) {
-    if (isWorker) return;
-    walkAST(ast.program, (node) => {
-      if (node.type !== "CallExpression") return;
-      const callee = node.callee;
-      if (callee.type !== "MemberExpression") return;
-      if (callee.property?.name !== "addEventListener") return;
-      const firstArg = node.arguments[0];
-      if (!firstArg) return;
-      const eventName = firstArg.value;
-      if (eventName !== "message") return;
-      const handler = node.arguments[1];
-      if (!handler) return;
-      if (handler.type !== "ArrowFunctionExpression" && handler.type !== "FunctionExpression") return;
-      const checksOrigin = containsOriginCheck(handler.body);
-      if (!checksOrigin && handler.params[0]) {
-        const paramName = handler.params[0].type === "Identifier" ? handler.params[0].name : null;
-        if (paramName) {
-          const loc = handler.loc?.start || {};
-          const label = new TaintLabel(
-            "postMessage.data",
-            file,
-            loc.line || 0,
-            loc.column || 0,
-            `${paramName}.data (no origin check)`
-          );
-          env.set(`${paramName}.data`, TaintSet.from(label));
-          env.set(paramName, TaintSet.from(label));
-        }
-      }
-    });
-    walkAST(ast.program, (node) => {
-      if (node.type !== "AssignmentExpression") return;
-      const leftStr = nodeToString(node.left);
-      if (leftStr !== "window.onmessage" && leftStr !== "onmessage" && leftStr !== "self.onmessage") return;
-      const handler = node.right;
-      if (handler.type !== "ArrowFunctionExpression" && handler.type !== "FunctionExpression") return;
-      const checksOrigin = containsOriginCheck(handler.body);
-      if (!checksOrigin && handler.params[0]) {
-        const paramName = handler.params[0].name;
-        if (paramName) {
-          const loc = handler.loc?.start || {};
-          const label = new TaintLabel(
-            "postMessage.data",
-            file,
-            loc.line || 0,
-            loc.column || 0,
-            `${paramName}.data (no origin check)`
-          );
-          env.set(`${paramName}.data`, TaintSet.from(label));
-          env.set(paramName, TaintSet.from(label));
-        }
-      }
-    });
   }
   function scanPrototypePollution(ast, env, file, findings, scopeInfo) {
     const ctx = { file, funcMap: /* @__PURE__ */ new Map(), findings, callDepth: 0, maxCallDepth: 0, globalEnv: env, scopeInfo: scopeInfo || null, returnTaint: TaintSet.empty(), analyzedCalls: /* @__PURE__ */ new Set() };
@@ -47904,43 +47851,6 @@ ${rootStack}`;
         walkAST(child, visitor);
       }
     }
-  }
-  function isOriginMemberAccess(node) {
-    if (!node) return false;
-    if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
-      if (!node.computed && node.property?.name === "origin") return true;
-      if (node.computed && node.property?.type === "StringLiteral" && node.property.value === "origin") return true;
-      if (node.computed && node.property?.type === "Literal" && node.property.value === "origin") return true;
-    }
-    return false;
-  }
-  function containsOriginCheck(node) {
-    if (!node || typeof node !== "object") return false;
-    if (node.type === "BinaryExpression" && (node.operator === "===" || node.operator === "==" || node.operator === "!==" || node.operator === "!=")) {
-      if (isOriginMemberAccess(node.left) || isOriginMemberAccess(node.right)) {
-        return true;
-      }
-    }
-    if (node.type === "CallExpression" && node.callee?.type === "MemberExpression") {
-      const method = node.callee.property?.name;
-      if ((method === "has" || method === "includes" || method === "indexOf") && node.arguments.length >= 1 && isOriginMemberAccess(node.arguments[0])) {
-        return true;
-      }
-    }
-    for (const key of Object.keys(node)) {
-      if (key === "loc" || key === "start" || key === "end") continue;
-      const child = node[key];
-      if (Array.isArray(child)) {
-        for (const item of child) {
-          if (item && typeof item === "object" && item.type) {
-            if (containsOriginCheck(item)) return true;
-          }
-        }
-      } else if (child && typeof child === "object" && child.type) {
-        if (containsOriginCheck(child)) return true;
-      }
-    }
-    return false;
   }
   function deduplicateFindings(findings) {
     const seen = /* @__PURE__ */ new Set();

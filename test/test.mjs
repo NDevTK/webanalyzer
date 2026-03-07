@@ -11887,20 +11887,20 @@ test('safe: tagged template with sanitizer tag function', () => {
 // ── CSS injection via style ──
 console.log('\n--- CSS injection ---');
 
-test('element.style.cssText = tainted → XSS', () => {
+test('element.style.cssText = tainted → CSS Injection', () => {
   const { findings } = analyze(`
     var el = document.getElementById('x');
     el.style.cssText = location.hash;
   `);
-  expect(findings).toHaveType('XSS');
+  expect(findings).toHaveType('CSS Injection');
 });
 
-test('setAttribute("style", tainted) → XSS', () => {
+test('setAttribute("style", tainted) → CSS Injection', () => {
   const { findings } = analyze(`
     var el = document.getElementById('x');
     el.setAttribute('style', location.hash);
   `);
-  expect(findings).toHaveType('XSS');
+  expect(findings).toHaveType('CSS Injection');
 });
 
 // ── IIFE patterns ──

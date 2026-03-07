@@ -207,9 +207,10 @@ function resolveId(node, ctx) {
 }
 
 // ── Main entry: analyze a CFG with initial taint environment ──
-export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo) {
+export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker) {
   const findings = [];
   const ctx = new AnalysisContext(file, funcMap, findings, globalEnv || new TaintEnv(), scopeInfo);
+  ctx.isWorker = !!isWorker;
 
   const blockEnvs = new Map();
   blockEnvs.set(cfg.entry.id, env.clone());
@@ -1429,7 +1430,7 @@ function processAssignment(node, env, ctx) {
        node.left.property?.name === 'onmessage' &&
        node.left.object?.type === 'Identifier' &&
        (node.left.object.name === 'window' || node.left.object.name === 'self' || node.left.object.name === 'globalThis'));
-    if (isOnmessage) {
+    if (isOnmessage && !ctx.isWorker) {
       let handler = node.right;
       // Resolve named function reference: window.onmessage = handleMessage
       if (handler.type === 'Identifier') {
@@ -2207,11 +2208,13 @@ function evaluateCallExpr(node, env, ctx) {
           'href', 'action', 'formaction', 'srcdoc', 'src', 'data', 'style']);
         if (DANGEROUS_ATTRS.has(attrName)) {
           const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
+          const isCss = attrName === 'style';
+          const type = isCss ? 'CSS Injection' : 'XSS';
           const loc = node.loc?.start || {};
           ctx.findings.push({
-            type: 'XSS',
-            severity: isEventHandler ? 'critical' : 'high',
-            title: `XSS: tainted data flows to setAttribute('${attrName}')`,
+            type,
+            severity: isCss ? 'high' : (isEventHandler ? 'critical' : 'high'),
+            title: `${type}: tainted data flows to setAttribute('${attrName}')`,
             sink: { expression: `${objName || 'element'}.setAttribute('${attrName}')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
             source: srcTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
             path: buildTaintPath(srcTaint, `${objName || 'element'}.setAttribute('${attrName}')`),
@@ -3165,7 +3168,7 @@ function analyzeEventListener(node, argTaints, env, ctx) {
     }
   }
 
-  if (eventName === 'message' && callback.params[0]) {
+  if (eventName === 'message' && callback.params[0] && !ctx.isWorker) {
     // Check if the handler validates event.origin — returns 'strong', 'weak', or false
     const originCheck = callbackChecksOrigin(callback.body, ctx);
     if (originCheck !== 'strong') {
