@@ -43860,6 +43860,7 @@ ${rootStack}`;
       this.globalEnv = globalEnv;
       this.scopeInfo = scopeInfo;
       this.returnTaint = TaintSet.empty();
+      this.returnElementTaints = null;
       this.analyzedCalls = analyzedCalls || /* @__PURE__ */ new Map();
       this.returnedFuncNode = null;
       this.returnedMethods = null;
@@ -44145,7 +44146,7 @@ ${rootStack}`;
     }
     return null;
   }
-  function isConstantBool(node) {
+  function isConstantBool(node, ctx) {
     if (!node) return null;
     if (node.type === "BooleanLiteral") return node.value;
     if (node.type === "Literal" && typeof node.value === "boolean") return node.value;
@@ -44155,6 +44156,28 @@ ${rootStack}`;
       return node.value !== "";
     if (node.type === "NullLiteral" || node.type === "Literal" && node.value === null) return false;
     if (node.type === "Identifier" && node.name === "undefined") return false;
+    if (node.type === "Identifier" && ctx?.scopeInfo) {
+      const bindingKey = ctx.scopeInfo.resolve(node);
+      if (bindingKey) {
+        const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
+        if (declNode?.type === "VariableDeclarator" && declNode.init) {
+          return isConstantBool(declNode.init, ctx);
+        }
+      }
+    }
+    if (node.type === "LogicalExpression") {
+      const leftBool = isConstantBool(node.left, ctx);
+      const rightBool = isConstantBool(node.right, ctx);
+      if (node.operator === "||") {
+        if (leftBool === true) return true;
+        if (leftBool === false) return rightBool;
+      } else if (node.operator === "&&") {
+        if (leftBool === false) return false;
+        if (leftBool === true) return rightBool;
+      } else if (node.operator === "??") {
+        if (leftBool !== null && leftBool !== void 0) return leftBool;
+      }
+    }
     return null;
   }
   function findProtocolMember(node) {
@@ -44212,6 +44235,9 @@ ${rootStack}`;
             if (Object.keys(methods).length > 0) ctx.returnedMethods = methods;
           }
           ctx.returnTaint.merge(evaluateExpr(arg, env, ctx));
+          if (arg.type === "ArrayExpression" && arg.elements.length > 0) {
+            ctx.returnElementTaints = arg.elements.map((e) => e ? evaluateExpr(e, env, ctx) : TaintSet.empty());
+          }
         }
         break;
       case "FunctionDeclaration":
@@ -44270,7 +44296,10 @@ ${rootStack}`;
         break;
       case "_CatchParam":
         if (node.param && ctx.thrownTaint.tainted) {
+          const savedBlockScoped = ctx._blockScopedDecl;
+          ctx._blockScopedDecl = true;
           assignToPattern(node.param, ctx.thrownTaint.clone(), env, ctx);
+          ctx._blockScopedDecl = savedBlockScoped;
         }
         break;
       case "ThrowStatement":
@@ -44335,7 +44364,25 @@ ${rootStack}`;
   }
   function storeObjectPropertyTaints(varName, objExpr, env, ctx) {
     for (const prop of objExpr.properties) {
-      if (prop.type === "SpreadElement") continue;
+      if (prop.type === "SpreadElement") {
+        const srcStr = nodeToString(prop.argument);
+        if (srcStr) {
+          const srcTaints = env.getTaintedWithPrefix(`${srcStr}.`);
+          for (const [key, taint] of srcTaints) {
+            const propName = key.slice(srcStr.length + 1);
+            if (propName && !propName.startsWith("#")) {
+              env.set(`${varName}.${propName}`, taint);
+            }
+          }
+          for (const [existingKey] of env.getTaintedWithPrefix(`${varName}.`)) {
+            const propName = existingKey.slice(varName.length + 1);
+            if (propName && !propName.startsWith("#") && env.has(`${srcStr}.${propName}`)) {
+              env.set(existingKey, env.get(`${srcStr}.${propName}`));
+            }
+          }
+        }
+        continue;
+      }
       if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
         const propName = prop.key.name || prop.key.value;
         if (propName) {
@@ -44484,6 +44531,20 @@ ${rootStack}`;
         }
         assignToPattern(pat, i < elemTaints.length ? elemTaints[i] : TaintSet.empty(), env, ctx);
       }
+    } else if (node.id.type === "ArrayPattern" && ctx.returnElementTaints) {
+      const retElems = ctx.returnElementTaints;
+      ctx.returnElementTaints = null;
+      for (let i = 0; i < node.id.elements.length; i++) {
+        const pat = node.id.elements[i];
+        if (!pat) continue;
+        if (pat.type === "RestElement") {
+          const restTaint = TaintSet.empty();
+          for (let j = i; j < retElems.length; j++) restTaint.merge(retElems[j]);
+          assignToPattern(pat.argument, restTaint, env, ctx);
+          break;
+        }
+        assignToPattern(pat, i < retElems.length ? retElems[i] : TaintSet.empty(), env, ctx);
+      }
     } else {
       assignToPattern(node.id, taint, env, ctx);
     }
@@ -44622,7 +44683,12 @@ ${rootStack}`;
         }
       }
     } else if (node.operator !== "=") {
-      finalTaint = evaluateExpr(node.left, env, ctx).clone().merge(rhsTaint);
+      const NUMERIC_ASSIGN_OPS = /* @__PURE__ */ new Set(["-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "|=", "^="]);
+      if (NUMERIC_ASSIGN_OPS.has(node.operator)) {
+        finalTaint = TaintSet.empty();
+      } else {
+        finalTaint = evaluateExpr(node.left, env, ctx).clone().merge(rhsTaint);
+      }
     }
     if (node.operator === "=" && node.left.type === "ArrayPattern" && node.right.type === "ArrayExpression") {
       const elems = node.right.elements;
@@ -44787,6 +44853,20 @@ ${rootStack}`;
         }
       }
     }
+    if (node.operator === "=" && node.left.type === "MemberExpression" && !node.left.computed && node.left.property?.name?.startsWith("on") && node.left.property.name !== "onmessage") {
+      let handler = node.right;
+      if (handler.type === "Identifier") {
+        handler = ctx.funcMap.get(resolveId(handler, ctx)) || ctx.funcMap.get(handler.name) || handler;
+      }
+      if (handler.type === "ArrowFunctionExpression" || handler.type === "FunctionExpression" || handler.type === "FunctionDeclaration") {
+        const childEnv = env.child();
+        if (handler.body.type === "BlockStatement") {
+          analyzeInlineFunction(handler, childEnv, ctx);
+        } else {
+          evaluateExpr(handler.body, childEnv, ctx);
+        }
+      }
+    }
     if (node.operator === "=") {
       const isOnmessage = node.left.type === "Identifier" && node.left.name === "onmessage" || node.left.type === "MemberExpression" && !node.left.computed && node.left.property?.name === "onmessage" && node.left.object?.type === "Identifier" && (node.left.object.name === "window" || node.left.object.name === "self" || node.left.object.name === "globalThis");
       if (isOnmessage) {
@@ -44895,9 +44975,9 @@ ${rootStack}`;
   function propagateThisToInstance(instanceName, env, ctx) {
     const toSet = [];
     for (const [key, taint] of env.bindings) {
-      if (key.startsWith("this.") && taint.tainted) {
+      if (key.startsWith("this.")) {
         const propName = key.slice(5);
-        toSet.push([`${instanceName}.${propName}`, taint]);
+        if (propName) toSet.push([`${instanceName}.${propName}`, taint]);
       }
     }
     for (const [k, t] of toSet) env.set(k, t);
@@ -44958,7 +45038,7 @@ ${rootStack}`;
       case "LogicalExpression": {
         const leftVal = evaluateExpr(node.left, env, ctx);
         if (node.operator === "&&" || node.operator === "||") {
-          const constLeft = isConstantBool(node.left);
+          const constLeft = isConstantBool(node.left, ctx);
           if (node.operator === "&&" && constLeft === false) return TaintSet.empty();
           if (node.operator === "||" && constLeft === true) return leftVal.clone();
         }
@@ -44972,7 +45052,8 @@ ${rootStack}`;
         return leftVal.clone().merge(evaluateExpr(node.right, env, ctx));
       }
       case "UnaryExpression":
-        if (node.operator === "!" || node.operator === "typeof" || node.operator === "+" || node.operator === "-" || node.operator === "~" || node.operator === "void") {
+        if (node.operator === "!" || node.operator === "typeof" || node.operator === "+" || node.operator === "-" || node.operator === "~" || node.operator === "void" || node.operator === "delete") {
+          evaluateExpr(node.argument, env, ctx);
           return TaintSet.empty();
         }
         return evaluateExpr(node.argument, env, ctx);
@@ -45074,6 +45155,20 @@ ${rootStack}`;
         return TaintSet.empty();
       case "AwaitExpression":
         return evaluateExpr(node.argument, env, ctx);
+      case "ImportExpression": {
+        const specifierTaint = evaluateExpr(node.source, env, ctx);
+        if (specifierTaint.tainted) {
+          for (const label of specifierTaint.labels) {
+            ctx.findings.push({
+              type: "XSS",
+              description: `XSS: tainted data flows to dynamic import()`,
+              location: { file: ctx.file, line: node.loc?.start?.line || 0, column: node.loc?.start?.column || 0 },
+              source: label
+            });
+          }
+        }
+        return TaintSet.empty();
+      }
       case "YieldExpression": {
         const yieldTaint = node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
         if (yieldTaint.tainted) ctx.returnTaint.merge(yieldTaint);
@@ -45124,16 +45219,14 @@ ${rootStack}`;
     }
     const fullPath = nodeToString(node);
     if (fullPath) {
-      const propTaint = env.get(fullPath);
-      if (propTaint.tainted) return propTaint.clone();
+      if (env.has(fullPath)) return env.get(fullPath).clone();
     }
     if (!node.computed && node.object?.type === "Identifier" && node.property) {
       const resolvedObjKey = resolveId(node.object, ctx);
       const memberProp = node.property.name || node.property.value;
       if (memberProp) {
         const scopedPath = `${resolvedObjKey}.${memberProp}`;
-        const scopedTaint = env.get(scopedPath);
-        if (scopedTaint.tainted) return scopedTaint.clone();
+        if (env.has(scopedPath)) return env.get(scopedPath).clone();
       }
     }
     if (fullPath) {
@@ -45343,7 +45436,15 @@ ${rootStack}`;
   ]);
   function evaluateCallExpr(node, env, ctx) {
     let calleeStr = nodeToString(node.callee);
-    const methodName = node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression" ? node.callee.property?.name || "" : "";
+    let methodName = "";
+    if (node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression") {
+      if (node.callee.computed) {
+        const resolved = resolveToConstant(node.callee.property, env, ctx);
+        if (resolved) methodName = resolved;
+      } else {
+        methodName = node.callee.property?.name || "";
+      }
+    }
     if (calleeStr && node.callee.type === "Identifier") {
       const alias = env.aliases.get(calleeStr);
       if (alias) calleeStr = alias;
@@ -45358,6 +45459,20 @@ ${rootStack}`;
         const lastStr = nodeToString(last);
         if (lastStr) calleeStr = lastStr;
       }
+    }
+    if (node.callee.type === "Import" && node.arguments.length > 0) {
+      const specifierTaint = evaluateExpr(node.arguments[0], env, ctx);
+      if (specifierTaint.tainted) {
+        for (const label of specifierTaint.labels) {
+          ctx.findings.push({
+            type: "XSS",
+            description: `XSS: tainted data flows to dynamic import()`,
+            location: { file: ctx.file, line: node.loc?.start?.line || 0, column: node.loc?.start?.column || 0 },
+            source: label
+          });
+        }
+      }
+      return TaintSet.empty();
     }
     if (node.callee.type === "CallExpression" || node.callee.type === "OptionalCallExpression") {
       evaluateExpr(node.callee, env, ctx);
@@ -45560,6 +45675,31 @@ ${rootStack}`;
             const key = resolveId(targetNode, ctx);
             env.set(key, env.get(key).clone().merge(merged));
           }
+          for (let si = 1; si < node.arguments.length; si++) {
+            const srcNode = node.arguments[si];
+            if (srcNode.type === "ObjectExpression") {
+              for (const prop of srcNode.properties) {
+                if (prop.type === "SpreadElement") continue;
+                if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+                  const propName = prop.key.name || prop.key.value;
+                  if (propName) {
+                    const propTaint = evaluateExpr(prop.value, env, ctx);
+                    env.set(`${targetStr}.${propName}`, propTaint);
+                  }
+                }
+              }
+            } else {
+              const srcStr = nodeToString(srcNode);
+              if (srcStr) {
+                for (const [key, taint] of env.getTaintedWithPrefix(`${srcStr}.`)) {
+                  const propName = key.slice(srcStr.length + 1);
+                  if (propName && !propName.startsWith("#")) {
+                    env.set(`${targetStr}.${propName}`, taint);
+                  }
+                }
+              }
+            }
+          }
         }
       }
       return merged;
@@ -45712,9 +45852,9 @@ ${rootStack}`;
           analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx);
           const thisTaint = TaintSet.empty();
           for (const [key, taint] of childEnv.bindings) {
-            if (key.startsWith("this.") && taint.tainted) {
+            if (key.startsWith("this.") && key.length > 5) {
               env.set(key, taint);
-              thisTaint.merge(taint);
+              if (taint.tainted) thisTaint.merge(taint);
             }
           }
           if (thisTaint.tainted) return thisTaint;
@@ -45862,6 +46002,15 @@ ${rootStack}`;
             if (node.callee.object.type === "Identifier") {
               const scopedKey = resolveId(node.callee.object, ctx);
               env.set(`${scopedKey}.#key_${keyStr}`, valueTaint.clone());
+            }
+            const valueArg = node.arguments[1];
+            if (valueArg?.type === "Identifier") {
+              const valueId = resolveId(valueArg, ctx);
+              env.aliases.set(perKeyPath, valueId);
+              if (node.callee.object.type === "Identifier") {
+                const scopedKey = resolveId(node.callee.object, ctx);
+                env.aliases.set(`${scopedKey}.#key_${keyStr}`, valueId);
+              }
             }
           } else if (objStr && valueTaint.tainted) {
             env.set(objStr, env.get(objStr).clone().merge(valueTaint));
@@ -46012,6 +46161,32 @@ ${rootStack}`;
             const scopedKey = resolveId(node.callee.object, ctx);
             const scopedPerKey = env.get(`${scopedKey}.#key_${getKeyStr}`);
             if (scopedPerKey.tainted) return scopedPerKey.clone();
+          }
+        }
+        if (!getObjStr && getKeyStr != null && node.callee?.object?.type === "CallExpression") {
+          const innerCall = node.callee.object;
+          const innerCallee = innerCall.callee;
+          if ((innerCallee?.type === "MemberExpression" || innerCallee?.type === "OptionalMemberExpression") && innerCallee.property?.name === "get") {
+            const innerObjStr = nodeToString(innerCallee.object);
+            const innerKeyArg = innerCall.arguments?.[0];
+            const innerKeyStr = innerKeyArg && (innerKeyArg.type === "StringLiteral" || innerKeyArg.type === "Literal") ? innerKeyArg.value ?? innerKeyArg.raw : null;
+            if (innerObjStr && innerKeyStr != null) {
+              const innerPerKeyPath = `${innerObjStr}.#key_${innerKeyStr}`;
+              const aliasTarget = env.aliases.get(innerPerKeyPath);
+              if (aliasTarget) {
+                const nestedPerKey = env.get(`${aliasTarget}.#key_${getKeyStr}`);
+                if (nestedPerKey.tainted) return nestedPerKey.clone();
+              }
+              if (innerCallee.object?.type === "Identifier") {
+                const scopedInner = resolveId(innerCallee.object, ctx);
+                const scopedInnerPerKey = `${scopedInner}.#key_${innerKeyStr}`;
+                const aliasTarget2 = env.aliases.get(scopedInnerPerKey);
+                if (aliasTarget2) {
+                  const nestedPerKey2 = env.get(`${aliasTarget2}.#key_${getKeyStr}`);
+                  if (nestedPerKey2.tainted) return nestedPerKey2.clone();
+                }
+              }
+            }
           }
         }
         if (objTaint.tainted) return objTaint.clone();
@@ -46431,6 +46606,7 @@ ${rootStack}`;
     }
     if (innerCtx.returnedFuncNode) ctx.returnedFuncNode = innerCtx.returnedFuncNode;
     if (innerCtx.returnedMethods) ctx.returnedMethods = innerCtx.returnedMethods;
+    if (innerCtx.returnElementTaints) ctx.returnElementTaints = innerCtx.returnElementTaints;
     const GLOBAL_OBJ_PREFIXES = ["window.", "self.", "globalThis."];
     for (const [key, val] of innerCtx.funcMap) {
       if (key.length > 2 && key[key.length - 1] === "]" && key[key.length - 2] === "[" && !ctx.funcMap.has(key)) {
@@ -46534,7 +46710,8 @@ ${rootStack}`;
     }
     if (!funcNode || !funcNode.body) return TaintSet.empty();
     const superSuffix = callNode.callee?.type === "Super" && ctx._currentSuperClass ? `:super=${ctx._currentSuperClass}` : "";
-    const callSig = `${calleeStr || "anon"}:${argTaints.map((t) => t.tainted ? "1" : "0").join("")}${superSuffix}`;
+    const locSuffix = !calleeStr && funcNode.loc ? `:${funcNode.loc.start.line}:${funcNode.loc.start.column}` : "";
+    const callSig = `${calleeStr || "anon"}:${argTaints.map((t) => t.tainted ? "1" : "0").join("")}${superSuffix}${locSuffix}`;
     if (ctx.analyzedCalls.has(callSig)) return ctx.analyzedCalls.get(callSig)?.clone() || TaintSet.empty();
     ctx.analyzedCalls.set(callSig, TaintSet.empty());
     const closureEnv = funcNode._closureEnv || env;
@@ -46630,7 +46807,17 @@ ${rootStack}`;
             assignToPattern(param.left, argTaints[i] || TaintSet.empty(), childEnv, ctx);
           }
         } else {
-          assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+          if (param.type === "ObjectPattern" && callNode.arguments[i]) {
+            const argNode = callNode.arguments[i];
+            const argStr = nodeToString(argNode);
+            if (argStr) {
+              assignObjectPatternFromSource(param, argStr, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+            } else {
+              assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+            }
+          } else {
+            assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+          }
         }
       }
     }
