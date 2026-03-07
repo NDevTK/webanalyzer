@@ -207,36 +207,51 @@ function buildStatement(stmt, current, cfg, ctx) {
 }
 
 function buildIf(stmt, current, cfg, ctx) {
-  // Test expression is in current block
-  current.addNode({ type: '_Test', test: stmt.test, loc: stmt.loc });
-
-  const thenBlock = cfg.createBlock();
+  // Flatten else-if chains iteratively to avoid stack overflow on deep chains
   const joinBlock = cfg.createBlock();
+  let cur = stmt;
+  let curBlock = current;
 
-  // True edge — annotate with the branch condition for path-sensitive analysis
-  thenBlock.branchCondition = stmt.test;
-  thenBlock.branchPolarity = true;
-  current.connect(thenBlock);
-  const afterThen = buildStatement(stmt.consequent, thenBlock, cfg, ctx);
-  if (afterThen) afterThen.connect(joinBlock);
+  while (cur && cur.type === 'IfStatement') {
+    // Test expression is in current block
+    curBlock.addNode({ type: '_Test', test: cur.test, loc: cur.loc });
 
-  // False edge
-  if (stmt.alternate) {
-    const elseBlock = cfg.createBlock();
-    elseBlock.branchCondition = stmt.test;
-    elseBlock.branchPolarity = false;
-    current.connect(elseBlock);
-    const afterElse = buildStatement(stmt.alternate, elseBlock, cfg, ctx);
-    if (afterElse) afterElse.connect(joinBlock);
-  } else {
-    // No else clause: fall-through represents the false branch.
-    // If the consequent terminates (return/throw/break), the join block only
-    // executes when the test is FALSE — annotate with negated condition.
-    if (!afterThen) {
-      joinBlock.branchCondition = stmt.test;
-      joinBlock.branchPolarity = false;
+    const thenBlock = cfg.createBlock();
+
+    // True edge — annotate with the branch condition for path-sensitive analysis
+    thenBlock.branchCondition = cur.test;
+    thenBlock.branchPolarity = true;
+    curBlock.connect(thenBlock);
+    const afterThen = buildStatement(cur.consequent, thenBlock, cfg, ctx);
+    if (afterThen) afterThen.connect(joinBlock);
+
+    if (cur.alternate) {
+      if (cur.alternate.type === 'IfStatement') {
+        // else-if: continue loop with a new block for the false branch
+        const elseBlock = cfg.createBlock();
+        elseBlock.branchCondition = cur.test;
+        elseBlock.branchPolarity = false;
+        curBlock.connect(elseBlock);
+        curBlock = elseBlock;
+        cur = cur.alternate;
+        continue;
+      }
+      // Final else block
+      const elseBlock = cfg.createBlock();
+      elseBlock.branchCondition = cur.test;
+      elseBlock.branchPolarity = false;
+      curBlock.connect(elseBlock);
+      const afterElse = buildStatement(cur.alternate, elseBlock, cfg, ctx);
+      if (afterElse) afterElse.connect(joinBlock);
+    } else {
+      // No else clause: fall-through represents the false branch.
+      if (!afterThen) {
+        joinBlock.branchCondition = cur.test;
+        joinBlock.branchPolarity = false;
+      }
+      curBlock.connect(joinBlock);
     }
-    current.connect(joinBlock);
+    break;
   }
 
   return joinBlock.predecessors.length > 0 ? joinBlock : null;
