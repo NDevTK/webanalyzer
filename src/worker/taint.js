@@ -4114,6 +4114,9 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
   const sinkInfo = checkAssignmentSink(leftStr, propName);
   if (!sinkInfo) return;
 
+  // Skip self-redirect: top.location.href = self.location.href
+  if (sinkInfo.navigation && isSelfRedirect(sinkInfo, rhsNode)) return;
+
   const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
   const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
   const loc = leftNode.loc?.start || {};
@@ -4127,6 +4130,20 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
   });
 }
 
+function isSelfRedirect(sinkInfo, argNode) {
+  // Suppress location.replace(location.href) / location.assign(self.location.href) etc.
+  // These are frame-busting or same-page reloads, not exploitable
+  if (!sinkInfo.navigation || !argNode) return false;
+  const argStr = nodeToString(argNode);
+  if (!argStr) return false;
+  const SELF_LOCATION_READS = new Set([
+    'location.href', 'window.location.href', 'self.location.href',
+    'document.location.href', 'top.location.href',
+    'location.toString()', 'window.location.toString()',
+  ]);
+  return SELF_LOCATION_READS.has(argStr);
+}
+
 function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
   if (!sinkInfo.taintedArgs) return;
   for (const argIdx of sinkInfo.taintedArgs) {
@@ -4137,6 +4154,9 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
       const argNode = callNode.arguments[argIdx];
       if (argNode.type === 'ArrowFunctionExpression' || argNode.type === 'FunctionExpression') continue;
     }
+
+    // Skip self-redirect patterns: location.replace(self.location.href)
+    if (isSelfRedirect(sinkInfo, callNode.arguments[argIdx])) continue;
 
     const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
     const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');

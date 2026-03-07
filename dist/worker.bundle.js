@@ -47176,6 +47176,7 @@ ${rootStack}`;
     const propName = leftNode.type === "MemberExpression" ? leftNode.property?.name : null;
     const sinkInfo = checkAssignmentSink(leftStr, propName);
     if (!sinkInfo) return;
+    if (sinkInfo.navigation && isSelfRedirect(sinkInfo, rhsNode)) return;
     const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
     const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
     const loc = leftNode.loc?.start || {};
@@ -47188,6 +47189,21 @@ ${rootStack}`;
       path: buildTaintPath(rhsTaint, leftStr || propName)
     });
   }
+  function isSelfRedirect(sinkInfo, argNode) {
+    if (!sinkInfo.navigation || !argNode) return false;
+    const argStr = nodeToString(argNode);
+    if (!argStr) return false;
+    const SELF_LOCATION_READS = /* @__PURE__ */ new Set([
+      "location.href",
+      "window.location.href",
+      "self.location.href",
+      "document.location.href",
+      "top.location.href",
+      "location.toString()",
+      "window.location.toString()"
+    ]);
+    return SELF_LOCATION_READS.has(argStr);
+  }
   function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
     if (!sinkInfo.taintedArgs) return;
     for (const argIdx of sinkInfo.taintedArgs) {
@@ -47197,6 +47213,7 @@ ${rootStack}`;
         const argNode = callNode.arguments[argIdx];
         if (argNode.type === "ArrowFunctionExpression" || argNode.type === "FunctionExpression") continue;
       }
+      if (isSelfRedirect(sinkInfo, callNode.arguments[argIdx])) continue;
       const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
       const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
       const loc = callNode.loc?.start || {};
