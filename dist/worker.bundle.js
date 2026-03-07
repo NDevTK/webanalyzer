@@ -43682,6 +43682,7 @@ ${rootStack}`;
     return MEMBER_SOURCES[str] || null;
   }
   var GLOBAL_ONLY_SINKS = /* @__PURE__ */ new Set(["setTimeout", "setInterval", "eval", "Function"]);
+  var LOCATION_ONLY_SINKS = /* @__PURE__ */ new Set(["replace", "assign"]);
   function checkCallSink(calleeStr, methodName) {
     if (CALL_SINKS[calleeStr]) return CALL_SINKS[calleeStr];
     for (const [pattern, info] of Object.entries(CALL_SINKS)) {
@@ -43690,6 +43691,12 @@ ${rootStack}`;
       if (method === methodName) {
         if (GLOBAL_ONLY_SINKS.has(method)) {
           if (!calleeStr || calleeStr === method || calleeStr === `window.${method}` || calleeStr === `globalThis.${method}` || calleeStr === `self.${method}`) {
+            return info;
+          }
+          continue;
+        }
+        if (LOCATION_ONLY_SINKS.has(method)) {
+          if (calleeStr && (calleeStr.includes("location") || calleeStr.includes("Location"))) {
             return info;
           }
           continue;
