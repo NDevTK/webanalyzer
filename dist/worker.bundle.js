@@ -47922,6 +47922,12 @@ ${rootStack}`;
         return true;
       }
     }
+    if (node.type === "CallExpression" && node.callee?.type === "MemberExpression") {
+      const method = node.callee.property?.name;
+      if ((method === "has" || method === "includes" || method === "indexOf") && node.arguments.length >= 1 && isOriginMemberAccess(node.arguments[0])) {
+        return true;
+      }
+    }
     for (const key of Object.keys(node)) {
       if (key === "loc" || key === "start" || key === "end") continue;
       const child = node[key];

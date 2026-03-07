@@ -544,10 +544,20 @@ function isOriginMemberAccess(node) {
 function containsOriginCheck(node) {
   if (!node || typeof node !== 'object') return false;
 
+  // Pattern: e.origin === '...' / e.origin !== '...'
   if (node.type === 'BinaryExpression' &&
       (node.operator === '===' || node.operator === '==' ||
        node.operator === '!==' || node.operator === '!=')) {
     if (isOriginMemberAccess(node.left) || isOriginMemberAccess(node.right)) {
+      return true;
+    }
+  }
+
+  // Pattern: allowlist.has(e.origin) / allowlist.includes(e.origin)
+  if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
+    const method = node.callee.property?.name;
+    if ((method === 'has' || method === 'includes' || method === 'indexOf') &&
+        node.arguments.length >= 1 && isOriginMemberAccess(node.arguments[0])) {
       return true;
     }
   }
