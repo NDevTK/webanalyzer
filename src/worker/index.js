@@ -257,7 +257,8 @@ function setupMessageHandlerTaint(ast, env, file) {
   walkAST(ast.program, (node) => {
     if (node.type !== 'AssignmentExpression') return;
     const leftStr = nodeToString(node.left);
-    if (leftStr !== 'window.onmessage' && leftStr !== 'onmessage') return;
+    if (leftStr !== 'window.onmessage' && leftStr !== 'onmessage' &&
+        leftStr !== 'self.onmessage') return;
 
     const handler = node.right;
     if (handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression') return;
