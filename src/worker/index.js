@@ -211,7 +211,7 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
 
 // ── Scan for prototype pollution ──
 function scanPrototypePollution(ast, env, file, findings, scopeInfo) {
-  const ctx = { file, funcMap: new Map(), findings, callDepth: 0, maxCallDepth: 0, globalEnv: env, scopeInfo: scopeInfo || null, returnTaint: TaintSet.empty(), analyzedCalls: new Set() };
+  const ctx = { file, funcMap: new Map(), findings, callDepth: 0, maxCallDepth: 0, globalEnv: env, scopeInfo: scopeInfo || null, returnTaint: TaintSet.empty(), analyzedCalls: new Map(), scriptElements: new Set(), eventListeners: new Map(), classBodyMap: new Map(), superClassMap: new Map(), protoMethodMap: new Map(), generatorTaint: new Map(), thrownTaint: TaintSet.empty(), returnedFuncNode: null, returnedMethods: null, returnElementTaints: null, returnPropertyTaints: null, isWorker: false };
   walkAST(ast.program, (node) => {
     if (node.type === 'AssignmentExpression') {
       checkPrototypePollution(node, env, ctx);

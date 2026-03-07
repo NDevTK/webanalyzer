@@ -47637,7 +47637,7 @@ ${rootStack}`;
     return findings;
   }
   function scanPrototypePollution(ast, env, file, findings, scopeInfo) {
-    const ctx = { file, funcMap: /* @__PURE__ */ new Map(), findings, callDepth: 0, maxCallDepth: 0, globalEnv: env, scopeInfo: scopeInfo || null, returnTaint: TaintSet.empty(), analyzedCalls: /* @__PURE__ */ new Set() };
+    const ctx = { file, funcMap: /* @__PURE__ */ new Map(), findings, callDepth: 0, maxCallDepth: 0, globalEnv: env, scopeInfo: scopeInfo || null, returnTaint: TaintSet.empty(), analyzedCalls: /* @__PURE__ */ new Map(), scriptElements: /* @__PURE__ */ new Set(), eventListeners: /* @__PURE__ */ new Map(), classBodyMap: /* @__PURE__ */ new Map(), superClassMap: /* @__PURE__ */ new Map(), protoMethodMap: /* @__PURE__ */ new Map(), generatorTaint: /* @__PURE__ */ new Map(), thrownTaint: TaintSet.empty(), returnedFuncNode: null, returnedMethods: null, returnElementTaints: null, returnPropertyTaints: null, isWorker: false };
     walkAST(ast.program, (node) => {
       if (node.type === "AssignmentExpression") {
         checkPrototypePollution(node, env, ctx);
