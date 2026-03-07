@@ -91,7 +91,7 @@ async function handleScript(tabId, origin, pageUrl, script) {
   }
 
   // Always run analysis (dynamic scripts need cross-file participation)
-  const findings = analyzeAST(ast, script.url, script.isModule, page);
+  const findings = analyzeAST(ast, script.url, script.isModule, page, script.isWorker);
 
   // Stamp page URL on each finding so the UI can show where the script was used
   for (const f of findings) f.pageUrl = pageUrl;
@@ -153,7 +153,7 @@ async function handleHTML(tabId, origin, pageUrl, html) {
 }
 
 // ── Core AST analysis for a single file ──
-function analyzeAST(ast, file, isModule, pageCtx) {
+function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
   // 1. Build scope info via @babel/traverse for accurate binding resolution
   let scopeInfo = null;
   try {
@@ -183,7 +183,7 @@ function analyzeAST(ast, file, isModule, pageCtx) {
   const env = isModule ? importEnv : pageCtx.globalEnv.child();
 
   // 5. Scan for postMessage handlers and set up taint for event.data
-  setupMessageHandlerTaint(ast, env, file);
+  setupMessageHandlerTaint(ast, env, file, isWorker);
 
   // 6. Build CFG for program body
   const cfg = buildCFG(ast.program);
@@ -213,7 +213,10 @@ function analyzeAST(ast, file, isModule, pageCtx) {
 }
 
 // ── Set up taint for message event handlers ──
-function setupMessageHandlerTaint(ast, env, file) {
+function setupMessageHandlerTaint(ast, env, file, isWorker) {
+  // In worker scripts, message handlers receive from same-origin parent — not a taint source
+  if (isWorker) return;
+
   // Walk AST looking for addEventListener('message', fn) patterns
   walkAST(ast.program, (node) => {
     if (node.type !== 'CallExpression') return;
@@ -221,10 +224,6 @@ function setupMessageHandlerTaint(ast, env, file) {
     const callee = node.callee;
     if (callee.type !== 'MemberExpression') return;
     if (callee.property?.name !== 'addEventListener') return;
-
-    // Skip self.addEventListener('message', ...) — worker receiving from same-origin parent
-    const objName = callee.object?.type === 'Identifier' ? callee.object.name : null;
-    if (objName === 'self') return;
 
     const firstArg = node.arguments[0];
     if (!firstArg) return;

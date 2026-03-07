@@ -4,7 +4,7 @@
    Findings are stored in IndexedDB by the worker — this file does NOT use IndexedDB. */
 
 // ── State ──
-const attachedTabs = new Map();   // tabId → { origin, scripts: Map<hash,url> }
+const attachedTabs = new Map();   // tabId → { origin, scripts: Map<hash,url>, workerSessions: Set }
 const tabFindingCounts = new Map(); // tabId → count (for badge, in-memory only)
 let offscreenReady = false;
 let enabled = true;               // global on/off
@@ -100,7 +100,7 @@ async function attachToTab(tabId, url) {
   }
 
   const origin = safeOrigin(url);
-  attachedTabs.set(tabId, { origin, pageUrl: url, scripts: new Map() });
+  attachedTabs.set(tabId, { origin, pageUrl: url, scripts: new Map(), workerSessions: new Set() });
 
   // Enable auto-attach to all frames (iframes, about:blank frames, etc.)
   await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', {
@@ -138,11 +138,15 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
   if (!tabState) return;
 
   if (method === 'Debugger.scriptParsed') {
-    await handleScriptParsed(tabId, tabState, params);
+    const isWorker = source.sessionId && tabState.workerSessions.has(source.sessionId);
+    await handleScriptParsed(tabId, tabState, params, isWorker);
   } else if (method === 'Network.responseReceived') {
     await handleNetworkResponse(tabId, tabState, params);
   } else if (method === 'Target.attachedToTarget') {
-    // New child target (iframe, about:blank frame, worker, etc.)
+    const type = params.targetInfo?.type;
+    if ((type === 'worker' || type === 'service_worker' || type === 'shared_worker') && params.sessionId) {
+      tabState.workerSessions.add(params.sessionId);
+    }
   }
 });
 
@@ -152,7 +156,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 });
 
 // ── Script collection ──
-async function handleScriptParsed(tabId, tabState, params) {
+async function handleScriptParsed(tabId, tabState, params, isWorker) {
   const { scriptId, url, isModule, startLine, startColumn } = params;
   // Skip extension scripts only — allow about:blank, data: URIs, blob: URIs, etc.
   if (url && (url.startsWith('chrome-extension://') || url.startsWith('extensions::'))) return;
@@ -182,6 +186,7 @@ async function handleScriptParsed(tabId, tabState, params) {
       url: url || `inline:${startLine}:${startColumn}`,
       hash,
       isModule: !!isModule,
+      isWorker: !!isWorker,
     },
   });
 }

@@ -47552,7 +47552,7 @@ ${rootStack}`;
     } catch (err) {
       return;
     }
-    const findings = analyzeAST(ast, script.url, script.isModule, page);
+    const findings = analyzeAST(ast, script.url, script.isModule, page, script.isWorker);
     for (const f of findings) f.pageUrl = pageUrl;
     if (findings.length > 0) {
       const novel = findings.filter((f) => {
@@ -47600,7 +47600,7 @@ ${rootStack}`;
       }
     }
   }
-  function analyzeAST(ast, file, isModule, pageCtx) {
+  function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
     let scopeInfo = null;
     try {
       scopeInfo = buildScopeInfo(ast);
@@ -47619,7 +47619,7 @@ ${rootStack}`;
       importEnv = resolveImportTaint(pageCtx, file, imports);
     }
     const env = isModule ? importEnv : pageCtx.globalEnv.child();
-    setupMessageHandlerTaint(ast, env, file);
+    setupMessageHandlerTaint(ast, env, file, isWorker);
     const cfg = buildCFG(ast.program);
     const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo);
     scanPrototypePollution(ast, env, file, findings, scopeInfo);
@@ -47634,14 +47634,13 @@ ${rootStack}`;
     }
     return findings;
   }
-  function setupMessageHandlerTaint(ast, env, file) {
+  function setupMessageHandlerTaint(ast, env, file, isWorker) {
+    if (isWorker) return;
     walkAST(ast.program, (node) => {
       if (node.type !== "CallExpression") return;
       const callee = node.callee;
       if (callee.type !== "MemberExpression") return;
       if (callee.property?.name !== "addEventListener") return;
-      const objName = callee.object?.type === "Identifier" ? callee.object.name : null;
-      if (objName === "self") return;
       const firstArg = node.arguments[0];
       if (!firstArg) return;
       const eventName = firstArg.value;
