@@ -271,6 +271,17 @@ function scanForMessageHandlers(node, file, findings, ancestors) {
   }
 }
 
+// Check if a node is a MemberExpression accessing .origin by AST structure
+function isOriginMemberAccess(node) {
+  if (!node) return false;
+  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+    if (!node.computed && node.property?.name === 'origin') return true;
+    if (node.computed && node.property?.type === 'StringLiteral' && node.property.value === 'origin') return true;
+    if (node.computed && node.property?.type === 'Literal' && node.property.value === 'origin') return true;
+  }
+  return false;
+}
+
 function handlerChecksOrigin(funcNode) {
   // Walk the function body looking for origin checks
   return containsOriginCheck(funcNode.body);
@@ -283,10 +294,7 @@ function containsOriginCheck(node) {
   if (node.type === 'BinaryExpression' &&
       (node.operator === '===' || node.operator === '==' ||
        node.operator === '!==' || node.operator === '!=')) {
-    const leftStr = memberToString(node.left);
-    const rightStr = memberToString(node.right);
-    if ((leftStr && leftStr.endsWith('.origin')) ||
-        (rightStr && rightStr.endsWith('.origin'))) {
+    if (isOriginMemberAccess(node.left) || isOriginMemberAccess(node.right)) {
       return true;
     }
   }

@@ -334,8 +334,7 @@ function extractSchemeCheck(node, positive) {
       const arg = node.arguments[0];
       if (arg && isStringLiteral(arg)) {
         const val = stringLiteralValue(arg);
-        if (val === 'http' || val === 'https' || val === 'http:' || val === 'https:' ||
-            val === 'http://' || val === 'https://' || val === '/') {
+        if (isSafeSchemeValue(val)) {
           return nodeToString(callee.object);
         }
       }
@@ -367,7 +366,7 @@ function extractSchemeCheck(node, positive) {
     const callee = node.callee;
     if (callee.type === 'MemberExpression' && callee.property?.name === 'startsWith') {
       const arg = node.arguments[0];
-      if (arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === 'javascript:') {
+      if (arg && isStringLiteral(arg) && isJavaScriptProtocol(stringLiteralValue(arg))) {
         return nodeToString(callee.object);
       }
     }
@@ -387,7 +386,7 @@ function extractSchemeCheck(node, positive) {
     if (isEquals) {
       const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
       const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
-      if (varSide && litSide && (litSide === 'http:' || litSide === 'https:')) {
+      if (varSide && litSide && isHttpProtocol(litSide)) {
         return varSide;
       }
     }
@@ -396,7 +395,7 @@ function extractSchemeCheck(node, positive) {
     if (isNotEquals) {
       const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
       const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
-      if (varSide && litSide && litSide.toLowerCase() === 'javascript:') {
+      if (varSide && litSide && isJavaScriptProtocol(litSide)) {
         return varSide;
       }
     }
@@ -412,8 +411,7 @@ function extractSchemeCheck(node, positive) {
           const arg = callSide.arguments[0];
           if (arg && isStringLiteral(arg)) {
             const val = stringLiteralValue(arg);
-            if (val === 'http' || val === 'https' || val === 'http:' || val === 'https:' ||
-                val === 'http://' || val === 'https://') {
+            if (isSafeSchemeValue(val)) {
               return nodeToString(cc.object);
             }
           }
@@ -425,8 +423,7 @@ function extractSchemeCheck(node, positive) {
     if (isEquals) {
       const litVal = getStringLiteral(node.left) || getStringLiteral(node.right);
       const callNode = isStringLiteral(node.left) ? node.right : node.left;
-      if (litVal && (litVal === 'http' || litVal === 'https' || litVal === 'http:' ||
-                     litVal === 'https:' || litVal === 'http://' || litVal === 'https://') &&
+      if (litVal && isSafeSchemeValue(litVal) &&
           callNode?.type === 'CallExpression') {
         const cc = callNode.callee;
         if (cc.type === 'MemberExpression' &&
@@ -438,6 +435,49 @@ function extractSchemeCheck(node, positive) {
   }
 
   return null;
+}
+
+// ── Scheme value classification helpers ──
+// Checks if a string literal value represents a safe HTTP(S) scheme prefix.
+// Case-insensitive to handle 'HTTP', 'Https', etc.
+function isSafeSchemeValue(val) {
+  if (!val || typeof val !== 'string') return false;
+  const lower = val.toLowerCase();
+  return lower === 'http' || lower === 'https' ||
+         lower === 'http:' || lower === 'https:' ||
+         lower === 'http://' || lower === 'https://' ||
+         lower === '/';
+}
+
+// Checks if a string literal value is a safe HTTP protocol for url.protocol comparison
+function isHttpProtocol(val) {
+  if (!val || typeof val !== 'string') return false;
+  const lower = val.toLowerCase();
+  return lower === 'http:' || lower === 'https:';
+}
+
+// Checks if a string literal value is the javascript: protocol
+function isJavaScriptProtocol(val) {
+  if (!val || typeof val !== 'string') return false;
+  return val.toLowerCase() === 'javascript:';
+}
+
+// Checks if a regex pattern validates HTTP(S) scheme at string start.
+// Recognizes anchored patterns: ^https?, ^(https?):, ^(?:https?), etc.
+function isHttpSchemeRegex(pattern) {
+  if (!pattern) return false;
+  // Must be anchored at start
+  if (pattern[0] !== '^') return false;
+  // Strip the leading ^ and any grouping: (?, (?:, etc.
+  let rest = pattern.slice(1);
+  while (rest[0] === '(' || rest[0] === '?') {
+    if (rest[0] === '(') { rest = rest.slice(1); continue; }
+    if (rest[0] === '?' && rest[1] === ':') { rest = rest.slice(2); continue; }
+    if (rest[0] === '?') { rest = rest.slice(1); continue; }
+    break;
+  }
+  // Now check if it starts with http/https pattern
+  return /^https?\??/.test(rest);
 }
 
 // Helpers for scheme check detection
@@ -476,11 +516,6 @@ function findProtocolMember(node) {
   }
   return null;
 }
-function isHttpSchemeRegex(pattern) {
-  // Match patterns that validate http/https at string start: ^https?, ^https?:, ^https?://, etc.
-  return /^\^https?\??/.test(pattern);
-}
-
 function processNode(node, env, ctx) {
   if (!node) return;
 
@@ -876,16 +911,20 @@ function processVarDeclarator(node, env, ctx) {
   }
   // Also: var search = location.search (MemberExpression alias)
   if (node.id.type === 'Identifier' && (node.init.type === 'MemberExpression' || node.init.type === 'OptionalMemberExpression')) {
-    const objStr = nodeToString(node.init.object);
     const prop = node.init.property?.name || node.init.property?.value;
-    if (objStr && prop) {
+    if (prop) {
       // var loc = window.location → alias loc to 'location'
       // var loc = document.location → alias loc to 'location'
-      const LOCATION_PARENTS = new Set(['window', 'document', 'self', 'globalThis']);
-      if (prop === 'location' && LOCATION_PARENTS.has(objStr)) {
-        env.aliases.set(node.id.name, 'location');
+      if (prop === 'location' && node.init.object?.type === 'Identifier') {
+        const parentName = node.init.object.name;
+        const resolvedParent = env.aliases.get(parentName) || parentName;
+        if (resolvedParent === 'window' || resolvedParent === 'document' ||
+            resolvedParent === 'self' || resolvedParent === 'globalThis') {
+          env.aliases.set(node.id.name, 'location');
+        }
       }
-      const resolvedObj = env.aliases.get(objStr) || objStr;
+      const objStr = nodeToString(node.init.object);
+      const resolvedObj = (objStr && env.aliases.get(objStr)) || objStr;
       if (resolvedObj !== objStr) {
         // Store the resolved path so later lookups find it
         const resolvedPath = `${resolvedObj}.${prop}`;
@@ -915,12 +954,12 @@ function processVarDeclarator(node, env, ctx) {
 
   // For `new Constructor()` — propagate this.* taint to instance.*
   if (node.init.type === 'NewExpression' && node.id.type === 'Identifier') {
-    ctx._lastNewCallee = nodeToString(node.init.callee);
+    // Extract constructor name from AST: new Widget() → 'Widget', new ns.Widget() → 'ns.Widget'
+    ctx._lastNewCallee = node.init.callee.type === 'Identifier' ? node.init.callee.name : nodeToString(node.init.callee);
     propagateThisToInstance(node.id.name, env, ctx);
     ctx._lastNewCallee = null;
     // Track new URL(x) origins so that url.protocol checks also validate x
-    const ctorName = nodeToString(node.init.callee);
-    if (ctorName === 'URL' && node.init.arguments[0]) {
+    if (isGlobalRef(node.init.callee, 'URL', env) && node.init.arguments[0]) {
       const argStr = nodeToString(node.init.arguments[0]);
       if (argStr) env.urlConstructorOrigins.set(node.id.name, argStr);
     }
@@ -970,7 +1009,7 @@ function processAssignment(node, env, ctx) {
 
   // Track CustomEvent type: var ev = new CustomEvent('type', ...) → map ev → type
   if (ctx._pendingCustomEventType) {
-    const evName = nodeToString(node.left) || (node.left.type === 'Identifier' ? node.left.name : null);
+    const evName = node.left.type === 'Identifier' ? node.left.name : nodeToString(node.left);
     if (evName) {
       if (!ctx._customEventTypes) ctx._customEventTypes = new Map();
       ctx._customEventTypes.set(evName, ctx._pendingCustomEventType);
@@ -1508,7 +1547,18 @@ function evaluateMemberExpr(node, env, ctx) {
   if (fullPath) {
     const propTaint = env.get(fullPath);
     if (propTaint.tainted) return propTaint.clone();
-
+  }
+  // Scope-resolved lookup: if object is an Identifier, try resolvedKey.propName
+  if (!node.computed && node.object?.type === 'Identifier' && node.property) {
+    const resolvedObjKey = resolveId(node.object, ctx);
+    const memberProp = node.property.name || node.property.value;
+    if (memberProp) {
+      const scopedPath = `${resolvedObjKey}.${memberProp}`;
+      const scopedTaint = env.get(scopedPath);
+      if (scopedTaint.tainted) return scopedTaint.clone();
+    }
+  }
+  if (fullPath) {
     // Check for getter: invoke getter body to determine taint
     const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
     if (getterFunc && getterFunc.body) {
@@ -1538,6 +1588,18 @@ function evaluateMemberExpr(node, env, ctx) {
         const merged = TaintSet.empty();
         for (const [, taint] of taintedProps) merged.merge(taint);
         return merged;
+      }
+    }
+    // Also check scope-resolved key for computed access
+    if (node.object?.type === 'Identifier') {
+      const resolvedKey = resolveId(node.object, ctx);
+      if (resolvedKey !== objStr) {
+        const resolvedProps = env.getTaintedWithPrefix(`${resolvedKey}.`);
+        if (resolvedProps.size > 0) {
+          const merged = TaintSet.empty();
+          for (const [, taint] of resolvedProps) merged.merge(taint);
+          return merged;
+        }
       }
     }
     // If the object itself is tainted (e.g. from JSON.parse), reading any property is tainted
@@ -1576,6 +1638,51 @@ function isCalleeIdentifier(node, name, env) {
   const alias = env?.aliases?.get(callee.name);
   return alias === name;
 }
+
+// Check if a node refers to a well-known global by AST structure.
+// Matches: bare Identifier (e.g., localStorage), or window.localStorage, self.localStorage, globalThis.localStorage
+// Also resolves aliases via env.
+function isGlobalRef(node, globalName, env) {
+  if (!node) return false;
+  if (node.type === 'Identifier') {
+    if (node.name === globalName) return true;
+    const alias = env?.aliases?.get(node.name);
+    if (alias === globalName) return true;
+    return false;
+  }
+  if (node.type === 'MemberExpression' && !node.computed) {
+    if (node.property?.name !== globalName) return false;
+    if (node.object?.type === 'Identifier') {
+      const objName = node.object.name;
+      if (objName === 'window' || objName === 'self' || objName === 'globalThis') return true;
+      const alias = env?.aliases?.get(objName);
+      if (alias === 'window' || alias === 'self' || alias === 'globalThis') return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+// Known event handler attribute names (per HTML spec)
+const EVENT_HANDLER_ATTRS = new Set([
+  'onabort', 'onblur', 'oncancel', 'oncanplay', 'oncanplaythrough', 'onchange',
+  'onclick', 'onclose', 'oncontextmenu', 'oncopy', 'oncuechange', 'oncut',
+  'ondblclick', 'ondrag', 'ondragend', 'ondragenter', 'ondragleave', 'ondragover',
+  'ondragstart', 'ondrop', 'ondurationchange', 'onemptied', 'onended', 'onerror',
+  'onfocus', 'onfocusin', 'onfocusout', 'onformdata', 'ongotpointercapture',
+  'oninput', 'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload',
+  'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onlostpointercapture',
+  'onmousedown', 'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout',
+  'onmouseover', 'onmouseup', 'onpaste', 'onpause', 'onplay', 'onplaying',
+  'onpointercancel', 'onpointerdown', 'onpointerenter', 'onpointerleave',
+  'onpointermove', 'onpointerout', 'onpointerover', 'onpointerup', 'onprogress',
+  'onratechange', 'onreset', 'onresize', 'onscroll', 'onsecuritypolicyviolation',
+  'onseeked', 'onseeking', 'onselect', 'onselectionchange', 'onselectstart',
+  'onslotchange', 'onstalled', 'onsubmit', 'onsuspend', 'ontimeupdate',
+  'ontoggle', 'ontouchcancel', 'ontouchend', 'ontouchmove', 'ontouchstart',
+  'ontransitioncancel', 'ontransitionend', 'ontransitionrun', 'ontransitionstart',
+  'onvolumechange', 'onwaiting', 'onwheel',
+]);
 
 // Properties that always return a number or boolean (not attacker-controlled strings)
 const NUMERIC_PROPS = new Set([
@@ -1651,7 +1758,7 @@ function evaluateCallExpr(node, env, ctx) {
           'onchange', 'oninput', 'onsubmit', 'onkeydown', 'onkeyup', 'onkeypress',
           'href', 'action', 'formaction', 'srcdoc', 'src', 'data']);
         if (DANGEROUS_ATTRS.has(attrName)) {
-          const isEventHandler = attrName.startsWith('on');
+          const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
           const loc = node.loc?.start || {};
           ctx.findings.push({
             type: 'XSS',
@@ -1910,14 +2017,14 @@ function evaluateNewExpr(node, env, ctx) {
     return TaintSet.from(new TaintLabel(CONSTRUCTOR_SOURCES[constructorName], ctx.file, loc.line || 0, loc.column || 0, `new ${constructorName}()`));
   }
 
-  if (constructorName === 'Function') {
+  if (isGlobalRef(node.callee, 'Function', env)) {
     // new Function(body) or new Function(arg1, ..., body) — any tainted arg is code injection
     const allArgIndices = argTaints.map((_, i) => i);
     checkSinkCall(node, { type: 'XSS', taintedArgs: allArgIndices }, argTaints, 'new Function()', env, ctx);
   }
 
   // new Promise(function(resolve, reject) { resolve(tainted) }) → taint propagates to .then()
-  if (constructorName === 'Promise' && node.arguments[0]) {
+  if (isGlobalRef(node.callee, 'Promise', env) && node.arguments[0]) {
     let callback = node.arguments[0];
     if (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression') {
       const childEnv = env.child();
@@ -1942,7 +2049,7 @@ function evaluateNewExpr(node, env, ctx) {
   }
 
   // new CustomEvent('type', {detail: tainted}) — track event type and detail taint
-  if (constructorName === 'CustomEvent' && node.arguments.length >= 2) {
+  if (isGlobalRef(node.callee, 'CustomEvent', env) && node.arguments.length >= 2) {
     const eventTypeNode = node.arguments[0];
     const optionsNode = node.arguments[1];
     if (eventTypeNode && (eventTypeNode.type === 'StringLiteral' || (eventTypeNode.type === 'Literal' && typeof eventTypeNode.value === 'string'))) {
@@ -2234,8 +2341,16 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       const calleeObj = node.callee?.object;
       const protoMethod = calleeObj ? nodeToString(calleeObj) : null;
       if (protoMethod) {
-        const parts = protoMethod.split('.');
-        const method = parts[parts.length - 1];
+        // Extract the terminal method name by walking the AST MemberExpression chain
+        // instead of string-splitting: Array.prototype.join → property 'join'
+        let method;
+        if (calleeObj.type === 'MemberExpression' || calleeObj.type === 'OptionalMemberExpression') {
+          method = calleeObj.property?.name || calleeObj.property?.value;
+        } else if (calleeObj.type === 'Identifier') {
+          method = calleeObj.name;
+        } else {
+          method = null;
+        }
         // Try builtin method first
         const result = handleBuiltinMethod(method, {
           ...node,
@@ -2300,9 +2415,17 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
         }
       }
       if (objTaint.tainted) return objTaint.clone();
-      if (getObjStr === 'localStorage' || getObjStr === 'sessionStorage') {
-        const loc = node.loc?.start || {};
-        return TaintSet.from(new TaintLabel(`storage.${getObjStr === 'localStorage' ? 'local' : 'session'}`, ctx.file, loc.line || 0, loc.column || 0, `${getObjStr}.getItem()`));
+      // Storage API: localStorage.get() / sessionStorage.get()
+      if (node.callee?.object) {
+        const storageObj = node.callee.object;
+        if (isGlobalRef(storageObj, 'localStorage', env)) {
+          const loc = node.loc?.start || {};
+          return TaintSet.from(new TaintLabel('storage.local', ctx.file, loc.line || 0, loc.column || 0, 'localStorage.getItem()'));
+        }
+        if (isGlobalRef(storageObj, 'sessionStorage', env)) {
+          const loc = node.loc?.start || {};
+          return TaintSet.from(new TaintLabel('storage.session', ctx.file, loc.line || 0, loc.column || 0, 'sessionStorage.getItem()'));
+        }
       }
       // If the callee resolves to a user-defined function, let analyzeCalledFunction handle it
       const getCalleeStr = nodeToString(node.callee);
@@ -2311,10 +2434,17 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     }
 
     case 'getItem': {
-      const objStr = nodeToString(node.callee?.object);
-      if (objStr === 'localStorage' || objStr === 'sessionStorage') {
-        const loc = node.loc?.start || {};
-        return TaintSet.from(new TaintLabel(`storage.${objStr === 'localStorage' ? 'local' : 'session'}`, ctx.file, loc.line || 0, loc.column || 0, `${objStr}.getItem()`));
+      // Storage API: localStorage.getItem() / sessionStorage.getItem()
+      if (node.callee?.object) {
+        const storageObj = node.callee.object;
+        if (isGlobalRef(storageObj, 'localStorage', env)) {
+          const loc = node.loc?.start || {};
+          return TaintSet.from(new TaintLabel('storage.local', ctx.file, loc.line || 0, loc.column || 0, 'localStorage.getItem()'));
+        }
+        if (isGlobalRef(storageObj, 'sessionStorage', env)) {
+          const loc = node.loc?.start || {};
+          return TaintSet.from(new TaintLabel('storage.session', ctx.file, loc.line || 0, loc.column || 0, 'sessionStorage.getItem()'));
+        }
       }
       return objTaint.clone();
     }
@@ -2339,9 +2469,13 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       const eventArg = node.arguments?.[0];
       if (eventArg) {
         const eventTaint = argTaints[0] || TaintSet.empty();
-        const eventStr = nodeToString(eventArg);
-        // Find the event type: check env for stored event name from CustomEvent constructor
-        const eventType = eventStr && ctx._customEventTypes?.get(eventStr);
+        // Look up event type by variable name (try raw name first, then scope-resolved)
+        const eventStr = eventArg.type === 'Identifier' ? eventArg.name : nodeToString(eventArg);
+        let eventType = eventStr && ctx._customEventTypes?.get(eventStr);
+        if (!eventType && eventArg.type === 'Identifier') {
+          const resolvedKey = resolveId(eventArg, ctx);
+          eventType = ctx._customEventTypes?.get(resolvedKey);
+        }
         if (eventType && ctx.eventListeners.has(eventType)) {
           for (const { callback, env: listenerEnv } of ctx.eventListeners.get(eventType)) {
             if (callback.params[0]) {
@@ -2351,7 +2485,8 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
                 // Taint the event parameter and its .detail property
                 assignToPattern(callback.params[0], eventTaint, childEnv, ctx);
                 // Get detail taint from the event object
-                const detailTaint = env.get(eventStr ? `${eventStr}.detail` : '');
+                const detailKey = eventStr ? `${eventStr}.detail` : '';
+                const detailTaint = env.get(detailKey);
                 if (detailTaint.tainted) {
                   childEnv.set(`${paramName}.detail`, detailTaint);
                 }
@@ -2596,8 +2731,8 @@ function classifyOriginMethod(method, callNode) {
       return 'weak';
     case 'startsWith':
       // e.origin.startsWith('https://trusted.com') with full origin is strong
-      if (argVal && /^https?:\/\/[^/]+/.test(argVal)) return 'strong';
-      // e.origin.startsWith('http') — just a scheme check, not origin validation
+      // Use the same origin literal classifier for consistency
+      if (argVal) return classifyOriginLiteral(argVal);
       return 'weak';
     case 'match':
       // Regex match on origin
@@ -2611,14 +2746,18 @@ function classifyOriginMethod(method, callNode) {
 }
 
 // Classify a regex used to validate .origin
+// Analyzes regex pattern anchors: ^ at start, $ at end (unescaped)
 function classifyOriginRegex(pattern) {
   if (!pattern) return 'weak';
-  // Must be anchored at both start and end to prevent bypass
-  const hasStart = pattern.startsWith('^');
-  const hasEnd = pattern.endsWith('$');
+  // Check for unescaped ^ anchor at start of pattern (or after leading group)
+  const hasStart = pattern[0] === '^' || /^\(\?[^)]*\)\^/.test(pattern);
+  // Check for unescaped $ anchor at end (not preceded by unescaped backslash)
+  const hasEnd = pattern.length > 0 && pattern[pattern.length - 1] === '$' &&
+    (pattern.length < 2 || pattern[pattern.length - 2] !== '\\');
   if (hasStart && hasEnd) return 'strong';
-  // Anchored at start with a full origin pattern is acceptable
-  if (hasStart && /^(\^)https?:/.test(pattern)) return 'strong';
+  // Anchored at start with a full origin scheme pattern is acceptable
+  // (e.g., /^https?:\/\/trusted\.com/ — the path structure prevents bypass)
+  if (hasStart && /^\^https?:/.test(pattern)) return 'strong';
   // Unanchored regex is bypassable
   return 'weak';
 }
@@ -2644,8 +2783,8 @@ function collectOriginValidatorChecks(node, params, checks) {
   if (node.type === 'BinaryExpression' &&
       (node.operator === '===' || node.operator === '==' ||
        node.operator === '!==' || node.operator === '!=')) {
-    const l = nodeToString(node.left), r = nodeToString(node.right);
-    const paramSide = paramNames.includes(l) ? 'left' : paramNames.includes(r) ? 'right' : null;
+    const isParamRef = (n) => n.type === 'Identifier' && paramNames.includes(n.name);
+    const paramSide = isParamRef(node.left) ? 'left' : isParamRef(node.right) ? 'right' : null;
     if (paramSide) {
       const otherNode = paramSide === 'left' ? node.right : node.left;
       const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
@@ -2662,17 +2801,16 @@ function collectOriginValidatorChecks(node, params, checks) {
 
   // Method call: param.includes(), allowList.includes(param), etc.
   if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
-    const objStr = nodeToString(node.callee.object);
     const method = node.callee.property?.name;
     // param.includes('...'), param.startsWith('...'), etc.
-    if (paramNames.includes(objStr) && method) {
+    if (node.callee.object?.type === 'Identifier' && paramNames.includes(node.callee.object.name) && method) {
       checks.push(classifyOriginMethod(method, node));
       return;
     }
     // allowList.includes(param) — array allowlist lookup is strong
     if ((method === 'includes' || method === 'has') && node.arguments?.[0]) {
-      const argStr = nodeToString(node.arguments[0]);
-      if (paramNames.includes(argStr)) {
+      const argNode = node.arguments[0];
+      if (argNode.type === 'Identifier' && paramNames.includes(argNode.name)) {
         checks.push('strong');
         return;
       }
@@ -2819,15 +2957,20 @@ function analyzeInlineFunction(funcNode, env, ctx) {
   // Propagate function entries discovered during inline analysis back to the caller:
   // - Array-stored callbacks (key ends with [])
   // - Global assignments via window.X (strip prefix for cross-file resolution)
+  // Propagate function entries discovered during inline analysis back to the caller:
+  // Array-stored callbacks (key ends with []) and global assignments (window.X, self.X, globalThis.X)
+  const GLOBAL_OBJ_PREFIXES = ['window.', 'self.', 'globalThis.'];
   for (const [key, val] of innerCtx.funcMap) {
-    if (key.endsWith('[]') && !ctx.funcMap.has(key)) {
+    if (key.length > 2 && key[key.length - 1] === ']' && key[key.length - 2] === '[' && !ctx.funcMap.has(key)) {
       ctx.funcMap.set(key, val);
     }
-    if (key.startsWith('window.') && !ctx.funcMap.has(key)) {
-      ctx.funcMap.set(key, val);
-      // Also register without the window. prefix: window.Mod.get → Mod.get
-      const stripped = key.slice(7); // remove "window."
-      if (stripped && !ctx.funcMap.has(stripped)) ctx.funcMap.set(stripped, val);
+    for (const prefix of GLOBAL_OBJ_PREFIXES) {
+      if (key.length > prefix.length && key.slice(0, prefix.length) === prefix && !ctx.funcMap.has(key)) {
+        ctx.funcMap.set(key, val);
+        const stripped = key.slice(prefix.length);
+        if (stripped && !ctx.funcMap.has(stripped)) ctx.funcMap.set(stripped, val);
+        break;
+      }
     }
   }
 
@@ -3111,8 +3254,12 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
   // Propagate global-scoped side effects back to the caller's env
   // Handles: Config.init(val) sets Config.data = val → caller sees Config.data as tainted
+  // A dot-path binding (e.g., "Config.data") is a property path — propagate it back.
+  // Exclude internal namespaces: 'this.', 'global:', and scope-resolved keys (digit + ':').
   for (const [key, taint] of childEnv.bindings) {
-    if (taint.tainted && key.includes('.') && !key.startsWith('this.') && !key.startsWith('global:')) {
+    if (taint.tainted && key.indexOf('.') !== -1 &&
+        key.slice(0, 5) !== 'this.' && key.slice(0, 7) !== 'global:' &&
+        !(key[0] >= '0' && key[0] <= '9')) {
       env.set(key, taint);
     }
   }
@@ -3196,7 +3343,7 @@ function collectClosureTaint(node, env, ctx, taintOut, visited) {
 }
 
 // ── Sink checks ──
-function classifyNavigationType(sinkInfo, env, rhsNode) {
+function classifyNavigationType(sinkInfo, env, rhsNode, ctx) {
   // For navigation sinks, check if the value has been URL-scheme-validated on this path.
   // If scheme is confirmed http/https, it's Open Redirect (javascript: blocked).
   // Otherwise it's XSS (javascript: URI injection possible).
@@ -3213,10 +3360,13 @@ function classifyNavigationType(sinkInfo, env, rhsNode) {
     }
     // Check if the variable references a new URL() result — new URL() with validated protocol
     if (rhsNode.type === 'Identifier') {
-      // Check all resolved names (scope-resolved and raw)
-      for (const checked of env.schemeCheckedVars) {
-        if (checked === rhsNode.name || checked.endsWith(':' + rhsNode.name)) return 'Open Redirect';
+      // Check by raw name and scope-resolved key (via resolveId)
+      if (env.schemeCheckedVars.has(rhsNode.name)) return 'Open Redirect';
+      if (ctx) {
+        const resolvedKey = resolveId(rhsNode, ctx);
+        if (env.schemeCheckedVars.has(resolvedKey)) return 'Open Redirect';
       }
+      if (env.schemeCheckedVars.has(`global:${rhsNode.name}`)) return 'Open Redirect';
     }
   }
 
@@ -3253,7 +3403,7 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
   const sinkInfo = checkAssignmentSink(leftStr, propName);
   if (!sinkInfo) return;
 
-  const type = classifyNavigationType(sinkInfo, env, rhsNode);
+  const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
   const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
   const loc = leftNode.loc?.start || {};
   ctx.findings.push({
@@ -3276,7 +3426,7 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
       if (argNode.type === 'ArrowFunctionExpression' || argNode.type === 'FunctionExpression') continue;
     }
 
-    const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx]);
+    const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
     const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
     const loc = callNode.loc?.start || {};
     ctx.findings.push({

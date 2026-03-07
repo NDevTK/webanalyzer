@@ -43969,7 +43969,7 @@ ${rootStack}`;
         const arg = node.arguments[0];
         if (arg && isStringLiteral(arg)) {
           const val = stringLiteralValue(arg);
-          if (val === "http" || val === "https" || val === "http:" || val === "https:" || val === "http://" || val === "https://" || val === "/") {
+          if (isSafeSchemeValue(val)) {
             return nodeToString(callee.object);
           }
         }
@@ -43997,7 +43997,7 @@ ${rootStack}`;
       const callee = node.callee;
       if (callee.type === "MemberExpression" && callee.property?.name === "startsWith") {
         const arg = node.arguments[0];
-        if (arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === "javascript:") {
+        if (arg && isStringLiteral(arg) && isJavaScriptProtocol(stringLiteralValue(arg))) {
           return nodeToString(callee.object);
         }
       }
@@ -44011,14 +44011,14 @@ ${rootStack}`;
       if (isEquals) {
         const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
         const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
-        if (varSide && litSide && (litSide === "http:" || litSide === "https:")) {
+        if (varSide && litSide && isHttpProtocol(litSide)) {
           return varSide;
         }
       }
       if (isNotEquals) {
         const varSide = findProtocolMember(node.left) || findProtocolMember(node.right);
         const litSide = getStringLiteral(node.left) || getStringLiteral(node.right);
-        if (varSide && litSide && litSide.toLowerCase() === "javascript:") {
+        if (varSide && litSide && isJavaScriptProtocol(litSide)) {
           return varSide;
         }
       }
@@ -44031,7 +44031,7 @@ ${rootStack}`;
             const arg = callSide.arguments[0];
             if (arg && isStringLiteral(arg)) {
               const val = stringLiteralValue(arg);
-              if (val === "http" || val === "https" || val === "http:" || val === "https:" || val === "http://" || val === "https://") {
+              if (isSafeSchemeValue(val)) {
                 return nodeToString(cc.object);
               }
             }
@@ -44041,7 +44041,7 @@ ${rootStack}`;
       if (isEquals) {
         const litVal = getStringLiteral(node.left) || getStringLiteral(node.right);
         const callNode = isStringLiteral(node.left) ? node.right : node.left;
-        if (litVal && (litVal === "http" || litVal === "https" || litVal === "http:" || litVal === "https:" || litVal === "http://" || litVal === "https://") && callNode?.type === "CallExpression") {
+        if (litVal && isSafeSchemeValue(litVal) && callNode?.type === "CallExpression") {
           const cc = callNode.callee;
           if (cc.type === "MemberExpression" && (cc.property?.name === "slice" || cc.property?.name === "substring" || cc.property?.name === "substr")) {
             return nodeToString(cc.object);
@@ -44050,6 +44050,41 @@ ${rootStack}`;
       }
     }
     return null;
+  }
+  function isSafeSchemeValue(val) {
+    if (!val || typeof val !== "string") return false;
+    const lower = val.toLowerCase();
+    return lower === "http" || lower === "https" || lower === "http:" || lower === "https:" || lower === "http://" || lower === "https://" || lower === "/";
+  }
+  function isHttpProtocol(val) {
+    if (!val || typeof val !== "string") return false;
+    const lower = val.toLowerCase();
+    return lower === "http:" || lower === "https:";
+  }
+  function isJavaScriptProtocol(val) {
+    if (!val || typeof val !== "string") return false;
+    return val.toLowerCase() === "javascript:";
+  }
+  function isHttpSchemeRegex(pattern) {
+    if (!pattern) return false;
+    if (pattern[0] !== "^") return false;
+    let rest = pattern.slice(1);
+    while (rest[0] === "(" || rest[0] === "?") {
+      if (rest[0] === "(") {
+        rest = rest.slice(1);
+        continue;
+      }
+      if (rest[0] === "?" && rest[1] === ":") {
+        rest = rest.slice(2);
+        continue;
+      }
+      if (rest[0] === "?") {
+        rest = rest.slice(1);
+        continue;
+      }
+      break;
+    }
+    return /^https?\??/.test(rest);
   }
   function isStringLiteral(node) {
     return node && (node.type === "StringLiteral" || node.type === "Literal" && typeof node.value === "string");
@@ -44083,9 +44118,6 @@ ${rootStack}`;
       return nodeToString(node.object);
     }
     return null;
-  }
-  function isHttpSchemeRegex(pattern) {
-    return /^\^https?\??/.test(pattern);
   }
   function processNode(node, env, ctx) {
     if (!node) return;
@@ -44445,14 +44477,17 @@ ${rootStack}`;
       if (existing) env.aliases.set(node.id.name, existing);
     }
     if (node.id.type === "Identifier" && (node.init.type === "MemberExpression" || node.init.type === "OptionalMemberExpression")) {
-      const objStr = nodeToString(node.init.object);
       const prop = node.init.property?.name || node.init.property?.value;
-      if (objStr && prop) {
-        const LOCATION_PARENTS = /* @__PURE__ */ new Set(["window", "document", "self", "globalThis"]);
-        if (prop === "location" && LOCATION_PARENTS.has(objStr)) {
-          env.aliases.set(node.id.name, "location");
+      if (prop) {
+        if (prop === "location" && node.init.object?.type === "Identifier") {
+          const parentName = node.init.object.name;
+          const resolvedParent = env.aliases.get(parentName) || parentName;
+          if (resolvedParent === "window" || resolvedParent === "document" || resolvedParent === "self" || resolvedParent === "globalThis") {
+            env.aliases.set(node.id.name, "location");
+          }
         }
-        const resolvedObj = env.aliases.get(objStr) || objStr;
+        const objStr = nodeToString(node.init.object);
+        const resolvedObj = objStr && env.aliases.get(objStr) || objStr;
         if (resolvedObj !== objStr) {
           const resolvedPath = `${resolvedObj}.${prop}`;
           const sourceTaint = checkMemberSource({ type: "MemberExpression", object: { type: "Identifier", name: resolvedObj }, property: node.init.property, computed: false });
@@ -44476,11 +44511,10 @@ ${rootStack}`;
       }
     }
     if (node.init.type === "NewExpression" && node.id.type === "Identifier") {
-      ctx._lastNewCallee = nodeToString(node.init.callee);
+      ctx._lastNewCallee = node.init.callee.type === "Identifier" ? node.init.callee.name : nodeToString(node.init.callee);
       propagateThisToInstance(node.id.name, env, ctx);
       ctx._lastNewCallee = null;
-      const ctorName = nodeToString(node.init.callee);
-      if (ctorName === "URL" && node.init.arguments[0]) {
+      if (isGlobalRef(node.init.callee, "URL", env) && node.init.arguments[0]) {
         const argStr = nodeToString(node.init.arguments[0]);
         if (argStr) env.urlConstructorOrigins.set(node.id.name, argStr);
       }
@@ -44520,7 +44554,7 @@ ${rootStack}`;
     }
     registerReturnedFunctions(node.left, ctx);
     if (ctx._pendingCustomEventType) {
-      const evName = nodeToString(node.left) || (node.left.type === "Identifier" ? node.left.name : null);
+      const evName = node.left.type === "Identifier" ? node.left.name : nodeToString(node.left);
       if (evName) {
         if (!ctx._customEventTypes) ctx._customEventTypes = /* @__PURE__ */ new Map();
         ctx._customEventTypes.set(evName, ctx._pendingCustomEventType);
@@ -44941,6 +44975,17 @@ ${rootStack}`;
     if (fullPath) {
       const propTaint = env.get(fullPath);
       if (propTaint.tainted) return propTaint.clone();
+    }
+    if (!node.computed && node.object?.type === "Identifier" && node.property) {
+      const resolvedObjKey = resolveId(node.object, ctx);
+      const memberProp = node.property.name || node.property.value;
+      if (memberProp) {
+        const scopedPath = `${resolvedObjKey}.${memberProp}`;
+        const scopedTaint = env.get(scopedPath);
+        if (scopedTaint.tainted) return scopedTaint.clone();
+      }
+    }
+    if (fullPath) {
       const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
       if (getterFunc && getterFunc.body) {
         const childEnv = (getterFunc._closureEnv || env).child();
@@ -44963,6 +45008,17 @@ ${rootStack}`;
           const merged = TaintSet.empty();
           for (const [, taint] of taintedProps) merged.merge(taint);
           return merged;
+        }
+      }
+      if (node.object?.type === "Identifier") {
+        const resolvedKey = resolveId(node.object, ctx);
+        if (resolvedKey !== objStr) {
+          const resolvedProps = env.getTaintedWithPrefix(`${resolvedKey}.`);
+          if (resolvedProps.size > 0) {
+            const merged = TaintSet.empty();
+            for (const [, taint] of resolvedProps) merged.merge(taint);
+            return merged;
+          }
         }
       }
       if (objTaint.tainted) return objTaint.clone();
@@ -44991,6 +45047,114 @@ ${rootStack}`;
     const alias = env?.aliases?.get(callee.name);
     return alias === name;
   }
+  function isGlobalRef(node, globalName, env) {
+    if (!node) return false;
+    if (node.type === "Identifier") {
+      if (node.name === globalName) return true;
+      const alias = env?.aliases?.get(node.name);
+      if (alias === globalName) return true;
+      return false;
+    }
+    if (node.type === "MemberExpression" && !node.computed) {
+      if (node.property?.name !== globalName) return false;
+      if (node.object?.type === "Identifier") {
+        const objName = node.object.name;
+        if (objName === "window" || objName === "self" || objName === "globalThis") return true;
+        const alias = env?.aliases?.get(objName);
+        if (alias === "window" || alias === "self" || alias === "globalThis") return true;
+      }
+      return false;
+    }
+    return false;
+  }
+  var EVENT_HANDLER_ATTRS = /* @__PURE__ */ new Set([
+    "onabort",
+    "onblur",
+    "oncancel",
+    "oncanplay",
+    "oncanplaythrough",
+    "onchange",
+    "onclick",
+    "onclose",
+    "oncontextmenu",
+    "oncopy",
+    "oncuechange",
+    "oncut",
+    "ondblclick",
+    "ondrag",
+    "ondragend",
+    "ondragenter",
+    "ondragleave",
+    "ondragover",
+    "ondragstart",
+    "ondrop",
+    "ondurationchange",
+    "onemptied",
+    "onended",
+    "onerror",
+    "onfocus",
+    "onfocusin",
+    "onfocusout",
+    "onformdata",
+    "ongotpointercapture",
+    "oninput",
+    "oninvalid",
+    "onkeydown",
+    "onkeypress",
+    "onkeyup",
+    "onload",
+    "onloadeddata",
+    "onloadedmetadata",
+    "onloadstart",
+    "onlostpointercapture",
+    "onmousedown",
+    "onmouseenter",
+    "onmouseleave",
+    "onmousemove",
+    "onmouseout",
+    "onmouseover",
+    "onmouseup",
+    "onpaste",
+    "onpause",
+    "onplay",
+    "onplaying",
+    "onpointercancel",
+    "onpointerdown",
+    "onpointerenter",
+    "onpointerleave",
+    "onpointermove",
+    "onpointerout",
+    "onpointerover",
+    "onpointerup",
+    "onprogress",
+    "onratechange",
+    "onreset",
+    "onresize",
+    "onscroll",
+    "onsecuritypolicyviolation",
+    "onseeked",
+    "onseeking",
+    "onselect",
+    "onselectionchange",
+    "onselectstart",
+    "onslotchange",
+    "onstalled",
+    "onsubmit",
+    "onsuspend",
+    "ontimeupdate",
+    "ontoggle",
+    "ontouchcancel",
+    "ontouchend",
+    "ontouchmove",
+    "ontouchstart",
+    "ontransitioncancel",
+    "ontransitionend",
+    "ontransitionrun",
+    "ontransitionstart",
+    "onvolumechange",
+    "onwaiting",
+    "onwheel"
+  ]);
   var NUMERIC_PROPS = /* @__PURE__ */ new Set([
     "length",
     "size",
@@ -45077,7 +45241,7 @@ ${rootStack}`;
             "data"
           ]);
           if (DANGEROUS_ATTRS.has(attrName)) {
-            const isEventHandler = attrName.startsWith("on");
+            const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
             const loc = node.loc?.start || {};
             ctx.findings.push({
               type: "XSS",
@@ -45285,11 +45449,11 @@ ${rootStack}`;
       const loc = node.loc?.start || {};
       return TaintSet.from(new TaintLabel(CONSTRUCTOR_SOURCES[constructorName], ctx.file, loc.line || 0, loc.column || 0, `new ${constructorName}()`));
     }
-    if (constructorName === "Function") {
+    if (isGlobalRef(node.callee, "Function", env)) {
       const allArgIndices = argTaints.map((_, i) => i);
       checkSinkCall(node, { type: "XSS", taintedArgs: allArgIndices }, argTaints, "new Function()", env, ctx);
     }
-    if (constructorName === "Promise" && node.arguments[0]) {
+    if (isGlobalRef(node.callee, "Promise", env) && node.arguments[0]) {
       let callback = node.arguments[0];
       if (callback.type === "ArrowFunctionExpression" || callback.type === "FunctionExpression") {
         const childEnv = env.child();
@@ -45305,7 +45469,7 @@ ${rootStack}`;
         }
       }
     }
-    if (constructorName === "CustomEvent" && node.arguments.length >= 2) {
+    if (isGlobalRef(node.callee, "CustomEvent", env) && node.arguments.length >= 2) {
       const eventTypeNode = node.arguments[0];
       const optionsNode = node.arguments[1];
       if (eventTypeNode && (eventTypeNode.type === "StringLiteral" || eventTypeNode.type === "Literal" && typeof eventTypeNode.value === "string")) {
@@ -45557,8 +45721,14 @@ ${rootStack}`;
         const calleeObj = node.callee?.object;
         const protoMethod = calleeObj ? nodeToString(calleeObj) : null;
         if (protoMethod) {
-          const parts = protoMethod.split(".");
-          const method = parts[parts.length - 1];
+          let method;
+          if (calleeObj.type === "MemberExpression" || calleeObj.type === "OptionalMemberExpression") {
+            method = calleeObj.property?.name || calleeObj.property?.value;
+          } else if (calleeObj.type === "Identifier") {
+            method = calleeObj.name;
+          } else {
+            method = null;
+          }
           const result = handleBuiltinMethod(method, {
             ...node,
             callee: { ...node.callee, object: node.arguments?.[0] || node.callee.object }
@@ -45609,19 +45779,32 @@ ${rootStack}`;
           }
         }
         if (objTaint.tainted) return objTaint.clone();
-        if (getObjStr === "localStorage" || getObjStr === "sessionStorage") {
-          const loc = node.loc?.start || {};
-          return TaintSet.from(new TaintLabel(`storage.${getObjStr === "localStorage" ? "local" : "session"}`, ctx.file, loc.line || 0, loc.column || 0, `${getObjStr}.getItem()`));
+        if (node.callee?.object) {
+          const storageObj = node.callee.object;
+          if (isGlobalRef(storageObj, "localStorage", env)) {
+            const loc = node.loc?.start || {};
+            return TaintSet.from(new TaintLabel("storage.local", ctx.file, loc.line || 0, loc.column || 0, "localStorage.getItem()"));
+          }
+          if (isGlobalRef(storageObj, "sessionStorage", env)) {
+            const loc = node.loc?.start || {};
+            return TaintSet.from(new TaintLabel("storage.session", ctx.file, loc.line || 0, loc.column || 0, "sessionStorage.getItem()"));
+          }
         }
         const getCalleeStr = nodeToString(node.callee);
         if (getCalleeStr && ctx.funcMap.has(getCalleeStr)) return null;
         return TaintSet.empty();
       }
       case "getItem": {
-        const objStr = nodeToString(node.callee?.object);
-        if (objStr === "localStorage" || objStr === "sessionStorage") {
-          const loc = node.loc?.start || {};
-          return TaintSet.from(new TaintLabel(`storage.${objStr === "localStorage" ? "local" : "session"}`, ctx.file, loc.line || 0, loc.column || 0, `${objStr}.getItem()`));
+        if (node.callee?.object) {
+          const storageObj = node.callee.object;
+          if (isGlobalRef(storageObj, "localStorage", env)) {
+            const loc = node.loc?.start || {};
+            return TaintSet.from(new TaintLabel("storage.local", ctx.file, loc.line || 0, loc.column || 0, "localStorage.getItem()"));
+          }
+          if (isGlobalRef(storageObj, "sessionStorage", env)) {
+            const loc = node.loc?.start || {};
+            return TaintSet.from(new TaintLabel("storage.session", ctx.file, loc.line || 0, loc.column || 0, "sessionStorage.getItem()"));
+          }
         }
         return objTaint.clone();
       }
@@ -45647,8 +45830,12 @@ ${rootStack}`;
         const eventArg = node.arguments?.[0];
         if (eventArg) {
           const eventTaint = argTaints[0] || TaintSet.empty();
-          const eventStr = nodeToString(eventArg);
-          const eventType = eventStr && ctx._customEventTypes?.get(eventStr);
+          const eventStr = eventArg.type === "Identifier" ? eventArg.name : nodeToString(eventArg);
+          let eventType = eventStr && ctx._customEventTypes?.get(eventStr);
+          if (!eventType && eventArg.type === "Identifier") {
+            const resolvedKey = resolveId(eventArg, ctx);
+            eventType = ctx._customEventTypes?.get(resolvedKey);
+          }
           if (eventType && ctx.eventListeners.has(eventType)) {
             for (const { callback, env: listenerEnv } of ctx.eventListeners.get(eventType)) {
               if (callback.params[0]) {
@@ -45656,7 +45843,8 @@ ${rootStack}`;
                 const paramName = callback.params[0].type === "Identifier" ? callback.params[0].name : null;
                 if (paramName) {
                   assignToPattern(callback.params[0], eventTaint, childEnv, ctx);
-                  const detailTaint = env.get(eventStr ? `${eventStr}.detail` : "");
+                  const detailKey = eventStr ? `${eventStr}.detail` : "";
+                  const detailTaint = env.get(detailKey);
                   if (detailTaint.tainted) {
                     childEnv.set(`${paramName}.detail`, detailTaint);
                   }
@@ -45835,7 +46023,7 @@ ${rootStack}`;
       case "endsWith":
         return "weak";
       case "startsWith":
-        if (argVal && /^https?:\/\/[^/]+/.test(argVal)) return "strong";
+        if (argVal) return classifyOriginLiteral(argVal);
         return "weak";
       case "match":
         if (arg && (arg.type === "RegExpLiteral" || arg.regex)) {
@@ -45848,10 +46036,10 @@ ${rootStack}`;
   }
   function classifyOriginRegex(pattern) {
     if (!pattern) return "weak";
-    const hasStart = pattern.startsWith("^");
-    const hasEnd = pattern.endsWith("$");
+    const hasStart = pattern[0] === "^" || /^\(\?[^)]*\)\^/.test(pattern);
+    const hasEnd = pattern.length > 0 && pattern[pattern.length - 1] === "$" && (pattern.length < 2 || pattern[pattern.length - 2] !== "\\");
     if (hasStart && hasEnd) return "strong";
-    if (hasStart && /^(\^)https?:/.test(pattern)) return "strong";
+    if (hasStart && /^\^https?:/.test(pattern)) return "strong";
     return "weak";
   }
   function analyzeOriginValidator(funcNode, ctx) {
@@ -45867,8 +46055,8 @@ ${rootStack}`;
     if (!node || typeof node !== "object") return;
     const paramNames = (params || []).map((p) => p.type === "Identifier" ? p.name : null).filter(Boolean);
     if (node.type === "BinaryExpression" && (node.operator === "===" || node.operator === "==" || node.operator === "!==" || node.operator === "!=")) {
-      const l = nodeToString(node.left), r = nodeToString(node.right);
-      const paramSide = paramNames.includes(l) ? "left" : paramNames.includes(r) ? "right" : null;
+      const isParamRef = (n) => n.type === "Identifier" && paramNames.includes(n.name);
+      const paramSide = isParamRef(node.left) ? "left" : isParamRef(node.right) ? "right" : null;
       if (paramSide) {
         const otherNode = paramSide === "left" ? node.right : node.left;
         const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
@@ -45881,15 +46069,14 @@ ${rootStack}`;
       }
     }
     if (node.type === "CallExpression" && node.callee?.type === "MemberExpression") {
-      const objStr = nodeToString(node.callee.object);
       const method = node.callee.property?.name;
-      if (paramNames.includes(objStr) && method) {
+      if (node.callee.object?.type === "Identifier" && paramNames.includes(node.callee.object.name) && method) {
         checks.push(classifyOriginMethod(method, node));
         return;
       }
       if ((method === "includes" || method === "has") && node.arguments?.[0]) {
-        const argStr = nodeToString(node.arguments[0]);
-        if (paramNames.includes(argStr)) {
+        const argNode = node.arguments[0];
+        if (argNode.type === "Identifier" && paramNames.includes(argNode.name)) {
           checks.push("strong");
           return;
         }
@@ -46007,14 +46194,18 @@ ${rootStack}`;
     }
     if (innerCtx.returnedFuncNode) ctx.returnedFuncNode = innerCtx.returnedFuncNode;
     if (innerCtx.returnedMethods) ctx.returnedMethods = innerCtx.returnedMethods;
+    const GLOBAL_OBJ_PREFIXES = ["window.", "self.", "globalThis."];
     for (const [key, val] of innerCtx.funcMap) {
-      if (key.endsWith("[]") && !ctx.funcMap.has(key)) {
+      if (key.length > 2 && key[key.length - 1] === "]" && key[key.length - 2] === "[" && !ctx.funcMap.has(key)) {
         ctx.funcMap.set(key, val);
       }
-      if (key.startsWith("window.") && !ctx.funcMap.has(key)) {
-        ctx.funcMap.set(key, val);
-        const stripped = key.slice(7);
-        if (stripped && !ctx.funcMap.has(stripped)) ctx.funcMap.set(stripped, val);
+      for (const prefix of GLOBAL_OBJ_PREFIXES) {
+        if (key.length > prefix.length && key.slice(0, prefix.length) === prefix && !ctx.funcMap.has(key)) {
+          ctx.funcMap.set(key, val);
+          const stripped = key.slice(prefix.length);
+          if (stripped && !ctx.funcMap.has(stripped)) ctx.funcMap.set(stripped, val);
+          break;
+        }
       }
     }
     return innerCtx.returnTaint;
@@ -46235,7 +46426,7 @@ ${rootStack}`;
       }
     }
     for (const [key, taint] of childEnv.bindings) {
-      if (taint.tainted && key.includes(".") && !key.startsWith("this.") && !key.startsWith("global:")) {
+      if (taint.tainted && key.indexOf(".") !== -1 && key.slice(0, 5) !== "this." && key.slice(0, 7) !== "global:" && !(key[0] >= "0" && key[0] <= "9")) {
         env.set(key, taint);
       }
     }
@@ -46305,7 +46496,7 @@ ${rootStack}`;
       }
     }
   }
-  function classifyNavigationType(sinkInfo, env, rhsNode) {
+  function classifyNavigationType(sinkInfo, env, rhsNode, ctx) {
     if (!sinkInfo.navigation) return sinkInfo.type;
     if (rhsNode) {
       const varName = nodeToString(rhsNode);
@@ -46315,9 +46506,12 @@ ${rootStack}`;
         if (objName && env.schemeCheckedVars.has(objName)) return "Open Redirect";
       }
       if (rhsNode.type === "Identifier") {
-        for (const checked of env.schemeCheckedVars) {
-          if (checked === rhsNode.name || checked.endsWith(":" + rhsNode.name)) return "Open Redirect";
+        if (env.schemeCheckedVars.has(rhsNode.name)) return "Open Redirect";
+        if (ctx) {
+          const resolvedKey = resolveId(rhsNode, ctx);
+          if (env.schemeCheckedVars.has(resolvedKey)) return "Open Redirect";
         }
+        if (env.schemeCheckedVars.has(`global:${rhsNode.name}`)) return "Open Redirect";
       }
     }
     return sinkInfo.type;
@@ -46347,7 +46541,7 @@ ${rootStack}`;
     const propName = leftNode.type === "MemberExpression" ? leftNode.property?.name : null;
     const sinkInfo = checkAssignmentSink(leftStr, propName);
     if (!sinkInfo) return;
-    const type = classifyNavigationType(sinkInfo, env, rhsNode);
+    const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
     const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
     const loc = leftNode.loc?.start || {};
     ctx.findings.push({
@@ -46367,7 +46561,7 @@ ${rootStack}`;
         const argNode = callNode.arguments[argIdx];
         if (argNode.type === "ArrowFunctionExpression" || argNode.type === "FunctionExpression") continue;
       }
-      const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx]);
+      const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
       const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
       const loc = callNode.loc?.start || {};
       ctx.findings.push({
@@ -47127,12 +47321,19 @@ ${rootStack}`;
       }
     }
   }
+  function isOriginMemberAccess(node) {
+    if (!node) return false;
+    if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
+      if (!node.computed && node.property?.name === "origin") return true;
+      if (node.computed && node.property?.type === "StringLiteral" && node.property.value === "origin") return true;
+      if (node.computed && node.property?.type === "Literal" && node.property.value === "origin") return true;
+    }
+    return false;
+  }
   function containsOriginCheck(node) {
     if (!node || typeof node !== "object") return false;
     if (node.type === "BinaryExpression" && (node.operator === "===" || node.operator === "==" || node.operator === "!==" || node.operator === "!=")) {
-      const leftStr = nodeToString(node.left);
-      const rightStr = nodeToString(node.right);
-      if (leftStr && leftStr.endsWith(".origin") || rightStr && rightStr.endsWith(".origin")) {
+      if (isOriginMemberAccess(node.left) || isOriginMemberAccess(node.right)) {
         return true;
       }
     }
