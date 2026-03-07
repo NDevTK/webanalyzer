@@ -47624,7 +47624,6 @@ ${rootStack}`;
     const env = isModule ? importEnv : pageCtx.globalEnv.child();
     const cfg = buildCFG(ast.program);
     const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker);
-    scanPrototypePollution(ast, env, file, findings, scopeInfo);
     if (!isModule) {
       pageCtx.globalEnv.replaceFrom(env);
     }
@@ -47635,14 +47634,6 @@ ${rootStack}`;
       storeExportTaint(ast, env, file, pageCtx);
     }
     return findings;
-  }
-  function scanPrototypePollution(ast, env, file, findings, scopeInfo) {
-    const ctx = { file, funcMap: /* @__PURE__ */ new Map(), findings, callDepth: 0, maxCallDepth: 0, globalEnv: env, scopeInfo: scopeInfo || null, returnTaint: TaintSet.empty(), analyzedCalls: /* @__PURE__ */ new Map(), scriptElements: /* @__PURE__ */ new Set(), eventListeners: /* @__PURE__ */ new Map(), classBodyMap: /* @__PURE__ */ new Map(), superClassMap: /* @__PURE__ */ new Map(), protoMethodMap: /* @__PURE__ */ new Map(), generatorTaint: /* @__PURE__ */ new Map(), thrownTaint: TaintSet.empty(), returnedFuncNode: null, returnedMethods: null, returnElementTaints: null, returnPropertyTaints: null, isWorker: false };
-    walkAST(ast.program, (node) => {
-      if (node.type === "AssignmentExpression") {
-        checkPrototypePollution(node, env, ctx);
-      }
-    });
   }
   function storeExportTaint(ast, env, file, pageCtx) {
     const exportInfo = extractExports(ast);
@@ -47693,7 +47684,6 @@ ${rootStack}`;
       if (!hasNewTaint) continue;
       const funcMap = new Map(page.globalFuncMap);
       const env = importEnv;
-      setupMessageHandlerTaint(ast, env, url);
       let scopeInfo = null;
       try {
         scopeInfo = buildScopeInfo(ast);
@@ -47731,7 +47721,6 @@ ${rootStack}`;
       const funcMap = new Map(page.globalFuncMap);
       extractGlobalDeclarations(ast, funcMap, script.url);
       const env = globalEnv.child();
-      setupMessageHandlerTaint(ast, env, script.url);
       let scopeInfo = null;
       try {
         scopeInfo = buildScopeInfo(ast);
@@ -47834,23 +47823,6 @@ ${rootStack}`;
   }
   function decodeHTMLEntities(str) {
     return str.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x27;/g, "'").replace(/&#x2F;/g, "/").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10))).replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16)));
-  }
-  function walkAST(node, visitor) {
-    if (!node || typeof node !== "object") return;
-    if (node.type) visitor(node);
-    for (const key of Object.keys(node)) {
-      if (key === "loc" || key === "start" || key === "end" || key === "leadingComments" || key === "trailingComments" || key === "innerComments" || key === "_closureEnv") continue;
-      const child = node[key];
-      if (Array.isArray(child)) {
-        for (const item of child) {
-          if (item && typeof item === "object" && item.type) {
-            walkAST(item, visitor);
-          }
-        }
-      } else if (child && typeof child === "object" && child.type) {
-        walkAST(child, visitor);
-      }
-    }
   }
   function deduplicateFindings(findings) {
     const seen = /* @__PURE__ */ new Set();

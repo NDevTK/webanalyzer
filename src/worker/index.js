@@ -4,7 +4,7 @@
 
 import { parse } from '@babel/parser';
 import { buildCFG } from './cfg.js';
-import { analyzeCFG, TaintEnv, TaintSet, checkPrototypePollution } from './taint.js';
+import { analyzeCFG, TaintEnv } from './taint.js';
 import {
   ModuleGraph, extractImports, extractExports,
   extractGlobalDeclarations, resolveImportTaint, checkPostMessageHandler,
@@ -185,12 +185,10 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
   const cfg = buildCFG(ast.program);
 
   // 6. Run taint analysis with scope info (isWorker suppresses message handler taint)
+  // checkPrototypePollution is called inline during CFG analysis (taint.js:1178)
   const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker);
 
-  // 8. Check for prototype pollution patterns
-  scanPrototypePollution(ast, env, file, findings, scopeInfo);
-
-  // 9. For non-module scripts, propagate final env back to global
+  // 7. For non-module scripts, propagate final env back to global
   if (!isModule) {
     pageCtx.globalEnv.replaceFrom(env);
   }
@@ -209,15 +207,6 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
 }
 
 
-// ── Scan for prototype pollution ──
-function scanPrototypePollution(ast, env, file, findings, scopeInfo) {
-  const ctx = { file, funcMap: new Map(), findings, callDepth: 0, maxCallDepth: 0, globalEnv: env, scopeInfo: scopeInfo || null, returnTaint: TaintSet.empty(), analyzedCalls: new Map(), scriptElements: new Set(), eventListeners: new Map(), classBodyMap: new Map(), superClassMap: new Map(), protoMethodMap: new Map(), generatorTaint: new Map(), thrownTaint: TaintSet.empty(), returnedFuncNode: null, returnedMethods: null, returnElementTaints: null, returnPropertyTaints: null, isWorker: false };
-  walkAST(ast.program, (node) => {
-    if (node.type === 'AssignmentExpression') {
-      checkPrototypePollution(node, env, ctx);
-    }
-  });
-}
 
 // ── Store module export taint for cross-file resolution ──
 function storeExportTaint(ast, env, file, pageCtx) {
@@ -272,7 +261,6 @@ async function runCrossFileAnalysis(tabId) {
 
     const funcMap = new Map(page.globalFuncMap);
     const env = importEnv;
-    setupMessageHandlerTaint(ast, env, url);
 
     let scopeInfo = null;
     try { scopeInfo = buildScopeInfo(ast); } catch {}
@@ -308,7 +296,6 @@ async function runCrossFileAnalysis(tabId) {
     extractGlobalDeclarations(ast, funcMap, script.url);
 
     const env = globalEnv.child();
-    setupMessageHandlerTaint(ast, env, script.url);
 
     let scopeInfo = null;
     try { scopeInfo = buildScopeInfo(ast); } catch {}
@@ -436,29 +423,6 @@ function decodeHTMLEntities(str) {
 }
 
 // ── Utilities ──
-
-function walkAST(node, visitor) {
-  if (!node || typeof node !== 'object') return;
-  if (node.type) visitor(node);
-
-  for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end' ||
-        key === 'leadingComments' || key === 'trailingComments' ||
-        key === 'innerComments' || key === '_closureEnv') continue;
-
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        if (item && typeof item === 'object' && item.type) {
-          walkAST(item, visitor);
-        }
-      }
-    } else if (child && typeof child === 'object' && child.type) {
-      walkAST(child, visitor);
-    }
-  }
-}
-
 
 function deduplicateFindings(findings) {
   const seen = new Set();
