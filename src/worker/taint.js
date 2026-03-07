@@ -1648,6 +1648,8 @@ function propagateThisToInstance(instanceName, env, ctx) {
 
 // ── Evaluate an expression, returning its TaintSet ──
 export function evaluateExpr(node, env, ctx) {
+  // Outer loop converts tail-recursive calls into iteration
+  for (;;) {
   if (!node) return TaintSet.empty();
 
   switch (node.type) {
@@ -1679,7 +1681,7 @@ export function evaluateExpr(node, env, ctx) {
 
     case 'AssignmentExpression':
       processAssignment(node, env, ctx);
-      return evaluateExpr(node.left, env, ctx);
+      node = node.left; continue;
 
     case 'BinaryExpression': {
       // Flatten left-recursive chains to avoid stack overflow: a + b + c → [a, b, c]
@@ -1775,7 +1777,7 @@ export function evaluateExpr(node, env, ctx) {
         evaluateExpr(node.argument, env, ctx); // evaluate for side effects
         return TaintSet.empty();
       }
-      return evaluateExpr(node.argument, env, ctx);
+      node = node.argument; continue;
 
     case 'UpdateExpression':
       return TaintSet.empty();
@@ -1859,9 +1861,9 @@ export function evaluateExpr(node, env, ctx) {
     }
 
     case 'SequenceExpression': {
-      let r = TaintSet.empty();
-      for (const expr of node.expressions) r = evaluateExpr(expr, env, ctx);
-      return r;
+      const exprs = node.expressions;
+      for (let i = 0; i < exprs.length - 1; i++) evaluateExpr(exprs[i], env, ctx);
+      node = exprs[exprs.length - 1]; continue;
     }
 
     case 'ObjectExpression': {
@@ -1880,7 +1882,7 @@ export function evaluateExpr(node, env, ctx) {
     }
 
     case 'SpreadElement':
-      return evaluateExpr(node.argument, env, ctx);
+      node = node.argument; continue;
 
     case 'ArrowFunctionExpression':
     case 'FunctionExpression':
@@ -1888,7 +1890,7 @@ export function evaluateExpr(node, env, ctx) {
       return TaintSet.empty();
 
     case 'AwaitExpression':
-      return evaluateExpr(node.argument, env, ctx);
+      node = node.argument; continue;
 
     case 'ImportExpression': {
       // import(source) — tainted module specifier is a code injection risk
@@ -1915,7 +1917,7 @@ export function evaluateExpr(node, env, ctx) {
 
     case 'ChainExpression':
     case 'ParenthesizedExpression':
-      return evaluateExpr(node.expression, env, ctx);
+      node = node.expression; continue;
 
     case 'StringLiteral':
     case 'NumericLiteral':
@@ -1932,6 +1934,7 @@ export function evaluateExpr(node, env, ctx) {
     default:
       return TaintSet.empty();
   }
+  } // end for(;;)
 }
 
 // ── Member expression ──
