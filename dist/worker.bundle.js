@@ -45118,234 +45118,242 @@ ${rootStack}`;
     for (const [k, f] of constructorFuncs) ctx.funcMap.set(k, f);
   }
   function evaluateExpr(node, env, ctx) {
-    if (!node) return TaintSet.empty();
-    switch (node.type) {
-      case "Identifier": {
-        const key = resolveId(node, ctx);
-        const taint = env.get(key);
-        if (taint.tainted) return taint.clone();
-        if (key !== node.name && env.has(key)) return TaintSet.empty();
-        const globalTaint = env.get(`global:${node.name}`);
-        if (globalTaint.tainted) return globalTaint.clone();
-        return TaintSet.empty();
-      }
-      case "MemberExpression":
-      case "OptionalMemberExpression":
-        return evaluateMemberExpr(node, env, ctx);
-      case "CallExpression":
-      case "OptionalCallExpression":
-        return evaluateCallExpr(node, env, ctx);
-      case "NewExpression":
-        return evaluateNewExpr(node, env, ctx);
-      case "AssignmentExpression":
-        processAssignment(node, env, ctx);
-        return evaluateExpr(node.left, env, ctx);
-      case "BinaryExpression": {
-        const parts = [];
-        let bn = node;
-        while (bn.type === "BinaryExpression") {
-          parts.push({ op: bn.operator, right: bn.right });
-          bn = bn.left;
-        }
-        let result = evaluateExpr(bn, env, ctx);
-        for (let i = parts.length - 1; i >= 0; i--) {
-          const { op, right } = parts[i];
-          if (op === "===" || op === "==" || op === "!==" || op === "!=" || op === ">" || op === "<" || op === ">=" || op === "<=" || op === "instanceof" || op === "in") {
-            evaluateExpr(right, env, ctx);
-            return TaintSet.empty();
-          }
-          if (op === "-" || op === "*" || op === "/" || op === "%" || op === "**" || op === "|" || op === "&" || op === "^" || op === "<<" || op === ">>" || op === ">>>") {
-            evaluateExpr(right, env, ctx);
-            return TaintSet.empty();
-          }
-          const rightT = evaluateExpr(right, env, ctx);
-          if (op === "+") {
-            result = result.clone().merge(rightT);
-            const leftNode = i === parts.length - 1 ? bn : parts[i + 1].right;
-            for (const operand of [leftNode, right]) {
-              if (operand.type === "Identifier" && !result.tainted) {
-                const objName = operand.name;
-                const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
-                if (toStringFunc && toStringFunc.body) {
-                  const synthCall = { type: "CallExpression", callee: operand, arguments: [], loc: operand.loc };
-                  const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
-                  result = result.merge(toStringTaint);
-                }
-              }
-            }
-          } else {
-            result = result.clone().merge(rightT);
-          }
-        }
-        return result;
-      }
-      case "LogicalExpression": {
-        const parts = [];
-        let ln = node;
-        while (ln.type === "LogicalExpression") {
-          parts.push({ op: ln.operator, right: ln.right });
-          ln = ln.left;
-        }
-        let result = evaluateExpr(ln, env, ctx);
-        for (let i = parts.length - 1; i >= 0; i--) {
-          const { op, right } = parts[i];
-          if (op === "&&") {
-            const constLeft = isConstantBool(ln, ctx);
-            if (constLeft === false) return TaintSet.empty();
-            result = result.clone().merge(evaluateExpr(right, env, ctx));
-          } else if (op === "||") {
-            const constLeft = isConstantBool(ln, ctx);
-            if (constLeft === true) {
-            } else result = result.clone().merge(evaluateExpr(right, env, ctx));
-          } else if (op === "??") {
-            const isNullish = ln.type === "NullLiteral" || ln.type === "Literal" && ln.value === null || ln.type === "Identifier" && ln.name === "undefined";
-            if (isNullish) {
-              result = evaluateExpr(right, env, ctx);
-            } else {
-              const isNonNullishConst = ln.type === "StringLiteral" || ln.type === "NumericLiteral" || ln.type === "BooleanLiteral" || ln.type === "Literal" && ln.value !== null && ln.value !== void 0 || ln.type === "ObjectExpression" || ln.type === "ArrayExpression";
-              if (!isNonNullishConst) result = result.clone().merge(evaluateExpr(right, env, ctx));
-            }
-          }
-          ln = parts[i].right;
-        }
-        return result;
-      }
-      case "UnaryExpression":
-        if (node.operator === "!" || node.operator === "typeof" || node.operator === "+" || node.operator === "-" || node.operator === "~" || node.operator === "void" || node.operator === "delete") {
-          evaluateExpr(node.argument, env, ctx);
+    for (; ; ) {
+      if (!node) return TaintSet.empty();
+      switch (node.type) {
+        case "Identifier": {
+          const key = resolveId(node, ctx);
+          const taint = env.get(key);
+          if (taint.tainted) return taint.clone();
+          if (key !== node.name && env.has(key)) return TaintSet.empty();
+          const globalTaint = env.get(`global:${node.name}`);
+          if (globalTaint.tainted) return globalTaint.clone();
           return TaintSet.empty();
         }
-        return evaluateExpr(node.argument, env, ctx);
-      case "UpdateExpression":
-        return TaintSet.empty();
-      case "ConditionalExpression": {
-        let result = TaintSet.empty();
-        let cn = node;
-        while (cn.type === "ConditionalExpression") {
-          evaluateExpr(cn.test, env, ctx);
-          const constCond = isConstantBool(cn.test);
-          if (constCond === true) {
-            const branch = cn.consequent;
-            result = evaluateExpr(branch, env, ctx);
-            if (!ctx.returnedFuncNode && branch.type === "Identifier") {
-              const refKey = resolveId(branch, ctx);
-              const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+        case "MemberExpression":
+        case "OptionalMemberExpression":
+          return evaluateMemberExpr(node, env, ctx);
+        case "CallExpression":
+        case "OptionalCallExpression":
+          return evaluateCallExpr(node, env, ctx);
+        case "NewExpression":
+          return evaluateNewExpr(node, env, ctx);
+        case "AssignmentExpression":
+          processAssignment(node, env, ctx);
+          node = node.left;
+          continue;
+        case "BinaryExpression": {
+          const parts = [];
+          let bn = node;
+          while (bn.type === "BinaryExpression") {
+            parts.push({ op: bn.operator, right: bn.right });
+            bn = bn.left;
+          }
+          let result = evaluateExpr(bn, env, ctx);
+          for (let i = parts.length - 1; i >= 0; i--) {
+            const { op, right } = parts[i];
+            if (op === "===" || op === "==" || op === "!==" || op === "!=" || op === ">" || op === "<" || op === ">=" || op === "<=" || op === "instanceof" || op === "in") {
+              evaluateExpr(right, env, ctx);
+              return TaintSet.empty();
+            }
+            if (op === "-" || op === "*" || op === "/" || op === "%" || op === "**" || op === "|" || op === "&" || op === "^" || op === "<<" || op === ">>" || op === ">>>") {
+              evaluateExpr(right, env, ctx);
+              return TaintSet.empty();
+            }
+            const rightT = evaluateExpr(right, env, ctx);
+            if (op === "+") {
+              result = result.clone().merge(rightT);
+              const leftNode = i === parts.length - 1 ? bn : parts[i + 1].right;
+              for (const operand of [leftNode, right]) {
+                if (operand.type === "Identifier" && !result.tainted) {
+                  const objName = operand.name;
+                  const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
+                  if (toStringFunc && toStringFunc.body) {
+                    const synthCall = { type: "CallExpression", callee: operand, arguments: [], loc: operand.loc };
+                    const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
+                    result = result.merge(toStringTaint);
+                  }
+                }
+              }
+            } else {
+              result = result.clone().merge(rightT);
+            }
+          }
+          return result;
+        }
+        case "LogicalExpression": {
+          const parts = [];
+          let ln = node;
+          while (ln.type === "LogicalExpression") {
+            parts.push({ op: ln.operator, right: ln.right });
+            ln = ln.left;
+          }
+          let result = evaluateExpr(ln, env, ctx);
+          for (let i = parts.length - 1; i >= 0; i--) {
+            const { op, right } = parts[i];
+            if (op === "&&") {
+              const constLeft = isConstantBool(ln, ctx);
+              if (constLeft === false) return TaintSet.empty();
+              result = result.clone().merge(evaluateExpr(right, env, ctx));
+            } else if (op === "||") {
+              const constLeft = isConstantBool(ln, ctx);
+              if (constLeft === true) {
+              } else result = result.clone().merge(evaluateExpr(right, env, ctx));
+            } else if (op === "??") {
+              const isNullish = ln.type === "NullLiteral" || ln.type === "Literal" && ln.value === null || ln.type === "Identifier" && ln.name === "undefined";
+              if (isNullish) {
+                result = evaluateExpr(right, env, ctx);
+              } else {
+                const isNonNullishConst = ln.type === "StringLiteral" || ln.type === "NumericLiteral" || ln.type === "BooleanLiteral" || ln.type === "Literal" && ln.value !== null && ln.value !== void 0 || ln.type === "ObjectExpression" || ln.type === "ArrayExpression";
+                if (!isNonNullishConst) result = result.clone().merge(evaluateExpr(right, env, ctx));
+              }
+            }
+            ln = parts[i].right;
+          }
+          return result;
+        }
+        case "UnaryExpression":
+          if (node.operator === "!" || node.operator === "typeof" || node.operator === "+" || node.operator === "-" || node.operator === "~" || node.operator === "void" || node.operator === "delete") {
+            evaluateExpr(node.argument, env, ctx);
+            return TaintSet.empty();
+          }
+          node = node.argument;
+          continue;
+        case "UpdateExpression":
+          return TaintSet.empty();
+        case "ConditionalExpression": {
+          let result = TaintSet.empty();
+          let cn = node;
+          while (cn.type === "ConditionalExpression") {
+            evaluateExpr(cn.test, env, ctx);
+            const constCond = isConstantBool(cn.test);
+            if (constCond === true) {
+              const branch = cn.consequent;
+              result = evaluateExpr(branch, env, ctx);
+              if (!ctx.returnedFuncNode && branch.type === "Identifier") {
+                const refKey = resolveId(branch, ctx);
+                const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
+                if (funcRef) ctx.returnedFuncNode = funcRef;
+              }
+              return result;
+            }
+            if (constCond === false) {
+              cn = cn.alternate;
+              continue;
+            }
+            const checkedVar = extractSchemeCheck(cn.test, true);
+            const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
+            if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
+            const consequentTaint = evaluateExpr(cn.consequent, env, ctx);
+            if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
+            result = result.merge(consequentTaint);
+            if (!ctx.returnedFuncNode && cn.consequent.type === "Identifier") {
+              const refKey = resolveId(cn.consequent, ctx);
+              const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.consequent.name);
               if (funcRef) ctx.returnedFuncNode = funcRef;
             }
-            return result;
-          }
-          if (constCond === false) {
             cn = cn.alternate;
-            continue;
           }
-          const checkedVar = extractSchemeCheck(cn.test, true);
-          const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
-          if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
-          const consequentTaint = evaluateExpr(cn.consequent, env, ctx);
-          if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
-          result = result.merge(consequentTaint);
-          if (!ctx.returnedFuncNode && cn.consequent.type === "Identifier") {
-            const refKey = resolveId(cn.consequent, ctx);
-            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.consequent.name);
+          const altTaint = evaluateExpr(cn, env, ctx);
+          if (!ctx.returnedFuncNode && cn.type === "Identifier") {
+            const refKey = resolveId(cn, ctx);
+            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.name);
             if (funcRef) ctx.returnedFuncNode = funcRef;
           }
-          cn = cn.alternate;
+          return result.merge(altTaint);
         }
-        const altTaint = evaluateExpr(cn, env, ctx);
-        if (!ctx.returnedFuncNode && cn.type === "Identifier") {
-          const refKey = resolveId(cn, ctx);
-          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.name);
-          if (funcRef) ctx.returnedFuncNode = funcRef;
+        case "TemplateLiteral": {
+          const t = TaintSet.empty();
+          for (const expr of node.expressions) t.merge(evaluateExpr(expr, env, ctx));
+          return t;
         }
-        return result.merge(altTaint);
-      }
-      case "TemplateLiteral": {
-        const t = TaintSet.empty();
-        for (const expr of node.expressions) t.merge(evaluateExpr(expr, env, ctx));
-        return t;
-      }
-      case "TaggedTemplateExpression": {
-        const exprTaints = node.quasi.expressions.map((e) => evaluateExpr(e, env, ctx));
-        const stringsArg = TaintSet.empty();
-        const allArgTaints = [stringsArg, ...exprTaints];
-        const tagCallee = node.tag;
-        let funcNode = null;
-        if (tagCallee.type === "Identifier") {
-          funcNode = ctx.funcMap.get(resolveId(tagCallee, ctx)) || ctx.funcMap.get(tagCallee.name);
-        } else if (tagCallee.type === "MemberExpression") {
-          const tagStr = nodeToString(tagCallee);
-          if (tagStr) funcNode = ctx.funcMap.get(tagStr);
-        }
-        if (funcNode && funcNode.body) {
-          const synthCall = { type: "CallExpression", callee: tagCallee, arguments: [{ type: "ArrayExpression", elements: [] }, ...node.quasi.expressions] };
-          const tagCalleeStr = nodeToString(tagCallee);
-          if (isSanitizer(tagCalleeStr, "")) return TaintSet.empty();
-          return analyzeCalledFunction(synthCall, tagCalleeStr, allArgTaints, env, ctx);
-        }
-        const t = TaintSet.empty();
-        for (const et of exprTaints) t.merge(et);
-        return t;
-      }
-      case "SequenceExpression": {
-        let r = TaintSet.empty();
-        for (const expr of node.expressions) r = evaluateExpr(expr, env, ctx);
-        return r;
-      }
-      case "ObjectExpression": {
-        const t = TaintSet.empty();
-        for (const prop of node.properties) {
-          if (prop.type === "SpreadElement") t.merge(evaluateExpr(prop.argument, env, ctx));
-          else if (prop.type === "ObjectProperty" || prop.type === "Property") t.merge(evaluateExpr(prop.value, env, ctx));
-        }
-        return t;
-      }
-      case "ArrayExpression": {
-        const t = TaintSet.empty();
-        for (const elem of node.elements) if (elem) t.merge(evaluateExpr(elem, env, ctx));
-        return t;
-      }
-      case "SpreadElement":
-        return evaluateExpr(node.argument, env, ctx);
-      case "ArrowFunctionExpression":
-      case "FunctionExpression":
-        node._closureEnv = env;
-        return TaintSet.empty();
-      case "AwaitExpression":
-        return evaluateExpr(node.argument, env, ctx);
-      case "ImportExpression": {
-        const specifierTaint = evaluateExpr(node.source, env, ctx);
-        if (specifierTaint.tainted) {
-          for (const label of specifierTaint.labels) {
-            ctx.findings.push({
-              type: "XSS",
-              description: `XSS: tainted data flows to dynamic import()`,
-              location: { file: ctx.file, line: node.loc?.start?.line || 0, column: node.loc?.start?.column || 0 },
-              source: label
-            });
+        case "TaggedTemplateExpression": {
+          const exprTaints = node.quasi.expressions.map((e) => evaluateExpr(e, env, ctx));
+          const stringsArg = TaintSet.empty();
+          const allArgTaints = [stringsArg, ...exprTaints];
+          const tagCallee = node.tag;
+          let funcNode = null;
+          if (tagCallee.type === "Identifier") {
+            funcNode = ctx.funcMap.get(resolveId(tagCallee, ctx)) || ctx.funcMap.get(tagCallee.name);
+          } else if (tagCallee.type === "MemberExpression") {
+            const tagStr = nodeToString(tagCallee);
+            if (tagStr) funcNode = ctx.funcMap.get(tagStr);
           }
+          if (funcNode && funcNode.body) {
+            const synthCall = { type: "CallExpression", callee: tagCallee, arguments: [{ type: "ArrayExpression", elements: [] }, ...node.quasi.expressions] };
+            const tagCalleeStr = nodeToString(tagCallee);
+            if (isSanitizer(tagCalleeStr, "")) return TaintSet.empty();
+            return analyzeCalledFunction(synthCall, tagCalleeStr, allArgTaints, env, ctx);
+          }
+          const t = TaintSet.empty();
+          for (const et of exprTaints) t.merge(et);
+          return t;
         }
-        return TaintSet.empty();
+        case "SequenceExpression": {
+          const exprs = node.expressions;
+          for (let i = 0; i < exprs.length - 1; i++) evaluateExpr(exprs[i], env, ctx);
+          node = exprs[exprs.length - 1];
+          continue;
+        }
+        case "ObjectExpression": {
+          const t = TaintSet.empty();
+          for (const prop of node.properties) {
+            if (prop.type === "SpreadElement") t.merge(evaluateExpr(prop.argument, env, ctx));
+            else if (prop.type === "ObjectProperty" || prop.type === "Property") t.merge(evaluateExpr(prop.value, env, ctx));
+          }
+          return t;
+        }
+        case "ArrayExpression": {
+          const t = TaintSet.empty();
+          for (const elem of node.elements) if (elem) t.merge(evaluateExpr(elem, env, ctx));
+          return t;
+        }
+        case "SpreadElement":
+          node = node.argument;
+          continue;
+        case "ArrowFunctionExpression":
+        case "FunctionExpression":
+          node._closureEnv = env;
+          return TaintSet.empty();
+        case "AwaitExpression":
+          node = node.argument;
+          continue;
+        case "ImportExpression": {
+          const specifierTaint = evaluateExpr(node.source, env, ctx);
+          if (specifierTaint.tainted) {
+            for (const label of specifierTaint.labels) {
+              ctx.findings.push({
+                type: "XSS",
+                description: `XSS: tainted data flows to dynamic import()`,
+                location: { file: ctx.file, line: node.loc?.start?.line || 0, column: node.loc?.start?.column || 0 },
+                source: label
+              });
+            }
+          }
+          return TaintSet.empty();
+        }
+        case "YieldExpression": {
+          const yieldTaint = node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
+          if (yieldTaint.tainted) ctx.returnTaint.merge(yieldTaint);
+          return yieldTaint;
+        }
+        case "ChainExpression":
+        case "ParenthesizedExpression":
+          node = node.expression;
+          continue;
+        case "StringLiteral":
+        case "NumericLiteral":
+        case "BooleanLiteral":
+        case "NullLiteral":
+        case "BigIntLiteral":
+        case "RegExpLiteral":
+        case "Literal":
+          return TaintSet.empty();
+        case "ThisExpression":
+          return env.get("this");
+        default:
+          return TaintSet.empty();
       }
-      case "YieldExpression": {
-        const yieldTaint = node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
-        if (yieldTaint.tainted) ctx.returnTaint.merge(yieldTaint);
-        return yieldTaint;
-      }
-      case "ChainExpression":
-      case "ParenthesizedExpression":
-        return evaluateExpr(node.expression, env, ctx);
-      case "StringLiteral":
-      case "NumericLiteral":
-      case "BooleanLiteral":
-      case "NullLiteral":
-      case "BigIntLiteral":
-      case "RegExpLiteral":
-      case "Literal":
-        return TaintSet.empty();
-      case "ThisExpression":
-        return env.get("this");
-      default:
-        return TaintSet.empty();
     }
   }
   function evaluateMemberExpr(node, env, ctx) {
