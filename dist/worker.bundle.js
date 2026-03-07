@@ -43842,6 +43842,7 @@ ${rootStack}`;
       this.scriptElements = /* @__PURE__ */ new Set();
       this.thrownTaint = TaintSet.empty();
       this.generatorTaint = /* @__PURE__ */ new Map();
+      this.eventListeners = /* @__PURE__ */ new Map();
     }
   };
   function resolveId(node, ctx) {
@@ -44283,6 +44284,16 @@ ${rootStack}`;
       assignToPattern(node.id, taint, env, ctx);
     }
     registerReturnedFunctions(node.id, ctx);
+    if (ctx._pendingCustomEventType && node.id.type === "Identifier") {
+      const evName = node.id.name;
+      if (!ctx._customEventTypes) ctx._customEventTypes = /* @__PURE__ */ new Map();
+      ctx._customEventTypes.set(evName, ctx._pendingCustomEventType);
+      if (ctx._pendingCustomEventDetailTaint) {
+        env.set(`${evName}.detail`, ctx._pendingCustomEventDetailTaint);
+        ctx._pendingCustomEventDetailTaint = null;
+      }
+      ctx._pendingCustomEventType = null;
+    }
     if (node.id.type === "Identifier" && node.init.type === "Identifier") {
       const ALIASABLE_GLOBALS = /* @__PURE__ */ new Set(["location", "document", "window", "self", "globalThis", "navigator", "top", "parent"]);
       const initName = node.init.name;
@@ -44338,6 +44349,18 @@ ${rootStack}`;
     }
     assignToPattern(node.left, finalTaint, env, ctx);
     registerReturnedFunctions(node.left, ctx);
+    if (ctx._pendingCustomEventType) {
+      const evName = nodeToString(node.left) || (node.left.type === "Identifier" ? node.left.name : null);
+      if (evName) {
+        if (!ctx._customEventTypes) ctx._customEventTypes = /* @__PURE__ */ new Map();
+        ctx._customEventTypes.set(evName, ctx._pendingCustomEventType);
+        if (ctx._pendingCustomEventDetailTaint) {
+          env.set(`${evName}.detail`, ctx._pendingCustomEventDetailTaint);
+          ctx._pendingCustomEventDetailTaint = null;
+        }
+      }
+      ctx._pendingCustomEventType = null;
+    }
     if (node.operator === "=" && (node.right.type === "FunctionExpression" || node.right.type === "ArrowFunctionExpression")) {
       node.right._closureEnv = env;
       const leftStr = nodeToString(node.left);
@@ -44824,7 +44847,7 @@ ${rootStack}`;
         }
       }
     }
-    if ((calleeStr === "setTimeout" || calleeStr === "setInterval") && node.arguments[0]) {
+    if ((calleeStr === "setTimeout" || calleeStr === "setInterval" || calleeStr === "queueMicrotask" || calleeStr === "requestAnimationFrame") && node.arguments[0]) {
       let callback = node.arguments[0];
       if (callback.type === "Identifier") {
         const refKey = resolveId(callback, ctx);
@@ -44870,6 +44893,26 @@ ${rootStack}`;
         }
       }
       return TaintSet.empty();
+    }
+    if (calleeStr === "Object.create" && node.arguments.length >= 2) {
+      const descMapNode = node.arguments[1];
+      if (descMapNode && descMapNode.type === "ObjectExpression") {
+        const resultTaint = TaintSet.empty();
+        for (const prop of descMapNode.properties) {
+          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key && prop.value) {
+            const propName = prop.key.name || prop.key.value;
+            if (propName && prop.value.type === "ObjectExpression") {
+              for (const descProp of prop.value.properties) {
+                if ((descProp.type === "ObjectProperty" || descProp.type === "Property") && descProp.key && (descProp.key.name === "value" || descProp.key.value === "value")) {
+                  const valTaint = evaluateExpr(descProp.value, env, ctx);
+                  if (valTaint.tainted) resultTaint.merge(valTaint);
+                }
+              }
+            }
+          }
+        }
+        return resultTaint;
+      }
     }
     if (calleeStr === "Reflect.apply" && node.arguments.length >= 3) {
       const fnNode = node.arguments[0];
@@ -44939,6 +44982,29 @@ ${rootStack}`;
     if (constructorName === "Function") {
       const allArgIndices = argTaints.map((_, i) => i);
       checkSinkCall(node, { type: "XSS", taintedArgs: allArgIndices }, argTaints, "new Function()", env, ctx);
+    }
+    if (constructorName === "CustomEvent" && node.arguments.length >= 2) {
+      const eventTypeNode = node.arguments[0];
+      const optionsNode = node.arguments[1];
+      if (eventTypeNode && (eventTypeNode.type === "StringLiteral" || eventTypeNode.type === "Literal" && typeof eventTypeNode.value === "string")) {
+        const eventTypeName = eventTypeNode.value;
+        if (!ctx._customEventTypes) ctx._customEventTypes = /* @__PURE__ */ new Map();
+        ctx._pendingCustomEventType = eventTypeName;
+      }
+      if (optionsNode && optionsNode.type === "ObjectExpression") {
+        for (const prop of optionsNode.properties) {
+          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+            const pname = prop.key.name || prop.key.value;
+            if (pname === "detail") {
+              const detailTaint = evaluateExpr(prop.value, env, ctx);
+              if (detailTaint.tainted) {
+                ctx._pendingCustomEventDetailTaint = detailTaint;
+                return detailTaint;
+              }
+            }
+          }
+        }
+      }
     }
     if (constructorName) {
       const funcNode = ctx.funcMap.get(constructorName);
@@ -45241,6 +45307,33 @@ ${rootStack}`;
         return analyzePromiseCallback(node, argTaints, objTaint, env, ctx);
       case "addEventListener":
         return analyzeEventListener(node, argTaints, env, ctx);
+      case "dispatchEvent": {
+        const eventArg = node.arguments?.[0];
+        if (eventArg) {
+          const eventTaint = argTaints[0] || TaintSet.empty();
+          const eventStr = nodeToString(eventArg);
+          const eventType = eventStr && ctx._customEventTypes?.get(eventStr);
+          if (eventType && ctx.eventListeners.has(eventType)) {
+            for (const { callback, env: listenerEnv } of ctx.eventListeners.get(eventType)) {
+              if (callback.params[0]) {
+                const childEnv = listenerEnv.child();
+                const paramName = callback.params[0].type === "Identifier" ? callback.params[0].name : null;
+                if (paramName) {
+                  assignToPattern(callback.params[0], eventTaint, childEnv, ctx);
+                  const detailTaint = env.get(eventStr ? `${eventStr}.detail` : "");
+                  if (detailTaint.tainted) {
+                    childEnv.set(`${paramName}.detail`, detailTaint);
+                  }
+                }
+                if (callback.body.type === "BlockStatement") {
+                  analyzeInlineFunction(callback, childEnv, ctx);
+                }
+              }
+            }
+          }
+        }
+        return TaintSet.empty();
+      }
       case "resolve":
       case "reject":
         return argTaints[0]?.clone() || TaintSet.empty();
@@ -45290,6 +45383,10 @@ ${rootStack}`;
           childEnv.set(`${paramName}.data`, TaintSet.from(label));
         }
       }
+    }
+    if (eventName && eventName !== "message" && !EVENT_SOURCES[eventName]) {
+      if (!ctx.eventListeners.has(eventName)) ctx.eventListeners.set(eventName, []);
+      ctx.eventListeners.get(eventName).push({ callback, env });
     }
     if (callback.body.type === "BlockStatement") {
       return analyzeInlineFunction(callback, childEnv, ctx);
@@ -45507,10 +45604,16 @@ ${rootStack}`;
       ctx.funcMap.set(callback.params[0].name, ctx.returnedFuncNode);
       ctx.returnedFuncNode = null;
     }
+    let cbResult;
     if (callback.body.type === "BlockStatement") {
-      return analyzeInlineFunction(callback, childEnv, ctx);
+      cbResult = analyzeInlineFunction(callback, childEnv, ctx);
+    } else {
+      cbResult = evaluateExpr(callback.body, childEnv, ctx);
     }
-    return evaluateExpr(callback.body, childEnv, ctx);
+    if (methodName === "catch") {
+      return objTaint.clone().merge(cbResult);
+    }
+    return cbResult;
   }
   function analyzeInlineFunction(funcNode, env, ctx) {
     const innerCfg = buildCFG(funcNode.body);

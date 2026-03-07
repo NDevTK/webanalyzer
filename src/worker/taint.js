@@ -187,6 +187,7 @@ class AnalysisContext {
     this.scriptElements = new Set(); // tracks variables holding createElement('script') results
     this.thrownTaint = TaintSet.empty(); // tracks taint from ThrowStatement for catch param
     this.generatorTaint = new Map(); // maps generator function key → TaintSet from yield expressions
+    this.eventListeners = new Map(); // eventName → [{callback, env}] for custom event dispatch tracking
   }
 }
 
@@ -746,6 +747,18 @@ function processVarDeclarator(node, env, ctx) {
   }
   registerReturnedFunctions(node.id, ctx);
 
+  // Track CustomEvent type: var ev = new CustomEvent('type', ...) → map ev → type
+  if (ctx._pendingCustomEventType && node.id.type === 'Identifier') {
+    const evName = node.id.name;
+    if (!ctx._customEventTypes) ctx._customEventTypes = new Map();
+    ctx._customEventTypes.set(evName, ctx._pendingCustomEventType);
+    if (ctx._pendingCustomEventDetailTaint) {
+      env.set(`${evName}.detail`, ctx._pendingCustomEventDetailTaint);
+      ctx._pendingCustomEventDetailTaint = null;
+    }
+    ctx._pendingCustomEventType = null;
+  }
+
   // Track aliases to known globals: var loc = location; var doc = document; etc.
   if (node.id.type === 'Identifier' && node.init.type === 'Identifier') {
     const ALIASABLE_GLOBALS = new Set(['location', 'document', 'window', 'self', 'globalThis', 'navigator', 'top', 'parent']);
@@ -816,6 +829,21 @@ function processAssignment(node, env, ctx) {
   }
   assignToPattern(node.left, finalTaint, env, ctx);
   registerReturnedFunctions(node.left, ctx);
+
+  // Track CustomEvent type: var ev = new CustomEvent('type', ...) → map ev → type
+  if (ctx._pendingCustomEventType) {
+    const evName = nodeToString(node.left) || (node.left.type === 'Identifier' ? node.left.name : null);
+    if (evName) {
+      if (!ctx._customEventTypes) ctx._customEventTypes = new Map();
+      ctx._customEventTypes.set(evName, ctx._pendingCustomEventType);
+      // Also store detail taint on the event variable
+      if (ctx._pendingCustomEventDetailTaint) {
+        env.set(`${evName}.detail`, ctx._pendingCustomEventDetailTaint);
+        ctx._pendingCustomEventDetailTaint = null;
+      }
+    }
+    ctx._pendingCustomEventType = null;
+  }
 
   // Register direct function expression assignments in funcMap
   // Handles: Widget.prototype.render = function() { ... }
@@ -1398,8 +1426,10 @@ function evaluateCallExpr(node, env, ctx) {
     }
   }
 
-  // setTimeout/setInterval with function callback: analyze body for closure taint reaching sinks
-  if ((calleeStr === 'setTimeout' || calleeStr === 'setInterval') && node.arguments[0]) {
+  // setTimeout/setInterval/queueMicrotask/requestAnimationFrame with function callback:
+  // analyze body for closure taint reaching sinks
+  if ((calleeStr === 'setTimeout' || calleeStr === 'setInterval' ||
+       calleeStr === 'queueMicrotask' || calleeStr === 'requestAnimationFrame') && node.arguments[0]) {
     let callback = node.arguments[0];
     if (callback.type === 'Identifier') {
       const refKey = resolveId(callback, ctx);
@@ -1453,6 +1483,30 @@ function evaluateCallExpr(node, env, ctx) {
       }
     }
     return TaintSet.empty();
+  }
+
+  // Object.create(proto, propertyDescriptors) — extract taint from descriptor values
+  if (calleeStr === 'Object.create' && node.arguments.length >= 2) {
+    const descMapNode = node.arguments[1];
+    if (descMapNode && descMapNode.type === 'ObjectExpression') {
+      const resultTaint = TaintSet.empty();
+      for (const prop of descMapNode.properties) {
+        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key && prop.value) {
+          const propName = prop.key.name || prop.key.value;
+          if (propName && prop.value.type === 'ObjectExpression') {
+            // Extract value from property descriptor: {value: ..., writable: ...}
+            for (const descProp of prop.value.properties) {
+              if ((descProp.type === 'ObjectProperty' || descProp.type === 'Property') &&
+                  descProp.key && (descProp.key.name === 'value' || descProp.key.value === 'value')) {
+                const valTaint = evaluateExpr(descProp.value, env, ctx);
+                if (valTaint.tainted) resultTaint.merge(valTaint);
+              }
+            }
+          }
+        }
+      }
+      return resultTaint;
+    }
   }
 
   // Reflect.apply(fn, thisArg, argsArray) — interprocedural call
@@ -1545,6 +1599,35 @@ function evaluateNewExpr(node, env, ctx) {
     // new Function(body) or new Function(arg1, ..., body) — any tainted arg is code injection
     const allArgIndices = argTaints.map((_, i) => i);
     checkSinkCall(node, { type: 'XSS', taintedArgs: allArgIndices }, argTaints, 'new Function()', env, ctx);
+  }
+
+  // new CustomEvent('type', {detail: tainted}) — track event type and detail taint
+  if (constructorName === 'CustomEvent' && node.arguments.length >= 2) {
+    const eventTypeNode = node.arguments[0];
+    const optionsNode = node.arguments[1];
+    if (eventTypeNode && (eventTypeNode.type === 'StringLiteral' || (eventTypeNode.type === 'Literal' && typeof eventTypeNode.value === 'string'))) {
+      const eventTypeName = eventTypeNode.value;
+      // Initialize custom event type tracker if needed
+      if (!ctx._customEventTypes) ctx._customEventTypes = new Map();
+      // The assignment target will be set by the caller (processAssignment)
+      // Store the event type for later resolution; we use _pendingCustomEventType
+      ctx._pendingCustomEventType = eventTypeName;
+    }
+    // Extract detail taint from options object
+    if (optionsNode && optionsNode.type === 'ObjectExpression') {
+      for (const prop of optionsNode.properties) {
+        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+          const pname = prop.key.name || prop.key.value;
+          if (pname === 'detail') {
+            const detailTaint = evaluateExpr(prop.value, env, ctx);
+            if (detailTaint.tainted) {
+              ctx._pendingCustomEventDetailTaint = detailTaint;
+              return detailTaint;
+            }
+          }
+        }
+      }
+    }
   }
 
   // Analyze constructor body to track this.* assignments
@@ -1892,6 +1975,39 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     case 'addEventListener':
       return analyzeEventListener(node, argTaints, env, ctx);
 
+    case 'dispatchEvent': {
+      // dispatchEvent(eventObj) — find matching custom event listeners and re-analyze
+      // with tainted event param from the dispatched event
+      const eventArg = node.arguments?.[0];
+      if (eventArg) {
+        const eventTaint = argTaints[0] || TaintSet.empty();
+        const eventStr = nodeToString(eventArg);
+        // Find the event type: check env for stored event name from CustomEvent constructor
+        const eventType = eventStr && ctx._customEventTypes?.get(eventStr);
+        if (eventType && ctx.eventListeners.has(eventType)) {
+          for (const { callback, env: listenerEnv } of ctx.eventListeners.get(eventType)) {
+            if (callback.params[0]) {
+              const childEnv = listenerEnv.child();
+              const paramName = callback.params[0].type === 'Identifier' ? callback.params[0].name : null;
+              if (paramName) {
+                // Taint the event parameter and its .detail property
+                assignToPattern(callback.params[0], eventTaint, childEnv, ctx);
+                // Get detail taint from the event object
+                const detailTaint = env.get(eventStr ? `${eventStr}.detail` : '');
+                if (detailTaint.tainted) {
+                  childEnv.set(`${paramName}.detail`, detailTaint);
+                }
+              }
+              if (callback.body.type === 'BlockStatement') {
+                analyzeInlineFunction(callback, childEnv, ctx);
+              }
+            }
+          }
+        }
+      }
+      return TaintSet.empty();
+    }
+
     case 'resolve': case 'reject':
       // Promise.resolve(val) / Promise.reject(val) — propagate taint
       return argTaints[0]?.clone() || TaintSet.empty();
@@ -1957,6 +2073,12 @@ function analyzeEventListener(node, argTaints, env, ctx) {
         childEnv.set(`${paramName}.data`, TaintSet.from(label));
       }
     }
+  }
+
+  // Store custom event listeners for dispatchEvent resolution
+  if (eventName && eventName !== 'message' && !EVENT_SOURCES[eventName]) {
+    if (!ctx.eventListeners.has(eventName)) ctx.eventListeners.set(eventName, []);
+    ctx.eventListeners.get(eventName).push({ callback, env });
   }
 
   if (callback.body.type === 'BlockStatement') {
@@ -2252,10 +2374,19 @@ function analyzePromiseCallback(node, argTaints, objTaint, env, ctx) {
     ctx.returnedFuncNode = null;
   }
 
+  let cbResult;
   if (callback.body.type === 'BlockStatement') {
-    return analyzeInlineFunction(callback, childEnv, ctx);
+    cbResult = analyzeInlineFunction(callback, childEnv, ctx);
+  } else {
+    cbResult = evaluateExpr(callback.body, childEnv, ctx);
   }
-  return evaluateExpr(callback.body, childEnv, ctx);
+
+  // .catch() only runs on rejection — on the success path, the resolved value passes through.
+  // Merge original taint so the next .then() in the chain sees it.
+  if (methodName === 'catch') {
+    return objTaint.clone().merge(cbResult);
+  }
+  return cbResult;
 }
 
 // ── Analyze inline function body ──
