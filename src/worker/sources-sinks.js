@@ -80,6 +80,7 @@ export const CALL_SOURCES = {
   'String': 'passthrough',
   'JSON.stringify': 'passthrough',
   'structuredClone': 'passthrough',
+  'URL.createObjectURL': 'passthrough',
 };
 
 // Constructor sources: new Foo(tainted) where result is tainted

@@ -799,6 +799,27 @@ function processNode(node, env, ctx) {
       if (node.expression) evaluateExpr(node.expression, env, ctx);
       break;
 
+    case '_WithScope': {
+      // with(obj) {} — inject obj's known source properties as bare identifiers
+      const withObj = nodeToString(node.object);
+      if (withObj) {
+        // Find all MEMBER_SOURCES that start with withObj + '.' and inject their property names
+        for (const [sourcePath, label] of Object.entries(MEMBER_SOURCES)) {
+          if (sourcePath.startsWith(withObj + '.')) {
+            const propName = sourcePath.slice(withObj.length + 1);
+            // Only inject simple property names (no nested dots)
+            if (propName && !propName.includes('.')) {
+              const loc = node.loc?.start || {};
+              const taint = TaintSet.from(new TaintLabel(label, ctx.file, loc.line || 0, loc.column || 0, `with(${withObj}).${propName}`));
+              env.set(propName, taint);
+              env.set(`global:${propName}`, taint);
+            }
+          }
+        }
+      }
+      break;
+    }
+
     default:
       // Evaluate unknown node types for side effects (e.g., nested expressions)
       evaluateExpr(node, env, ctx);
@@ -1106,6 +1127,14 @@ function processVarDeclarator(node, env, ctx) {
       ctx._pendingCustomEventDetailTaint = null;
     }
     ctx._pendingCustomEventType = null;
+  }
+
+  // Track Object.getOwnPropertyDescriptor result: var desc = GOPD(obj, 'x') → desc.get = getter func
+  if (ctx._pendingDescriptorGetter && node.id.type === 'Identifier') {
+    const descName = node.id.name;
+    const { getter } = ctx._pendingDescriptorGetter;
+    ctx.funcMap.set(`${descName}.get`, getter);
+    ctx._pendingDescriptorGetter = null;
   }
 
   // Track aliases to known globals: var loc = location; var doc = document; etc.
@@ -1718,10 +1747,21 @@ function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
         W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
         return;
       }
-      const isNonNullishConst = (ln.type === 'StringLiteral') ||
-        (ln.type === 'NumericLiteral') || (ln.type === 'BooleanLiteral') ||
-        (ln.type === 'Literal' && ln.value !== null && ln.value !== undefined) ||
-        (ln.type === 'ObjectExpression') || (ln.type === 'ArrayExpression');
+      // Check if left is a known non-nullish constant (including via variable resolution)
+      // Note: isConstantBool returns false for null (falsy), so we can't use it directly.
+      // Instead, resolve identifiers through scope and check the resolved node.
+      let resolvedLn = ln;
+      if (ln.type === 'Identifier' && ln.name !== 'undefined' && ctx?.scopeInfo) {
+        const bindingKey = ctx.scopeInfo.resolve(ln);
+        if (bindingKey) {
+          const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
+          if (declNode?.type === 'VariableDeclarator' && declNode.init) resolvedLn = declNode.init;
+        }
+      }
+      const isNonNullishConst = (resolvedLn.type === 'StringLiteral') ||
+        (resolvedLn.type === 'NumericLiteral') || (resolvedLn.type === 'BooleanLiteral') ||
+        (resolvedLn.type === 'Literal' && resolvedLn.value !== null && resolvedLn.value !== undefined) ||
+        (resolvedLn.type === 'ObjectExpression') || (resolvedLn.type === 'ArrayExpression');
       if (isNonNullishConst) {
         // Definitely non-nullish: entire chain result is the left value
         V.push(accum);
@@ -2095,6 +2135,12 @@ function evaluateTaggedTemplate(node, env, ctx) {
 }
 
 function evaluateMemberExpr(node, env, ctx) {
+  // arguments.callee refers to the function itself, not argument values — always safe
+  const fullPath = nodeToString(node);
+  if (fullPath && (fullPath === 'arguments.callee' || fullPath.startsWith('arguments.callee.'))) {
+    return TaintSet.empty();
+  }
+
   // Iterative evaluation for MemberExpression chains to avoid stack overflow on minified code.
   // Walk the chain, checking sources/env/getters at each level. Only recurse for computed access.
   let cur = node;
@@ -2389,6 +2435,11 @@ function evaluateCallExpr(node, env, ctx) {
   if (node.callee.type === 'NewExpression') {
     evaluateExpr(node.callee, env, ctx);
   }
+  // For (cond ? fn1 : fn2)(args) patterns: evaluate the conditional callee
+  // so ctx.returnedFuncNode is set to the selected function reference
+  if (node.callee.type === 'ConditionalExpression') {
+    evaluateExpr(node.callee, env, ctx);
+  }
 
   const argTaints = node.arguments.map(arg => evaluateExpr(arg, env, ctx));
 
@@ -2529,6 +2580,28 @@ function evaluateCallExpr(node, env, ctx) {
     return TaintSet.empty();
   }
 
+  // Object.getOwnPropertyDescriptor(obj, prop) — return descriptor with getter/setter refs
+  // When `var desc = Object.getOwnPropertyDescriptor(obj, "x")`, make desc.get resolve to the getter
+  if (isCalleeMatch(node, 'Object', 'getOwnPropertyDescriptor', env) && node.arguments.length >= 2) {
+    const objNode = node.arguments[0];
+    const propNode = node.arguments[1];
+    const objStr = nodeToString(objNode);
+    const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
+    if (objStr && propName) {
+      // Look up the getter registered for this property
+      const getterFunc = ctx.funcMap.get(`getter:${objStr}.${propName}`);
+      if (getterFunc) {
+        // Store it so that when assigned to `var desc = ...`, desc.get resolves in funcMap
+        // We use ctx._pendingDescriptorGetter which processAssignment will pick up
+        ctx._pendingDescriptorGetter = { getter: getterFunc, propName };
+      }
+      // Return the taint of the property value itself
+      const valTaint = env.get(`${objStr}.${propName}`);
+      if (valTaint.tainted) return valTaint;
+    }
+    return TaintSet.empty();
+  }
+
   // Object.create(proto, propertyDescriptors) — extract taint from descriptor values
   if (isCalleeMatch(node, 'Object', 'create', env) && node.arguments.length >= 2) {
     const descMapNode = node.arguments[1];
@@ -2566,6 +2639,16 @@ function evaluateCallExpr(node, env, ctx) {
       return analyzeCalledFunction(synthCall, funcName, [argsArrayTaint], env, ctx);
     }
     return argsArrayTaint.clone();
+  }
+
+  // Reflect.construct(Target, args) — equivalent to new Target(...args)
+  if (isCalleeMatch(node, 'Reflect', 'construct', env) && node.arguments.length >= 2) {
+    const targetNode = node.arguments[0];
+    const argsNode = node.arguments[1];
+    // Synthesize a NewExpression and delegate to evaluateNewExpr
+    const synthArgs = argsNode.type === 'ArrayExpression' ? argsNode.elements.filter(Boolean) : [];
+    const synthNew = { ...node, type: 'NewExpression', callee: targetNode, arguments: synthArgs };
+    return evaluateNewExpr(synthNew, env, ctx);
   }
 
   // Object.freeze/seal/preventExtensions — return the same object, propagate taint
@@ -2730,6 +2813,16 @@ function evaluateNewExpr(node, env, ctx) {
     // new Function(body) or new Function(arg1, ..., body) — any tainted arg is code injection
     const allArgIndices = argTaints.map((_, i) => i);
     checkSinkCall(node, { type: 'XSS', taintedArgs: allArgIndices }, argTaints, 'new Function()', env, ctx);
+  }
+
+  // new WebSocket(url) — tainted URL is injection risk (attacker-controlled endpoint)
+  if (isGlobalRef(node.callee, 'WebSocket', env)) {
+    checkSinkCall(node, { type: 'XSS', taintedArgs: [0] }, argTaints, 'new WebSocket()', env, ctx);
+  }
+
+  // new Blob([content], ...) — propagate taint from array content
+  if (isGlobalRef(node.callee, 'Blob', env) && argTaints[0]) {
+    return argTaints[0].clone();
   }
 
   // new Promise(function(resolve, reject) { resolve(tainted) }) → taint propagates to .then()
@@ -3869,9 +3962,15 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         ctx.returnedFuncNode = null;
       }
     }
-    // Ternary callee: (cond ? fnA : fnB)(args) — resolve either branch
+    // Ternary callee: (cond ? fnA : fnB)(args) — resolve the selected branch
+    // Respect constant-folding: if condition is known true/false, only use that branch
     if (!funcNode && callNode.callee.type === 'ConditionalExpression') {
-      for (const branch of [callNode.callee.consequent, callNode.callee.alternate]) {
+      const condConst = isConstantBool(callNode.callee.test);
+      let branches;
+      if (condConst === true) branches = [callNode.callee.consequent];
+      else if (condConst === false) branches = [callNode.callee.alternate];
+      else branches = [callNode.callee.consequent, callNode.callee.alternate];
+      for (const branch of branches) {
         if (branch.type === 'Identifier') {
           const ref = ctx.funcMap.get(resolveId(branch, ctx)) || ctx.funcMap.get(branch.name);
           if (ref) { funcNode = ref; break; }

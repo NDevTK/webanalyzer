@@ -43331,6 +43331,9 @@ ${rootStack}`;
       case "ExportAllDeclaration":
         current.addNode(stmt);
         return current;
+      case "WithStatement":
+        current.addNode({ type: "_WithScope", object: stmt.object, loc: stmt.loc });
+        return buildStatement(stmt.body, current, cfg, ctx);
       case "EmptyStatement":
       case "DebuggerStatement":
         return current;
@@ -43579,7 +43582,8 @@ ${rootStack}`;
     // tainted URL → tainted response for .then chains
     "String": "passthrough",
     "JSON.stringify": "passthrough",
-    "structuredClone": "passthrough"
+    "structuredClone": "passthrough",
+    "URL.createObjectURL": "passthrough"
   };
   var CONSTRUCTOR_SOURCES = {
     "URL": "url.constructed",
@@ -44391,6 +44395,23 @@ ${rootStack}`;
       case "ExpressionStatement":
         if (node.expression) evaluateExpr(node.expression, env, ctx);
         break;
+      case "_WithScope": {
+        const withObj = nodeToString(node.object);
+        if (withObj) {
+          for (const [sourcePath, label] of Object.entries(MEMBER_SOURCES)) {
+            if (sourcePath.startsWith(withObj + ".")) {
+              const propName = sourcePath.slice(withObj.length + 1);
+              if (propName && !propName.includes(".")) {
+                const loc = node.loc?.start || {};
+                const taint = TaintSet.from(new TaintLabel(label, ctx.file, loc.line || 0, loc.column || 0, `with(${withObj}).${propName}`));
+                env.set(propName, taint);
+                env.set(`global:${propName}`, taint);
+              }
+            }
+          }
+        }
+        break;
+      }
       default:
         evaluateExpr(node, env, ctx);
         break;
@@ -44648,6 +44669,12 @@ ${rootStack}`;
         ctx._pendingCustomEventDetailTaint = null;
       }
       ctx._pendingCustomEventType = null;
+    }
+    if (ctx._pendingDescriptorGetter && node.id.type === "Identifier") {
+      const descName = node.id.name;
+      const { getter } = ctx._pendingDescriptorGetter;
+      ctx.funcMap.set(`${descName}.get`, getter);
+      ctx._pendingDescriptorGetter = null;
     }
     if (node.id.type === "Identifier" && node.init.type === "Identifier") {
       const ALIASABLE_GLOBALS = /* @__PURE__ */ new Set([
@@ -45188,7 +45215,15 @@ ${rootStack}`;
           W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
           return;
         }
-        const isNonNullishConst = ln.type === "StringLiteral" || ln.type === "NumericLiteral" || ln.type === "BooleanLiteral" || ln.type === "Literal" && ln.value !== null && ln.value !== void 0 || ln.type === "ObjectExpression" || ln.type === "ArrayExpression";
+        let resolvedLn = ln;
+        if (ln.type === "Identifier" && ln.name !== "undefined" && ctx?.scopeInfo) {
+          const bindingKey = ctx.scopeInfo.resolve(ln);
+          if (bindingKey) {
+            const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
+            if (declNode?.type === "VariableDeclarator" && declNode.init) resolvedLn = declNode.init;
+          }
+        }
+        const isNonNullishConst = resolvedLn.type === "StringLiteral" || resolvedLn.type === "NumericLiteral" || resolvedLn.type === "BooleanLiteral" || resolvedLn.type === "Literal" && resolvedLn.value !== null && resolvedLn.value !== void 0 || resolvedLn.type === "ObjectExpression" || resolvedLn.type === "ArrayExpression";
         if (isNonNullishConst) {
           V.push(accum);
           return;
@@ -45557,6 +45592,10 @@ ${rootStack}`;
     return t;
   }
   function evaluateMemberExpr(node, env, ctx) {
+    const fullPath = nodeToString(node);
+    if (fullPath && (fullPath === "arguments.callee" || fullPath.startsWith("arguments.callee."))) {
+      return TaintSet.empty();
+    }
     let cur = node;
     while (cur.type === "MemberExpression" || cur.type === "OptionalMemberExpression") {
       const sourceLabel = checkMemberSource(cur);
@@ -45582,9 +45621,9 @@ ${rootStack}`;
           }
         }
       }
-      const fullPath = fullStr;
-      if (fullPath) {
-        if (env.has(fullPath)) return env.get(fullPath).clone();
+      const fullPath2 = fullStr;
+      if (fullPath2) {
+        if (env.has(fullPath2)) return env.get(fullPath2).clone();
       }
       if (!cur.computed && cur.object?.type === "Identifier" && cur.property) {
         const resolvedObjKey = resolveId(cur.object, ctx);
@@ -45594,8 +45633,8 @@ ${rootStack}`;
           if (env.has(scopedPath)) return env.get(scopedPath).clone();
         }
       }
-      if (fullPath) {
-        const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
+      if (fullPath2) {
+        const getterFunc = ctx.funcMap.get(`getter:${fullPath2}`);
         if (getterFunc && getterFunc.body) {
           const childEnv = (getterFunc._closureEnv || env).child();
           const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
@@ -45875,6 +45914,9 @@ ${rootStack}`;
     if (node.callee.type === "NewExpression") {
       evaluateExpr(node.callee, env, ctx);
     }
+    if (node.callee.type === "ConditionalExpression") {
+      evaluateExpr(node.callee, env, ctx);
+    }
     const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
     if (isSanitizer(calleeStr, methodName)) return TaintSet.empty();
     const sinkInfo = checkCallSink(calleeStr, methodName);
@@ -46009,6 +46051,21 @@ ${rootStack}`;
       }
       return TaintSet.empty();
     }
+    if (isCalleeMatch(node, "Object", "getOwnPropertyDescriptor", env) && node.arguments.length >= 2) {
+      const objNode = node.arguments[0];
+      const propNode = node.arguments[1];
+      const objStr = nodeToString(objNode);
+      const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
+      if (objStr && propName) {
+        const getterFunc = ctx.funcMap.get(`getter:${objStr}.${propName}`);
+        if (getterFunc) {
+          ctx._pendingDescriptorGetter = { getter: getterFunc, propName };
+        }
+        const valTaint = env.get(`${objStr}.${propName}`);
+        if (valTaint.tainted) return valTaint;
+      }
+      return TaintSet.empty();
+    }
     if (isCalleeMatch(node, "Object", "create", env) && node.arguments.length >= 2) {
       const descMapNode = node.arguments[1];
       if (descMapNode && descMapNode.type === "ObjectExpression") {
@@ -46039,6 +46096,13 @@ ${rootStack}`;
         return analyzeCalledFunction(synthCall, funcName, [argsArrayTaint], env, ctx);
       }
       return argsArrayTaint.clone();
+    }
+    if (isCalleeMatch(node, "Reflect", "construct", env) && node.arguments.length >= 2) {
+      const targetNode = node.arguments[0];
+      const argsNode = node.arguments[1];
+      const synthArgs = argsNode.type === "ArrayExpression" ? argsNode.elements.filter(Boolean) : [];
+      const synthNew = { ...node, type: "NewExpression", callee: targetNode, arguments: synthArgs };
+      return evaluateNewExpr(synthNew, env, ctx);
     }
     if (isCalleeMatch(node, "Object", "freeze", env) || isCalleeMatch(node, "Object", "seal", env) || isCalleeMatch(node, "Object", "preventExtensions", env)) {
       return argTaints[0]?.clone() || TaintSet.empty();
@@ -46166,6 +46230,12 @@ ${rootStack}`;
     if (isGlobalRef(node.callee, "Function", env)) {
       const allArgIndices = argTaints.map((_, i) => i);
       checkSinkCall(node, { type: "XSS", taintedArgs: allArgIndices }, argTaints, "new Function()", env, ctx);
+    }
+    if (isGlobalRef(node.callee, "WebSocket", env)) {
+      checkSinkCall(node, { type: "XSS", taintedArgs: [0] }, argTaints, "new WebSocket()", env, ctx);
+    }
+    if (isGlobalRef(node.callee, "Blob", env) && argTaints[0]) {
+      return argTaints[0].clone();
     }
     if (isGlobalRef(node.callee, "Promise", env) && node.arguments[0]) {
       let callback = node.arguments[0];
@@ -47084,7 +47154,12 @@ ${rootStack}`;
         }
       }
       if (!funcNode && callNode.callee.type === "ConditionalExpression") {
-        for (const branch of [callNode.callee.consequent, callNode.callee.alternate]) {
+        const condConst = isConstantBool(callNode.callee.test);
+        let branches;
+        if (condConst === true) branches = [callNode.callee.consequent];
+        else if (condConst === false) branches = [callNode.callee.alternate];
+        else branches = [callNode.callee.consequent, callNode.callee.alternate];
+        for (const branch of branches) {
           if (branch.type === "Identifier") {
             const ref = ctx.funcMap.get(resolveId(branch, ctx)) || ctx.funcMap.get(branch.name);
             if (ref) {

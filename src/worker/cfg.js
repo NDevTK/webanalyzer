@@ -195,6 +195,11 @@ function buildStatement(stmt, current, cfg, ctx) {
       current.addNode(stmt);
       return current;
 
+    case 'WithStatement':
+      // Add marker node for with() scope, then process body
+      current.addNode({ type: '_WithScope', object: stmt.object, loc: stmt.loc });
+      return buildStatement(stmt.body, current, cfg, ctx);
+
     case 'EmptyStatement':
     case 'DebuggerStatement':
       return current;
