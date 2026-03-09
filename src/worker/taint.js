@@ -925,29 +925,36 @@ function processVarDeclarator(node, env, ctx) {
     ctx.funcMap.set(node.id.name, node.init);
   }
   // Register function-valued properties from object literals: var obj = { render: function(){} }
+  // Also recurses into nested objects: var obj = { inner: { getData: function(){} } }
   if (node.id.type === 'Identifier' && node.init && node.init.type === 'ObjectExpression') {
-    const varName = node.id.name;
-    for (const prop of node.init.properties) {
-      if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
-        const propName = prop.key.name || prop.key.value;
-        const val = prop.value;
-        if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
-          val._closureEnv = env;
-          ctx.funcMap.set(`${varName}.${propName}`, val);
-          if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+    const registerObjectMethods = (objExpr, prefix) => {
+      for (const prop of objExpr.properties) {
+        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+          const propName = prop.key.name || prop.key.value;
+          const val = prop.value;
+          if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
+            val._closureEnv = env;
+            ctx.funcMap.set(`${prefix}.${propName}`, val);
+            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+          }
+          // Recurse into nested ObjectExpression for deep method registration
+          if (propName && val && val.type === 'ObjectExpression') {
+            registerObjectMethods(val, `${prefix}.${propName}`);
+          }
+        }
+        if (prop.type === 'ObjectMethod' && prop.key) {
+          const propName = prop.key.name || prop.key.value;
+          if (propName) {
+            prop._closureEnv = env;
+            // Register getters with a special prefix so they can be invoked on property access
+            const getterPrefix = prop.kind === 'get' ? 'getter:' : '';
+            ctx.funcMap.set(`${getterPrefix}${prefix}.${propName}`, prop);
+            if (!ctx.funcMap.has(`${getterPrefix}${propName}`)) ctx.funcMap.set(`${getterPrefix}${propName}`, prop);
+          }
         }
       }
-      if (prop.type === 'ObjectMethod' && prop.key) {
-        const propName = prop.key.name || prop.key.value;
-        if (propName) {
-          prop._closureEnv = env;
-          // Register getters with a special prefix so they can be invoked on property access
-          const prefix = prop.kind === 'get' ? 'getter:' : '';
-          ctx.funcMap.set(`${prefix}${varName}.${propName}`, prop);
-          if (!ctx.funcMap.has(`${prefix}${propName}`)) ctx.funcMap.set(`${prefix}${propName}`, prop);
-        }
-      }
-    }
+    };
+    registerObjectMethods(node.init, node.id.name);
   }
 
   // Alias: var fn = existingFunc — register the alias in funcMap
@@ -1695,10 +1702,9 @@ function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
     } else if (op === '||') {
       const constLeft = isConstantBool(ln, ctx);
       if (constLeft === true) {
-        // short-circuit: skip right, advance iteratively
-        ln = right;
-        index--;
-        continue;
+        // short-circuit: left is truthy → entire chain result is the left value
+        V.push(accum);
+        return;
       }
       W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum, parts, index, ln: right, env, ctx });
       W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
@@ -1717,10 +1723,9 @@ function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
         (ln.type === 'Literal' && ln.value !== null && ln.value !== undefined) ||
         (ln.type === 'ObjectExpression') || (ln.type === 'ArrayExpression');
       if (isNonNullishConst) {
-        // Definitely non-nullish: skip right, advance iteratively
-        ln = right;
-        index--;
-        continue;
+        // Definitely non-nullish: entire chain result is the left value
+        V.push(accum);
+        return;
       }
       W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum, parts, index, ln: right, env, ctx });
       W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
@@ -1816,7 +1821,8 @@ export function evaluateExpr(node, env, ctx) {
           case 'BinaryExpression': {
             const parts = [];
             let bn = _n;
-            while (bn.type === 'BinaryExpression') {
+            const topOp = _n.operator;
+            while (bn.type === 'BinaryExpression' && bn.operator === topOp) {
               parts.push({ op: bn.operator, right: bn.right });
               bn = bn.left;
             }
@@ -1983,11 +1989,13 @@ export function evaluateExpr(node, env, ctx) {
               for (const operand of [leftNode, right]) {
                 if (operand.type === 'Identifier' && !result.tainted) {
                   const objName = operand.name;
-                  const toStringFunc = item.ctx.funcMap.get(`${objName}.toString`);
-                  if (toStringFunc && toStringFunc.body) {
-                    const synthCall = { type: 'CallExpression', callee: operand, arguments: [], loc: operand.loc };
-                    const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], item.env, item.ctx);
-                    result = result.merge(toStringTaint);
+                  for (const methodName of ['toString', 'valueOf']) {
+                    const coercionFunc = item.ctx.funcMap.get(`${objName}.${methodName}`);
+                    if (coercionFunc && coercionFunc.body) {
+                      const synthCall = { type: 'CallExpression', callee: operand, arguments: [], loc: operand.loc };
+                      const coercionTaint = analyzeCalledFunction(synthCall, `${objName}.${methodName}`, [], item.env, item.ctx);
+                      result = result.merge(coercionTaint);
+                    }
                   }
                 }
               }
@@ -3900,12 +3908,21 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       const methodName = callNode.callee.property?.name;
       if (methodName && ctx.funcMap.has(methodName)) funcNode = ctx.funcMap.get(methodName);
     }
-    // Computed member call: arr[0](args) — resolve function pushed to array via arr[]
+    // Computed member call: obj[method](args) — resolve method name to dot-path
     if (!funcNode && callNode.callee.computed) {
-      const arrStr = nodeToString(callNode.callee.object);
-      if (arrStr) {
-        const arrFunc = ctx.funcMap.get(`${arrStr}[]`);
-        if (arrFunc) funcNode = arrFunc;
+      const objStr = nodeToString(callNode.callee.object);
+      if (objStr) {
+        // Try resolving the computed property to a constant string: obj["render"]() or obj[varHoldingName]()
+        const resolvedMethod = resolveToConstant(callNode.callee.property, env, ctx);
+        if (resolvedMethod) {
+          const dotPath = `${objStr}.${resolvedMethod}`;
+          if (ctx.funcMap.has(dotPath)) funcNode = ctx.funcMap.get(dotPath);
+        }
+        // Fallback: arr[0](args) — resolve function pushed to array via arr[]
+        if (!funcNode) {
+          const arrFunc = ctx.funcMap.get(`${objStr}[]`);
+          if (arrFunc) funcNode = arrFunc;
+        }
         if (!funcNode && callNode.callee.object.type === 'Identifier') {
           const arrKey = resolveId(callNode.callee.object, ctx);
           const arrFunc2 = ctx.funcMap.get(`${arrKey}[]`);
@@ -4121,6 +4138,18 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         // This is a non-local, non-param binding — likely a closure variable
         funcNode._closureEnv.set(key, taint);
       }
+    }
+  }
+
+  // Propagate closure variable mutations back to the caller's env
+  // Handles: var x = "safe"; function f() { x = tainted; } f(); sink(x);
+  // Also handles inverse: var x = tainted; function f() { x = "safe"; } f(); sink(x);
+  for (const [key, taint] of childEnv.bindings) {
+    if (key.startsWith('this.') || key === 'this' || key.startsWith('global:') ||
+        paramNames.has(key) || key.indexOf('.') !== -1) continue;
+    // Only propagate if the key is a closure variable (exists in caller's env)
+    if (env.has(key)) {
+      env.set(key, taint);
     }
   }
 
