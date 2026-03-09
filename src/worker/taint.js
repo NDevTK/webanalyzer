@@ -283,49 +283,48 @@ function processBlock(block, env, ctx) {
 // instead of "XSS" (since javascript: URIs are blocked).
 
 function applyBranchCondition(testNode, polarity, env) {
-  // Unwrap negation: if (!expr) → analyze expr with flipped polarity
-  let node = testNode;
-  let positive = polarity;
-  while (node.type === 'UnaryExpression' && node.operator === '!') {
-    positive = !positive;
-    node = node.argument;
-  }
-
-  // Handle logical expressions: if (a && b) → both are true in consequent
-  if (node.type === 'LogicalExpression' && node.operator === '&&' && positive) {
-    applyBranchCondition(node.left, true, env);
-    applyBranchCondition(node.right, true, env);
-    return;
-  }
-  // if (a || b) in the false branch → both are false
-  if (node.type === 'LogicalExpression' && node.operator === '||' && !positive) {
-    applyBranchCondition(node.left, false, env);
-    applyBranchCondition(node.right, false, env);
-    return;
-  }
-  // if (a || b) in the true branch → at least one is true
-  // For scheme checks: if both sides check the same var, mark it as checked
-  if (node.type === 'LogicalExpression' && node.operator === '||' && positive) {
-    const leftVar = extractSchemeCheck(node.left, true);
-    const rightVar = extractSchemeCheck(node.right, true);
-    if (leftVar && rightVar && leftVar === rightVar) {
-      env.schemeCheckedVars.add(leftVar);
-      const origin = env.urlConstructorOrigins.get(leftVar);
-      if (origin) env.schemeCheckedVars.add(origin);
-      return;
+  const stack = [{ node: testNode, positive: polarity }];
+  while (stack.length > 0) {
+    let { node, positive } = stack.pop();
+    // Unwrap negation: if (!expr) → analyze expr with flipped polarity
+    while (node.type === 'UnaryExpression' && node.operator === '!') {
+      positive = !positive;
+      node = node.argument;
     }
-    // Still recurse — individual checks may apply
-    applyBranchCondition(node.left, true, env);
-    applyBranchCondition(node.right, true, env);
-    return;
-  }
 
-  const checkedVar = extractSchemeCheck(node, positive);
-  if (checkedVar) {
-    env.schemeCheckedVars.add(checkedVar);
-    // If this var was created via new URL(x), also mark x as scheme-checked
-    const origin = env.urlConstructorOrigins.get(checkedVar);
-    if (origin) env.schemeCheckedVars.add(origin);
+    // Handle logical expressions: if (a && b) → both are true in consequent
+    if (node.type === 'LogicalExpression' && node.operator === '&&' && positive) {
+      stack.push({ node: node.left, positive: true });
+      stack.push({ node: node.right, positive: true });
+      continue;
+    }
+    // if (a || b) in the false branch → both are false
+    if (node.type === 'LogicalExpression' && node.operator === '||' && !positive) {
+      stack.push({ node: node.left, positive: false });
+      stack.push({ node: node.right, positive: false });
+      continue;
+    }
+    // if (a || b) in the true branch → at least one is true
+    if (node.type === 'LogicalExpression' && node.operator === '||' && positive) {
+      const leftVar = extractSchemeCheck(node.left, true);
+      const rightVar = extractSchemeCheck(node.right, true);
+      if (leftVar && rightVar && leftVar === rightVar) {
+        env.schemeCheckedVars.add(leftVar);
+        const origin = env.urlConstructorOrigins.get(leftVar);
+        if (origin) env.schemeCheckedVars.add(origin);
+        continue;
+      }
+      stack.push({ node: node.left, positive: true });
+      stack.push({ node: node.right, positive: true });
+      continue;
+    }
+
+    const checkedVar = extractSchemeCheck(node, positive);
+    if (checkedVar) {
+      env.schemeCheckedVars.add(checkedVar);
+      const origin = env.urlConstructorOrigins.get(checkedVar);
+      if (origin) env.schemeCheckedVars.add(origin);
+    }
   }
 }
 
@@ -1487,82 +1486,78 @@ function processAssignment(node, env, ctx) {
 }
 
 // ── Assign taint to a pattern using scope-resolved keys ──
-function assignToPattern(pattern, taint, env, ctx) {
-  if (!pattern) return;
+function assignToPattern(rootPattern, rootTaint, env, ctx) {
+  if (!rootPattern) return;
+  const stack = [{ pattern: rootPattern, taint: rootTaint }];
+  while (stack.length > 0) {
+    const { pattern, taint } = stack.pop();
+    if (!pattern) continue;
 
-  switch (pattern.type) {
-    case 'Identifier': {
-      const key = resolveId(pattern, ctx);
-      env.set(key, taint);
-      // Also set by raw name for cross-file globals
-      // Skip for block-scoped (let/const) declarations inside inner blocks
-      // that would pollute the global: namespace and shadow outer bindings
-      const skipGlobal = ctx._blockScopedDecl && ctx.scopeInfo &&
-        key !== `global:${pattern.name}` && key !== pattern.name &&
-        !key.startsWith('0:'); // 0: is typically the program scope
-      if (!skipGlobal) {
-        env.set(`global:${pattern.name}`, taint);
-      }
-      break;
-    }
-
-    case 'MemberExpression':
-    case 'OptionalMemberExpression': {
-      const str = nodeToString(pattern);
-      if (str) env.set(str, taint);
-      if (!pattern.computed && pattern.property?.name) {
-        const objStr = nodeToString(pattern.object);
-        if (objStr) env.set(`${objStr}.${pattern.property.name}`, taint);
-        // For window.X / self.X / globalThis.X assignments, also set the bare name
-        // so cross-file resolution can find it as a plain identifier
-        const GLOBAL_PREFIXES = new Set(['window', 'self', 'globalThis']);
-        if (pattern.object.type === 'Identifier' && GLOBAL_PREFIXES.has(pattern.object.name)) {
-          const propName = pattern.property.name;
-          env.set(propName, taint);
-          env.set(`global:${propName}`, taint);
+    switch (pattern.type) {
+      case 'Identifier': {
+        const key = resolveId(pattern, ctx);
+        env.set(key, taint);
+        const skipGlobal = ctx._blockScopedDecl && ctx.scopeInfo &&
+          key !== `global:${pattern.name}` && key !== pattern.name &&
+          !key.startsWith('0:');
+        if (!skipGlobal) {
+          env.set(`global:${pattern.name}`, taint);
         }
+        break;
       }
-      // Computed property write: obj[key] = val where key resolves to a constant
-      if (pattern.computed) {
-        const objStr = nodeToString(pattern.object);
-        if (objStr) {
-          const resolved = resolveToConstant(pattern.property, null, ctx);
-          if (resolved !== undefined) {
-            env.set(`${objStr}.${resolved}`, taint);
-            // Also store per-index taint for arrays: arr.#idx_0
-            if (/^\d+$/.test(String(resolved))) {
-              env.set(`${objStr}.#idx_${resolved}`, taint);
-            }
-          } else {
-            // Dynamic key: fall back to tainting the whole object
-            if (taint.tainted) env.set(objStr, env.get(objStr).clone().merge(taint));
+
+      case 'MemberExpression':
+      case 'OptionalMemberExpression': {
+        const str = nodeToString(pattern);
+        if (str) env.set(str, taint);
+        if (!pattern.computed && pattern.property?.name) {
+          const objStr = nodeToString(pattern.object);
+          if (objStr) env.set(`${objStr}.${pattern.property.name}`, taint);
+          const GLOBAL_PREFIXES = new Set(['window', 'self', 'globalThis']);
+          if (pattern.object.type === 'Identifier' && GLOBAL_PREFIXES.has(pattern.object.name)) {
+            const propName = pattern.property.name;
+            env.set(propName, taint);
+            env.set(`global:${propName}`, taint);
           }
         }
-      }
-      break;
-    }
-
-    case 'ObjectPattern':
-      for (const prop of pattern.properties) {
-        if (prop.type === 'RestElement') assignToPattern(prop.argument, taint, env, ctx);
-        else assignToPattern(prop.value, taint, env, ctx);
-      }
-      break;
-
-    case 'ArrayPattern':
-      for (const elem of pattern.elements) {
-        if (elem) {
-          if (elem.type === 'RestElement') assignToPattern(elem.argument, taint, env, ctx);
-          else assignToPattern(elem, taint, env, ctx);
+        if (pattern.computed) {
+          const objStr = nodeToString(pattern.object);
+          if (objStr) {
+            const resolved = resolveToConstant(pattern.property, null, ctx);
+            if (resolved !== undefined) {
+              env.set(`${objStr}.${resolved}`, taint);
+              if (/^\d+$/.test(String(resolved))) {
+                env.set(`${objStr}.#idx_${resolved}`, taint);
+              }
+            } else {
+              if (taint.tainted) env.set(objStr, env.get(objStr).clone().merge(taint));
+            }
+          }
         }
+        break;
       }
-      break;
 
-    case 'AssignmentPattern': {
-      // Default parameter: if no taint was provided (empty), evaluate the default value
-      const paramTaint = taint.tainted ? taint : evaluateExpr(pattern.right, env, ctx);
-      assignToPattern(pattern.left, paramTaint, env, ctx);
-      break;
+      case 'ObjectPattern':
+        for (const prop of pattern.properties) {
+          if (prop.type === 'RestElement') stack.push({ pattern: prop.argument, taint });
+          else stack.push({ pattern: prop.value, taint });
+        }
+        break;
+
+      case 'ArrayPattern':
+        for (const elem of pattern.elements) {
+          if (elem) {
+            if (elem.type === 'RestElement') stack.push({ pattern: elem.argument, taint });
+            else stack.push({ pattern: elem, taint });
+          }
+        }
+        break;
+
+      case 'AssignmentPattern': {
+        const paramTaint = taint.tainted ? taint : evaluateExpr(pattern.right, env, ctx);
+        stack.push({ pattern: pattern.left, taint: paramTaint });
+        break;
+      }
     }
   }
 }
@@ -1647,294 +1642,450 @@ function propagateThisToInstance(instanceName, env, ctx) {
 }
 
 // ── Evaluate an expression, returning its TaintSet ──
+// ── Work item kinds for the iterative engine ──
+const W_EVAL_EXPR = 0;       // Evaluate an expression node → push TaintSet to V
+const W_CONTINUATION = 1;    // Run a continuation that pops from V, pushes result
+
+// ── Continuation labels ──
+const C_PASSTHROUGH = 0;      // Pop 1 value, push it back unchanged
+const C_KILL_TAINT = 1;       // Pop 1 value (side effects done), push empty
+const C_IMPORT_EXPR = 2;      // Pop specifier taint, check for XSS, push empty
+const C_YIELD_EXPR = 3;       // Pop yield taint, merge into returnTaint, push it
+const C_MERGE_N = 4;          // Pop N values, merge all, push result
+const C_TAKE_LAST = 5;        // Pop N values, push only the last one
+const C_BINARY_INIT = 6;     // Pop leftmost result, begin binary chain iteration
+const C_BINARY_NEXT = 7;     // Pop right operand result, combine with accum, continue
+const C_LOGICAL_INIT = 8;    // Pop leftmost result, begin logical chain iteration
+const C_LOGICAL_NEXT = 9;    // Pop right operand result, merge with accum, continue
+const C_COND_TEST = 10;      // Pop test taint (discarded), dispatch on constness
+const C_COND_BRANCH = 11;    // Pop branch taint, merge with accum, continue to alternate
+const C_COND_FINAL = 12;     // Pop final alternate taint, merge with accum, push result
+
+// ── Stepper helpers for compound expressions (push work items, no JS recursion) ──
+
+const COMPARISON_OPS = new Set(['===', '==', '!==', '!=', '>', '<', '>=', '<=', 'instanceof', 'in']);
+const ARITHMETIC_OPS = new Set(['-', '*', '/', '%', '**', '|', '&', '^', '<<', '>>', '>>>']);
+
+/** Push work for the next step of a BinaryExpression chain, or finalize. */
+function binaryStep(accum, parts, index, bn, env, ctx, W, V) {
+  if (index < 0) { V.push(accum); return; }
+  const { op, right } = parts[index];
+  if (COMPARISON_OPS.has(op) || ARITHMETIC_OPS.has(op)) {
+    // Evaluate right for side effects, then push empty as final result
+    W.push({ kind: W_CONTINUATION, label: C_KILL_TAINT });
+    W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+    return;
+  }
+  // Evaluate right, then combine in C_BINARY_NEXT
+  W.push({ kind: W_CONTINUATION, label: C_BINARY_NEXT, accum, parts, index, bn, env, ctx });
+  W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+}
+
+/** Push work for the next step of a LogicalExpression chain, or finalize. */
+function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
+  // While loop to handle short-circuit skips without recursion
+  while (index >= 0) {
+    const { op, right } = parts[index];
+    if (op === '&&') {
+      const constLeft = isConstantBool(ln, ctx);
+      if (constLeft === false) { V.push(TaintSet.empty()); return; }
+      W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum, parts, index, ln: right, env, ctx });
+      W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+      return;
+    } else if (op === '||') {
+      const constLeft = isConstantBool(ln, ctx);
+      if (constLeft === true) {
+        // short-circuit: skip right, advance iteratively
+        ln = right;
+        index--;
+        continue;
+      }
+      W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum, parts, index, ln: right, env, ctx });
+      W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+      return;
+    } else if (op === '??') {
+      const isNullish = (ln.type === 'NullLiteral') ||
+        (ln.type === 'Literal' && ln.value === null) ||
+        (ln.type === 'Identifier' && ln.name === 'undefined');
+      if (isNullish) {
+        W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum: TaintSet.empty(), parts, index, ln: right, env, ctx });
+        W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+        return;
+      }
+      const isNonNullishConst = (ln.type === 'StringLiteral') ||
+        (ln.type === 'NumericLiteral') || (ln.type === 'BooleanLiteral') ||
+        (ln.type === 'Literal' && ln.value !== null && ln.value !== undefined) ||
+        (ln.type === 'ObjectExpression') || (ln.type === 'ArrayExpression');
+      if (isNonNullishConst) {
+        // Definitely non-nullish: skip right, advance iteratively
+        ln = right;
+        index--;
+        continue;
+      }
+      W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum, parts, index, ln: right, env, ctx });
+      W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+      return;
+    }
+    break; // unknown op, shouldn't happen
+  }
+  V.push(accum);
+}
+
+/** Push work for the next step of a ConditionalExpression chain, or finalize. */
+function conditionalStep(accum, cn, env, ctx, W, V) {
+  if (cn.type !== 'ConditionalExpression') {
+    // Final alternate — evaluate and merge with accum
+    W.push({ kind: W_CONTINUATION, label: C_COND_FINAL, accum, ctx, node: cn });
+    W.push({ kind: W_EVAL_EXPR, node: cn, env, ctx });
+    return;
+  }
+  // Evaluate test, then dispatch in C_COND_TEST
+  W.push({ kind: W_CONTINUATION, label: C_COND_TEST, accum, cn, env, ctx });
+  W.push({ kind: W_EVAL_EXPR, node: cn.test, env, ctx });
+}
+
+/** Iterative expression evaluator — single work loop with explicit W and V stacks. */
 export function evaluateExpr(node, env, ctx) {
   if (!node) return TaintSet.empty();
 
-  switch (node.type) {
-    case 'Identifier': {
-      // Scope-resolved lookup: try the binding key first, then global: prefix
-      const key = resolveId(node, ctx);
-      const taint = env.get(key);
-      if (taint.tainted) return taint.clone();
-      // If scope-resolved key exists in env (even if safe), trust it — don't fall through
-      // This prevents inner block-scoped safe variables from being shadowed by global tainted ones
-      if (key !== node.name && env.has(key)) return TaintSet.empty();
-      // Fall back: check global: prefix (cross-file globals set via assignToPattern)
-      const globalTaint = env.get(`global:${node.name}`);
-      if (globalTaint.tainted) return globalTaint.clone();
-      // No raw-name fallback — only scope-resolved and explicit global bindings are trusted
-      return TaintSet.empty();
-    }
+  const W = []; // work stack
+  const V = []; // value stack (TaintSet results)
 
-    case 'MemberExpression':
-    case 'OptionalMemberExpression':
-      return evaluateMemberExpr(node, env, ctx);
+  W.push({ kind: W_EVAL_EXPR, node, env, ctx });
 
-    case 'CallExpression':
-    case 'OptionalCallExpression':
-      return evaluateCallExpr(node, env, ctx);
+  while (W.length > 0) {
+    const item = W.pop();
 
-    case 'NewExpression':
-      return evaluateNewExpr(node, env, ctx);
-
-    case 'AssignmentExpression':
-      processAssignment(node, env, ctx);
-      return evaluateExpr(node.left, env, ctx);
-
-    case 'BinaryExpression': {
-      // Flatten left-recursive chains to avoid stack overflow: a + b + c → [a, b, c]
-      const parts = [];
-      let bn = node;
-      while (bn.type === 'BinaryExpression') {
-        parts.push({ op: bn.operator, right: bn.right });
-        bn = bn.left;
+    switch (item.kind) {
+      case W_EVAL_EXPR: {
+        if (!item.node) { V.push(TaintSet.empty()); break; }
+        const _n = item.node, _e = item.env, _c = item.ctx;
+        switch (_n.type) {
+          // ── Stage 1: Leaf nodes (no sub-expression evaluation) ──
+          case 'Identifier': {
+            const key = resolveId(_n, _c);
+            const taint = _e.get(key);
+            if (taint.tainted) { V.push(taint.clone()); break; }
+            if (key !== _n.name && _e.has(key)) { V.push(TaintSet.empty()); break; }
+            const globalTaint = _e.get(`global:${_n.name}`);
+            if (globalTaint.tainted) { V.push(globalTaint.clone()); break; }
+            V.push(TaintSet.empty());
+            break;
+          }
+          case 'ThisExpression':
+            V.push(_e.get('this'));
+            break;
+          case 'StringLiteral':
+          case 'NumericLiteral':
+          case 'BooleanLiteral':
+          case 'NullLiteral':
+          case 'BigIntLiteral':
+          case 'RegExpLiteral':
+          case 'Literal':
+          case 'UpdateExpression':
+            V.push(TaintSet.empty());
+            break;
+          case 'ArrowFunctionExpression':
+          case 'FunctionExpression':
+            _n._closureEnv = _e;
+            V.push(TaintSet.empty());
+            break;
+          // ── Stage 6: MemberExpression ──
+          case 'MemberExpression':
+          case 'OptionalMemberExpression':
+            V.push(evaluateMemberExpr(_n, _e, _c));
+            break;
+          // ── Stage 7: CallExpression / NewExpression ──
+          case 'CallExpression':
+          case 'OptionalCallExpression':
+            V.push(evaluateCallExpr(_n, _e, _c));
+            break;
+          case 'NewExpression':
+            V.push(evaluateNewExpr(_n, _e, _c));
+            break;
+          case 'TaggedTemplateExpression':
+            V.push(evaluateTaggedTemplate(_n, _e, _c));
+            break;
+          // ── Stage 5: AssignmentExpression ──
+          case 'AssignmentExpression':
+            processAssignment(_n, _e, _c);
+            // Return value is the LHS after assignment
+            W.push({ kind: W_EVAL_EXPR, node: _n.left, env: _e, ctx: _c });
+            break;
+          // ── Stage 4: Compound expressions with control flow ──
+          case 'BinaryExpression': {
+            const parts = [];
+            let bn = _n;
+            while (bn.type === 'BinaryExpression') {
+              parts.push({ op: bn.operator, right: bn.right });
+              bn = bn.left;
+            }
+            // Push C_BINARY_INIT to receive leftmost result, then evaluate leftmost
+            W.push({ kind: W_CONTINUATION, label: C_BINARY_INIT, parts, bn, env: _e, ctx: _c });
+            W.push({ kind: W_EVAL_EXPR, node: bn, env: _e, ctx: _c });
+            break;
+          }
+          case 'LogicalExpression': {
+            const parts = [];
+            let ln = _n;
+            while (ln.type === 'LogicalExpression') {
+              parts.push({ op: ln.operator, right: ln.right });
+              ln = ln.left;
+            }
+            W.push({ kind: W_CONTINUATION, label: C_LOGICAL_INIT, parts, ln, env: _e, ctx: _c });
+            W.push({ kind: W_EVAL_EXPR, node: ln, env: _e, ctx: _c });
+            break;
+          }
+          case 'ConditionalExpression':
+            // Push C_COND_TEST to evaluate test and dispatch
+            W.push({ kind: W_CONTINUATION, label: C_COND_TEST, accum: TaintSet.empty(), cn: _n, env: _e, ctx: _c });
+            W.push({ kind: W_EVAL_EXPR, node: _n.test, env: _e, ctx: _c });
+            break;
+          // ── Stage 2: Simple wrappers (1 sub-expression) ──
+          case 'UnaryExpression':
+            if (_n.operator === '!' || _n.operator === 'typeof' ||
+                _n.operator === '+' || _n.operator === '-' || _n.operator === '~' ||
+                _n.operator === 'void' || _n.operator === 'delete') {
+              W.push({ kind: W_CONTINUATION, label: C_KILL_TAINT });
+            } else {
+              W.push({ kind: W_CONTINUATION, label: C_PASSTHROUGH });
+            }
+            W.push({ kind: W_EVAL_EXPR, node: _n.argument, env: _e, ctx: _c });
+            break;
+          case 'AwaitExpression':
+            W.push({ kind: W_CONTINUATION, label: C_PASSTHROUGH });
+            W.push({ kind: W_EVAL_EXPR, node: _n.argument, env: _e, ctx: _c });
+            break;
+          case 'SpreadElement':
+            W.push({ kind: W_CONTINUATION, label: C_PASSTHROUGH });
+            W.push({ kind: W_EVAL_EXPR, node: _n.argument, env: _e, ctx: _c });
+            break;
+          case 'ChainExpression':
+          case 'ParenthesizedExpression':
+            W.push({ kind: W_CONTINUATION, label: C_PASSTHROUGH });
+            W.push({ kind: W_EVAL_EXPR, node: _n.expression, env: _e, ctx: _c });
+            break;
+          // ── Stage 3: Aggregating nodes (N sub-expressions) ──
+          case 'TemplateLiteral': {
+            const exprs = _n.expressions;
+            if (exprs.length === 0) { V.push(TaintSet.empty()); break; }
+            W.push({ kind: W_CONTINUATION, label: C_MERGE_N, count: exprs.length });
+            for (let i = exprs.length - 1; i >= 0; i--)
+              W.push({ kind: W_EVAL_EXPR, node: exprs[i], env: _e, ctx: _c });
+            break;
+          }
+          case 'ObjectExpression': {
+            const props = _n.properties;
+            if (props.length === 0) { V.push(TaintSet.empty()); break; }
+            // Each property contributes one value: spread → argument, property → value
+            W.push({ kind: W_CONTINUATION, label: C_MERGE_N, count: props.length });
+            for (let i = props.length - 1; i >= 0; i--) {
+              const prop = props[i];
+              if (prop.type === 'SpreadElement')
+                W.push({ kind: W_EVAL_EXPR, node: prop.argument, env: _e, ctx: _c });
+              else if (prop.type === 'ObjectProperty' || prop.type === 'Property')
+                W.push({ kind: W_EVAL_EXPR, node: prop.value, env: _e, ctx: _c });
+              else
+                W.push({ kind: W_EVAL_EXPR, node: null, env: _e, ctx: _c }); // safety
+            }
+            break;
+          }
+          case 'ArrayExpression': {
+            const elems = _n.elements;
+            const valid = elems.filter(e => e);
+            if (valid.length === 0) { V.push(TaintSet.empty()); break; }
+            W.push({ kind: W_CONTINUATION, label: C_MERGE_N, count: valid.length });
+            for (let i = valid.length - 1; i >= 0; i--)
+              W.push({ kind: W_EVAL_EXPR, node: valid[i], env: _e, ctx: _c });
+            break;
+          }
+          case 'SequenceExpression': {
+            const exprs = _n.expressions;
+            if (exprs.length === 0) { V.push(TaintSet.empty()); break; }
+            W.push({ kind: W_CONTINUATION, label: C_TAKE_LAST, count: exprs.length });
+            for (let i = exprs.length - 1; i >= 0; i--)
+              W.push({ kind: W_EVAL_EXPR, node: exprs[i], env: _e, ctx: _c });
+            break;
+          }
+          case 'ImportExpression':
+            W.push({ kind: W_CONTINUATION, label: C_IMPORT_EXPR, node: _n, ctx: _c });
+            W.push({ kind: W_EVAL_EXPR, node: _n.source, env: _e, ctx: _c });
+            break;
+          case 'YieldExpression':
+            W.push({ kind: W_CONTINUATION, label: C_YIELD_EXPR, ctx: _c });
+            W.push({ kind: W_EVAL_EXPR, node: _n.argument, env: _e, ctx: _c });
+            break;
+          // ── Everything else: unknown node type → safe ──
+          default:
+            V.push(TaintSet.empty());
+            break;
+        }
+        break;
       }
-      // bn is the leftmost non-BinaryExpression
-      let result = evaluateExpr(bn, env, ctx);
-      for (let i = parts.length - 1; i >= 0; i--) {
-        const { op, right } = parts[i];
-        // Comparison/relational: return boolean — kill taint
-        if (op === '===' || op === '==' || op === '!==' || op === '!=' ||
-            op === '>' || op === '<' || op === '>=' || op === '<=' ||
-            op === 'instanceof' || op === 'in') {
-          evaluateExpr(right, env, ctx); // side effects
-          return TaintSet.empty();
-        }
-        // Arithmetic/bitwise: return number — kill taint
-        if (op === '-' || op === '*' || op === '/' || op === '%' || op === '**' ||
-            op === '|' || op === '&' || op === '^' || op === '<<' || op === '>>' || op === '>>>') {
-          evaluateExpr(right, env, ctx); // side effects
-          return TaintSet.empty();
-        }
-        const rightT = evaluateExpr(right, env, ctx);
-        if (op === '+') {
-          result = result.clone().merge(rightT);
-          // Check toString/valueOf coercion on both operands
-          const leftNode = i === parts.length - 1 ? bn : parts[i + 1].right;
-          for (const operand of [leftNode, right]) {
-            if (operand.type === 'Identifier' && !result.tainted) {
-              const objName = operand.name;
-              const toStringFunc = ctx.funcMap.get(`${objName}.toString`);
-              if (toStringFunc && toStringFunc.body) {
-                const synthCall = { type: 'CallExpression', callee: operand, arguments: [], loc: operand.loc };
-                const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], env, ctx);
-                result = result.merge(toStringTaint);
+
+      case W_CONTINUATION: {
+        switch (item.label) {
+          case C_PASSTHROUGH:
+            // Value already on V — nothing to do
+            break;
+          case C_KILL_TAINT:
+            V.pop(); // discard (evaluated for side effects)
+            V.push(TaintSet.empty());
+            break;
+          case C_IMPORT_EXPR: {
+            const specifierTaint = V.pop();
+            if (specifierTaint.tainted) {
+              for (const label of specifierTaint.labels) {
+                item.ctx.findings.push({
+                  type: 'XSS',
+                  description: `XSS: tainted data flows to dynamic import()`,
+                  location: { file: item.ctx.file, line: item.node.loc?.start?.line || 0, column: item.node.loc?.start?.column || 0 },
+                  source: label,
+                });
               }
             }
+            V.push(TaintSet.empty());
+            break;
           }
-        } else {
-          result = result.clone().merge(rightT);
-        }
-      }
-      return result;
-    }
-
-    case 'LogicalExpression': {
-      // Flatten left-recursive chain to avoid stack overflow: a || b || c → [a, b, c]
-      const parts = []; // {op, node} pairs; first entry has op=null
-      let ln = node;
-      while (ln.type === 'LogicalExpression') {
-        parts.push({ op: ln.operator, right: ln.right });
-        ln = ln.left;
-      }
-      // ln is the leftmost non-LogicalExpression
-      let result = evaluateExpr(ln, env, ctx);
-      for (let i = parts.length - 1; i >= 0; i--) {
-        const { op, right } = parts[i];
-        if (op === '&&') {
-          const constLeft = isConstantBool(ln, ctx);
-          if (constLeft === false) return TaintSet.empty();
-          result = result.clone().merge(evaluateExpr(right, env, ctx));
-        } else if (op === '||') {
-          const constLeft = isConstantBool(ln, ctx);
-          if (constLeft === true) { /* short-circuit: skip right */ }
-          else result = result.clone().merge(evaluateExpr(right, env, ctx));
-        } else if (op === '??') {
-          const isNullish = (ln.type === 'NullLiteral') ||
-            (ln.type === 'Literal' && ln.value === null) ||
-            (ln.type === 'Identifier' && ln.name === 'undefined');
-          if (isNullish) {
-            result = evaluateExpr(right, env, ctx);
-          } else {
-            const isNonNullishConst = (ln.type === 'StringLiteral') ||
-              (ln.type === 'NumericLiteral') || (ln.type === 'BooleanLiteral') ||
-              (ln.type === 'Literal' && ln.value !== null && ln.value !== undefined) ||
-              (ln.type === 'ObjectExpression') || (ln.type === 'ArrayExpression');
-            if (!isNonNullishConst) result = result.clone().merge(evaluateExpr(right, env, ctx));
+          case C_YIELD_EXPR: {
+            const yieldTaint = V.pop();
+            if (yieldTaint.tainted) item.ctx.returnTaint.merge(yieldTaint);
+            V.push(yieldTaint);
+            break;
+          }
+          case C_MERGE_N: {
+            const t = TaintSet.empty();
+            for (let i = 0; i < item.count; i++) t.merge(V.pop());
+            V.push(t);
+            break;
+          }
+          case C_TAKE_LAST: {
+            // All N values are on V; the last expression's result is on top
+            const last = V.pop();
+            for (let i = 1; i < item.count; i++) V.pop(); // discard earlier
+            V.push(last);
+            break;
+          }
+          // ── Stage 4: Binary/Logical/Conditional steppers ──
+          case C_BINARY_INIT: {
+            const leftResult = V.pop();
+            binaryStep(leftResult, item.parts, item.parts.length - 1, item.bn, item.env, item.ctx, W, V);
+            break;
+          }
+          case C_BINARY_NEXT: {
+            const rightT = V.pop();
+            let result = item.accum;
+            const { op, right } = item.parts[item.index];
+            if (op === '+') {
+              result = result.clone().merge(rightT);
+              // Check toString/valueOf coercion on both operands
+              const leftNode = item.index === item.parts.length - 1 ? item.bn : item.parts[item.index + 1].right;
+              for (const operand of [leftNode, right]) {
+                if (operand.type === 'Identifier' && !result.tainted) {
+                  const objName = operand.name;
+                  const toStringFunc = item.ctx.funcMap.get(`${objName}.toString`);
+                  if (toStringFunc && toStringFunc.body) {
+                    const synthCall = { type: 'CallExpression', callee: operand, arguments: [], loc: operand.loc };
+                    const toStringTaint = analyzeCalledFunction(synthCall, `${objName}.toString`, [], item.env, item.ctx);
+                    result = result.merge(toStringTaint);
+                  }
+                }
+              }
+            } else {
+              result = result.clone().merge(rightT);
+            }
+            binaryStep(result, item.parts, item.index - 1, item.bn, item.env, item.ctx, W, V);
+            break;
+          }
+          case C_LOGICAL_INIT: {
+            const leftResult = V.pop();
+            logicalStep(leftResult, item.parts, item.parts.length - 1, item.ln, item.env, item.ctx, W, V);
+            break;
+          }
+          case C_LOGICAL_NEXT: {
+            const rightT = V.pop();
+            const result = item.accum.clone().merge(rightT);
+            logicalStep(result, item.parts, item.index - 1, item.ln, item.env, item.ctx, W, V);
+            break;
+          }
+          case C_COND_TEST: {
+            V.pop(); // discard test taint (evaluated for side effects)
+            const cn = item.cn;
+            const constCond = isConstantBool(cn.test);
+            if (constCond === true) {
+              // Definite true: evaluate consequent as final result
+              W.push({ kind: W_CONTINUATION, label: C_COND_FINAL, accum: TaintSet.empty(), ctx: item.ctx, node: cn.consequent });
+              W.push({ kind: W_EVAL_EXPR, node: cn.consequent, env: item.env, ctx: item.ctx });
+            } else if (constCond === false) {
+              // Definite false: skip to alternate
+              conditionalStep(item.accum, cn.alternate, item.env, item.ctx, W, V);
+            } else {
+              // Unknown: evaluate consequent, then continue to alternate
+              const checkedVar = extractSchemeCheck(cn.test, true);
+              W.push({ kind: W_CONTINUATION, label: C_COND_BRANCH, accum: item.accum, cn, env: item.env, ctx: item.ctx, checkedVar, hadCheck: checkedVar && item.env.schemeCheckedVars.has(checkedVar) });
+              if (checkedVar && !item.env.schemeCheckedVars.has(checkedVar)) item.env.schemeCheckedVars.add(checkedVar);
+              W.push({ kind: W_EVAL_EXPR, node: cn.consequent, env: item.env, ctx: item.ctx });
+            }
+            break;
+          }
+          case C_COND_BRANCH: {
+            const consequentTaint = V.pop();
+            const cn = item.cn;
+            if (item.checkedVar && !item.hadCheck) item.env.schemeCheckedVars.delete(item.checkedVar);
+            let accum = item.accum.merge(consequentTaint);
+            if (!item.ctx.returnedFuncNode && cn.consequent.type === 'Identifier') {
+              const refKey = resolveId(cn.consequent, item.ctx);
+              const funcRef = item.ctx.funcMap.get(refKey) || item.ctx.funcMap.get(cn.consequent.name);
+              if (funcRef) item.ctx.returnedFuncNode = funcRef;
+            }
+            conditionalStep(accum, cn.alternate, item.env, item.ctx, W, V);
+            break;
+          }
+          case C_COND_FINAL: {
+            const taint = V.pop();
+            const result = item.accum.merge(taint);
+            // Check for returnedFuncNode on the final node (passed via item.node if set)
+            if (item.node && !item.ctx.returnedFuncNode && item.node.type === 'Identifier') {
+              const refKey = resolveId(item.node, item.ctx);
+              const funcRef = item.ctx.funcMap.get(refKey) || item.ctx.funcMap.get(item.node.name);
+              if (funcRef) item.ctx.returnedFuncNode = funcRef;
+            }
+            V.push(result);
+            break;
           }
         }
-        ln = parts[i].right; // for next iteration's constLeft check, use this level's right as context
+        break;
       }
-      return result;
     }
-
-    case 'UnaryExpression':
-      if (node.operator === '!' || node.operator === 'typeof' ||
-          node.operator === '+' || node.operator === '-' || node.operator === '~' ||
-          node.operator === 'void' || node.operator === 'delete') {
-        evaluateExpr(node.argument, env, ctx); // evaluate for side effects
-        return TaintSet.empty();
-      }
-      return evaluateExpr(node.argument, env, ctx);
-
-    case 'UpdateExpression':
-      return TaintSet.empty();
-
-    case 'ConditionalExpression': {
-      // Flatten right-recursive ternary chains: a ? b : c ? d : e → iterate
-      let result = TaintSet.empty();
-      let cn = node;
-      while (cn.type === 'ConditionalExpression') {
-        evaluateExpr(cn.test, env, ctx);
-        const constCond = isConstantBool(cn.test);
-        if (constCond === true) {
-          const branch = cn.consequent;
-          result = evaluateExpr(branch, env, ctx);
-          if (!ctx.returnedFuncNode && branch.type === 'Identifier') {
-            const refKey = resolveId(branch, ctx);
-            const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(branch.name);
-            if (funcRef) ctx.returnedFuncNode = funcRef;
-          }
-          return result;
-        }
-        if (constCond === false) {
-          cn = cn.alternate; // continue loop — alternate may be another ConditionalExpression
-          continue;
-        }
-        // Unknown condition: evaluate consequent, then continue with alternate
-        const checkedVar = extractSchemeCheck(cn.test, true);
-        const hadCheck = checkedVar && env.schemeCheckedVars.has(checkedVar);
-        if (checkedVar && !hadCheck) env.schemeCheckedVars.add(checkedVar);
-        const consequentTaint = evaluateExpr(cn.consequent, env, ctx);
-        if (checkedVar && !hadCheck) env.schemeCheckedVars.delete(checkedVar);
-        result = result.merge(consequentTaint);
-        if (!ctx.returnedFuncNode && cn.consequent.type === 'Identifier') {
-          const refKey = resolveId(cn.consequent, ctx);
-          const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.consequent.name);
-          if (funcRef) ctx.returnedFuncNode = funcRef;
-        }
-        cn = cn.alternate;
-      }
-      // cn is the final alternate (not a ConditionalExpression)
-      const altTaint = evaluateExpr(cn, env, ctx);
-      if (!ctx.returnedFuncNode && cn.type === 'Identifier') {
-        const refKey = resolveId(cn, ctx);
-        const funcRef = ctx.funcMap.get(refKey) || ctx.funcMap.get(cn.name);
-        if (funcRef) ctx.returnedFuncNode = funcRef;
-      }
-      return result.merge(altTaint);
-    }
-
-    case 'TemplateLiteral': {
-      const t = TaintSet.empty();
-      for (const expr of node.expressions) t.merge(evaluateExpr(expr, env, ctx));
-      return t;
-    }
-
-    case 'TaggedTemplateExpression': {
-      // Analyze the tag function interprocedurally: tag`...${expr}...` → tag(strings, ...exprs)
-      const exprTaints = node.quasi.expressions.map(e => evaluateExpr(e, env, ctx));
-      const stringsArg = TaintSet.empty(); // template strings array is always safe
-      const allArgTaints = [stringsArg, ...exprTaints];
-      // Resolve the tag function
-      const tagCallee = node.tag;
-      let funcNode = null;
-      if (tagCallee.type === 'Identifier') {
-        funcNode = ctx.funcMap.get(resolveId(tagCallee, ctx)) || ctx.funcMap.get(tagCallee.name);
-      } else if (tagCallee.type === 'MemberExpression') {
-        const tagStr = nodeToString(tagCallee);
-        if (tagStr) funcNode = ctx.funcMap.get(tagStr);
-      }
-      if (funcNode && funcNode.body) {
-        // Build a synthetic call node for interprocedural analysis
-        const synthCall = { type: 'CallExpression', callee: tagCallee, arguments: [{ type: 'ArrayExpression', elements: [] }, ...node.quasi.expressions] };
-        const tagCalleeStr = nodeToString(tagCallee);
-        if (isSanitizer(tagCalleeStr, '')) return TaintSet.empty();
-        return analyzeCalledFunction(synthCall, tagCalleeStr, allArgTaints, env, ctx);
-      }
-      // Fallback: merge all expression taints
-      const t = TaintSet.empty();
-      for (const et of exprTaints) t.merge(et);
-      return t;
-    }
-
-    case 'SequenceExpression': {
-      let r = TaintSet.empty();
-      for (const expr of node.expressions) r = evaluateExpr(expr, env, ctx);
-      return r;
-    }
-
-    case 'ObjectExpression': {
-      const t = TaintSet.empty();
-      for (const prop of node.properties) {
-        if (prop.type === 'SpreadElement') t.merge(evaluateExpr(prop.argument, env, ctx));
-        else if (prop.type === 'ObjectProperty' || prop.type === 'Property') t.merge(evaluateExpr(prop.value, env, ctx));
-      }
-      return t;
-    }
-
-    case 'ArrayExpression': {
-      const t = TaintSet.empty();
-      for (const elem of node.elements) if (elem) t.merge(evaluateExpr(elem, env, ctx));
-      return t;
-    }
-
-    case 'SpreadElement':
-      return evaluateExpr(node.argument, env, ctx);
-
-    case 'ArrowFunctionExpression':
-    case 'FunctionExpression':
-      node._closureEnv = env;
-      return TaintSet.empty();
-
-    case 'AwaitExpression':
-      return evaluateExpr(node.argument, env, ctx);
-
-    case 'ImportExpression': {
-      // import(source) — tainted module specifier is a code injection risk
-      const specifierTaint = evaluateExpr(node.source, env, ctx);
-      if (specifierTaint.tainted) {
-        for (const label of specifierTaint.labels) {
-          ctx.findings.push({
-            type: 'XSS',
-            description: `XSS: tainted data flows to dynamic import()`,
-            location: { file: ctx.file, line: node.loc?.start?.line || 0, column: node.loc?.start?.column || 0 },
-            source: label,
-          });
-        }
-      }
-      return TaintSet.empty();
-    }
-
-    case 'YieldExpression': {
-      const yieldTaint = node.argument ? evaluateExpr(node.argument, env, ctx) : TaintSet.empty();
-      // Track yield taint so generator callers can propagate it through .next().value
-      if (yieldTaint.tainted) ctx.returnTaint.merge(yieldTaint);
-      return yieldTaint;
-    }
-
-    case 'ChainExpression':
-    case 'ParenthesizedExpression':
-      return evaluateExpr(node.expression, env, ctx);
-
-    case 'StringLiteral':
-    case 'NumericLiteral':
-    case 'BooleanLiteral':
-    case 'NullLiteral':
-    case 'BigIntLiteral':
-    case 'RegExpLiteral':
-    case 'Literal':  // Babel compat: old-style literal node
-      return TaintSet.empty();
-
-    case 'ThisExpression':
-      return env.get('this');
-
-    default:
-      return TaintSet.empty();
   }
+
+  return V.pop() || TaintSet.empty();
 }
 
 // ── Member expression ──
+function evaluateTaggedTemplate(node, env, ctx) {
+  const exprTaints = node.quasi.expressions.map(e => evaluateExpr(e, env, ctx));
+  const stringsArg = TaintSet.empty();
+  const allArgTaints = [stringsArg, ...exprTaints];
+  const tagCallee = node.tag;
+  let funcNode = null;
+  if (tagCallee.type === 'Identifier') {
+    funcNode = ctx.funcMap.get(resolveId(tagCallee, ctx)) || ctx.funcMap.get(tagCallee.name);
+  } else if (tagCallee.type === 'MemberExpression') {
+    const tagStr = nodeToString(tagCallee);
+    if (tagStr) funcNode = ctx.funcMap.get(tagStr);
+  }
+  if (funcNode && funcNode.body) {
+    const synthCall = { type: 'CallExpression', callee: tagCallee, arguments: [{ type: 'ArrayExpression', elements: [] }, ...node.quasi.expressions] };
+    const tagCalleeStr = nodeToString(tagCallee);
+    if (isSanitizer(tagCalleeStr, '')) return TaintSet.empty();
+    return analyzeCalledFunction(synthCall, tagCalleeStr, allArgTaints, env, ctx);
+  }
+  const t = TaintSet.empty();
+  for (const et of exprTaints) t.merge(et);
+  return t;
+}
+
 function evaluateMemberExpr(node, env, ctx) {
   // Iterative evaluation for MemberExpression chains to avoid stack overflow on minified code.
   // Walk the chain, checking sources/env/getters at each level. Only recurse for computed access.
@@ -2517,30 +2668,35 @@ function evaluateCallExpr(node, env, ctx) {
 
 // Walk AST to find calls to a named function (e.g., resolve(x) inside Promise constructor)
 // Scope-aware: skips nested function scopes that shadow the resolve parameter
-function walkCallsToResolve(node, resolveName, env, ctx, taintOut) {
-  if (!node || typeof node !== 'object') return;
-  if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
-    if (node.callee?.type === 'Identifier' && node.callee.name === resolveName && node.arguments[0]) {
-      const argTaint = evaluateExpr(node.arguments[0], env, ctx);
-      taintOut.merge(argTaint);
-    }
-  }
-  // Skip nested function scopes that shadow the resolve name
-  if (node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression' ||
-      node.type === 'FunctionDeclaration') {
-    const shadowsResolve = node.params?.some(p =>
-      p.type === 'Identifier' && p.name === resolveName);
-    if (shadowsResolve) return; // nested function shadows the resolve parameter
-  }
-  for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        if (item && typeof item === 'object' && item.type) walkCallsToResolve(item, resolveName, env, ctx, taintOut);
+function walkCallsToResolve(root, resolveName, env, ctx, taintOut) {
+  if (!root || typeof root !== 'object') return;
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
+      if (node.callee?.type === 'Identifier' && node.callee.name === resolveName && node.arguments[0]) {
+        const argTaint = evaluateExpr(node.arguments[0], env, ctx);
+        taintOut.merge(argTaint);
       }
-    } else if (child && typeof child === 'object' && child.type) {
-      walkCallsToResolve(child, resolveName, env, ctx, taintOut);
+    }
+    // Skip nested function scopes that shadow the resolve name
+    if (node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression' ||
+        node.type === 'FunctionDeclaration') {
+      const shadowsResolve = node.params?.some(p =>
+        p.type === 'Identifier' && p.name === resolveName);
+      if (shadowsResolve) continue;
+    }
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (item && typeof item === 'object' && item.type) stack.push(item);
+        }
+      } else if (child && typeof child === 'object' && child.type) {
+        stack.push(child);
+      }
     }
   }
 }
@@ -3279,96 +3435,97 @@ function callbackChecksOrigin(node, ctx) {
   return 'weak';
 }
 
-function collectOriginChecks(node, checks, ctx) {
-  if (!node || typeof node !== 'object') return;
+function collectOriginChecks(root, checks, ctx) {
+  if (!root || typeof root !== 'object') return;
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    let handled = false;
 
-  // Binary comparison: e.origin === / !== / == / != something
-  if (node.type === 'BinaryExpression' &&
-      (node.operator === '===' || node.operator === '==' ||
-       node.operator === '!==' || node.operator === '!=')) {
-    const originSide = isOriginAccess(node.left) ? 'left' : isOriginAccess(node.right) ? 'right' : null;
-    if (originSide) {
-      const otherNode = originSide === 'left' ? node.right : node.left;
-      const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
-      if (otherStr !== null) {
-        checks.push(classifyOriginLiteral(otherStr));
-      } else {
-        // Variable comparison: e.origin === expectedOrigin
-        // Only strong if the variable is not tainted (i.e., not user-controlled)
-        // Analyze the variable: if it's an identifier, check if it's bound to a tainted source
-        const otherIsTainted = ctx && ctx.globalEnv &&
-          (otherNode.type === 'Identifier' && ctx.globalEnv.get(otherNode.name).tainted);
-        checks.push(otherIsTainted ? 'weak' : 'strong');
-      }
-      return;
-    }
-  }
-
-  // Method call on .origin: e.origin.includes(), e.origin.startsWith(), etc.
-  if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
-    const method = node.callee.property?.name;
-    if (isOriginAccess(node.callee.object) && method) {
-      checks.push(classifyOriginMethod(method, node));
-      return;
-    }
-    // Array/Set allowlist check: allowedOrigins.includes(e.origin)
-    if (method === 'includes' || method === 'has') {
-      const arg = node.arguments[0];
-      if (arg && isOriginAccess(arg)) {
-        checks.push('strong'); // allowList.includes(e.origin) is strong
-        return;
-      }
-    }
-    // Regex .test(e.origin): /pattern/.test(e.origin)
-    if (method === 'test') {
-      const arg = node.arguments[0];
-      if (arg && isOriginAccess(arg)) {
-        const pattern = node.callee.object?.regex?.pattern ||
-                        node.callee.object?.pattern || '';
-        checks.push(classifyOriginRegex(pattern));
-        return;
-      }
-    }
-  }
-
-  // Custom validator function call with origin as argument:
-  // isAllowed(e.origin), validateOrigin(e.origin), etc.
-  if (node.type === 'CallExpression') {
-    const hasOriginArg = node.arguments?.some(arg => isOriginAccess(arg));
-    if (hasOriginArg) {
-      // Resolve the function and analyze it — try scope-resolved key first
-      if (ctx) {
-        let funcNode = null;
-        if (node.callee.type === 'Identifier') {
-          const key = resolveId(node.callee, ctx);
-          funcNode = ctx.funcMap.get(key) || ctx.funcMap.get(node.callee.name);
+    // Binary comparison: e.origin === / !== / == / != something
+    if (node.type === 'BinaryExpression' &&
+        (node.operator === '===' || node.operator === '==' ||
+         node.operator === '!==' || node.operator === '!=')) {
+      const originSide = isOriginAccess(node.left) ? 'left' : isOriginAccess(node.right) ? 'right' : null;
+      if (originSide) {
+        const otherNode = originSide === 'left' ? node.right : node.left;
+        const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
+        if (otherStr !== null) {
+          checks.push(classifyOriginLiteral(otherStr));
         } else {
-          const calleeName = nodeToString(node.callee);
-          if (calleeName) funcNode = ctx.funcMap.get(calleeName);
+          const otherIsTainted = ctx && ctx.globalEnv &&
+            (otherNode.type === 'Identifier' && ctx.globalEnv.get(otherNode.name).tainted);
+          checks.push(otherIsTainted ? 'weak' : 'strong');
         }
-        if (funcNode) {
-          const quality = analyzeOriginValidator(funcNode, ctx);
-          checks.push(quality);
-          return;
-        }
+        handled = true;
       }
-      // Unknown/external function with origin arg — cannot analyze, treat conservatively
-      // External functions are unanalyzable, so "weak" is the safest classification
-      checks.push('weak');
-      return;
     }
-  }
 
-  // Recurse into child nodes
-  for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        if (item && typeof item === 'object' && item.type) collectOriginChecks(item, checks, ctx);
+    // Method call on .origin: e.origin.includes(), e.origin.startsWith(), etc.
+    if (!handled && node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
+      const method = node.callee.property?.name;
+      if (isOriginAccess(node.callee.object) && method) {
+        checks.push(classifyOriginMethod(method, node));
+        handled = true;
       }
-    } else if (child && typeof child === 'object' && child.type) {
-      collectOriginChecks(child, checks, ctx);
+      if (!handled && (method === 'includes' || method === 'has')) {
+        const arg = node.arguments[0];
+        if (arg && isOriginAccess(arg)) {
+          checks.push('strong');
+          handled = true;
+        }
+      }
+      if (!handled && method === 'test') {
+        const arg = node.arguments[0];
+        if (arg && isOriginAccess(arg)) {
+          const pattern = node.callee.object?.regex?.pattern ||
+                          node.callee.object?.pattern || '';
+          checks.push(classifyOriginRegex(pattern));
+          handled = true;
+        }
+      }
+    }
+
+    // Custom validator function call with origin as argument
+    if (!handled && node.type === 'CallExpression') {
+      const hasOriginArg = node.arguments?.some(arg => isOriginAccess(arg));
+      if (hasOriginArg) {
+        if (ctx) {
+          let funcNode = null;
+          if (node.callee.type === 'Identifier') {
+            const key = resolveId(node.callee, ctx);
+            funcNode = ctx.funcMap.get(key) || ctx.funcMap.get(node.callee.name);
+          } else {
+            const calleeName = nodeToString(node.callee);
+            if (calleeName) funcNode = ctx.funcMap.get(calleeName);
+          }
+          if (funcNode) {
+            const quality = analyzeOriginValidator(funcNode, ctx);
+            checks.push(quality);
+            handled = true;
+          }
+        }
+        if (!handled) {
+          checks.push('weak');
+          handled = true;
+        }
+      }
+    }
+
+    if (handled) continue;
+
+    // Push child nodes onto stack
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (item && typeof item === 'object' && item.type) stack.push(item);
+        }
+      } else if (child && typeof child === 'object' && child.type) {
+        stack.push(child);
+      }
     }
   }
 }
@@ -3449,57 +3606,61 @@ function analyzeOriginValidator(funcNode, ctx) {
 }
 
 // Scan a validator function body for comparison patterns on its parameter
-function collectOriginValidatorChecks(node, params, checks) {
-  if (!node || typeof node !== 'object') return;
+function collectOriginValidatorChecks(root, params, checks) {
+  if (!root || typeof root !== 'object') return;
   const paramNames = (params || []).map(p => p.type === 'Identifier' ? p.name : null).filter(Boolean);
+  const isParamRef = (n) => n.type === 'Identifier' && paramNames.includes(n.name);
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    let handled = false;
 
-  // Binary comparison: param === 'https://...' or allowList.includes(param)
-  if (node.type === 'BinaryExpression' &&
-      (node.operator === '===' || node.operator === '==' ||
-       node.operator === '!==' || node.operator === '!=')) {
-    const isParamRef = (n) => n.type === 'Identifier' && paramNames.includes(n.name);
-    const paramSide = isParamRef(node.left) ? 'left' : isParamRef(node.right) ? 'right' : null;
-    if (paramSide) {
-      const otherNode = paramSide === 'left' ? node.right : node.left;
-      const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
-      if (otherStr !== null) {
-        checks.push(classifyOriginLiteral(otherStr));
-      } else {
-        // Variable comparison in validator — strong if it's a parameter or local
-        // (not user-controlled), since the function explicitly validates against it
-        checks.push('strong');
-      }
-      return;
-    }
-  }
-
-  // Method call: param.includes(), allowList.includes(param), etc.
-  if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
-    const method = node.callee.property?.name;
-    // param.includes('...'), param.startsWith('...'), etc.
-    if (node.callee.object?.type === 'Identifier' && paramNames.includes(node.callee.object.name) && method) {
-      checks.push(classifyOriginMethod(method, node));
-      return;
-    }
-    // allowList.includes(param) — array allowlist lookup is strong
-    if ((method === 'includes' || method === 'has') && node.arguments?.[0]) {
-      const argNode = node.arguments[0];
-      if (argNode.type === 'Identifier' && paramNames.includes(argNode.name)) {
-        checks.push('strong');
-        return;
+    // Binary comparison: param === 'https://...' or allowList.includes(param)
+    if (node.type === 'BinaryExpression' &&
+        (node.operator === '===' || node.operator === '==' ||
+         node.operator === '!==' || node.operator === '!=')) {
+      const paramSide = isParamRef(node.left) ? 'left' : isParamRef(node.right) ? 'right' : null;
+      if (paramSide) {
+        const otherNode = paramSide === 'left' ? node.right : node.left;
+        const otherStr = isStringLiteral(otherNode) ? stringLiteralValue(otherNode) : null;
+        if (otherStr !== null) {
+          checks.push(classifyOriginLiteral(otherStr));
+        } else {
+          checks.push('strong');
+        }
+        handled = true;
       }
     }
-  }
 
-  for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        if (item && typeof item === 'object' && item.type) collectOriginValidatorChecks(item, params, checks);
+    // Method call: param.includes(), allowList.includes(param), etc.
+    if (!handled && node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
+      const method = node.callee.property?.name;
+      if (node.callee.object?.type === 'Identifier' && paramNames.includes(node.callee.object.name) && method) {
+        checks.push(classifyOriginMethod(method, node));
+        handled = true;
       }
-    } else if (child && typeof child === 'object' && child.type) {
-      collectOriginValidatorChecks(child, params, checks);
+      if (!handled && (method === 'includes' || method === 'has') && node.arguments?.[0]) {
+        const argNode = node.arguments[0];
+        if (argNode.type === 'Identifier' && paramNames.includes(argNode.name)) {
+          checks.push('strong');
+          handled = true;
+        }
+      }
+    }
+
+    if (handled) continue;
+
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (item && typeof item === 'object' && item.type) stack.push(item);
+        }
+      } else if (child && typeof child === 'object' && child.type) {
+        stack.push(child);
+      }
     }
   }
 }
@@ -4020,35 +4181,39 @@ function processForBinding(node, env, ctx) {
 }
 
 // Recursively scan AST for Identifier nodes that reference tainted env bindings
-function collectClosureTaint(node, env, ctx, taintOut, visited) {
-  if (!node || typeof node !== 'object' || visited.has(node)) return;
-  visited.add(node);
-  if (node.type === 'Identifier') {
-    const t = env.get(node.name);
-    if (t.tainted) taintOut.merge(t);
-    // Also check per-element (#idx_) and per-property taint
-    const perIdx = env.getTaintedWithPrefix(`${node.name}.#idx_`);
-    for (const [, pt] of perIdx) taintOut.merge(pt);
-    const perKey = env.getTaintedWithPrefix(`${node.name}.#key_`);
-    for (const [, pt] of perKey) taintOut.merge(pt);
-    return;
-  }
-  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
-    const str = nodeToString(node);
-    if (str) {
-      const t = env.get(str);
-      if (t.tainted) { taintOut.merge(t); return; }
+function collectClosureTaint(root, env, ctx, taintOut, visited) {
+  if (!root || typeof root !== 'object') return;
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object' || visited.has(node)) continue;
+    visited.add(node);
+    if (node.type === 'Identifier') {
+      const t = env.get(node.name);
+      if (t.tainted) taintOut.merge(t);
+      const perIdx = env.getTaintedWithPrefix(`${node.name}.#idx_`);
+      for (const [, pt] of perIdx) taintOut.merge(pt);
+      const perKey = env.getTaintedWithPrefix(`${node.name}.#key_`);
+      for (const [, pt] of perKey) taintOut.merge(pt);
+      continue;
     }
-  }
-  for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        if (item && typeof item === 'object' && item.type) collectClosureTaint(item, env, ctx, taintOut, visited);
+    if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+      const str = nodeToString(node);
+      if (str) {
+        const t = env.get(str);
+        if (t.tainted) { taintOut.merge(t); continue; }
       }
-    } else if (child && typeof child === 'object' && child.type) {
-      collectClosureTaint(child, env, ctx, taintOut, visited);
+    }
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end' || key === '_closureEnv') continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (item && typeof item === 'object' && item.type) stack.push(item);
+        }
+      } else if (child && typeof child === 'object' && child.type) {
+        stack.push(child);
+      }
     }
   }
 }
