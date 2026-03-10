@@ -43262,245 +43262,359 @@ ${rootStack}`;
     if (afterBlock) afterBlock.connect(cfg.exit);
     return cfg;
   }
-  function buildStatements(stmts, current, cfg, ctx) {
-    for (const stmt of stmts) {
-      if (!current) return null;
-      current = buildStatement(stmt, current, cfg, ctx);
-    }
-    return current;
-  }
-  function buildStatement(stmt, current, cfg, ctx) {
-    if (!stmt) return current;
-    switch (stmt.type) {
-      case "ExpressionStatement":
-        current.addNode(stmt.expression);
-        return current;
-      case "VariableDeclaration":
-        for (const decl of stmt.declarations) {
-          if (stmt.kind === "let" || stmt.kind === "const") decl._blockScoped = true;
-          current.addNode(decl);
+  function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
+    const S = [];
+    let cr;
+    S.push({ t: "S", stmts: rootStmts, idx: 0, cur: rootCurrent });
+    while (S.length > 0) {
+      const f = S[S.length - 1];
+      switch (f.t) {
+        case "S": {
+          if (cr !== void 0) {
+            f.cur = cr;
+            cr = void 0;
+          }
+          if (!f.cur || f.idx >= f.stmts.length) {
+            cr = f.cur;
+            S.pop();
+            continue;
+          }
+          const stmt = f.stmts[f.idx++];
+          if (!stmt) continue;
+          switch (stmt.type) {
+            // ── Simple (non-recursive) statements ──
+            case "ExpressionStatement":
+              f.cur.addNode(stmt.expression);
+              continue;
+            case "VariableDeclaration":
+              for (const decl of stmt.declarations) {
+                if (stmt.kind === "let" || stmt.kind === "const") decl._blockScoped = true;
+                f.cur.addNode(decl);
+              }
+              continue;
+            case "ReturnStatement":
+              f.cur.addNode(stmt);
+              f.cur.connect(ctx.returnTarget);
+              f.cur = null;
+              continue;
+            case "ThrowStatement":
+              f.cur.addNode(stmt);
+              f.cur.connect(ctx.throwTarget);
+              f.cur = null;
+              continue;
+            case "BreakStatement": {
+              const target = ctx.getBreakTarget(stmt.label?.name);
+              if (target) f.cur.connect(target);
+              f.cur = null;
+              continue;
+            }
+            case "ContinueStatement": {
+              const target = ctx.getContinueTarget(stmt.label?.name);
+              if (target) f.cur.connect(target);
+              f.cur = null;
+              continue;
+            }
+            case "FunctionDeclaration":
+            case "ClassDeclaration":
+            case "ImportDeclaration":
+            case "ExportNamedDeclaration":
+            case "ExportDefaultDeclaration":
+            case "ExportAllDeclaration":
+              f.cur.addNode(stmt);
+              continue;
+            case "EmptyStatement":
+            case "DebuggerStatement":
+              continue;
+            // ── Complex statements → push frame ──
+            case "IfStatement": {
+              const thenBlock = cfg.createBlock();
+              const joinBlock = cfg.createBlock();
+              thenBlock.branchCondition = stmt.test;
+              thenBlock.branchPolarity = true;
+              f.cur.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
+              f.cur.connect(thenBlock);
+              S.push({ t: "IF", step: 0, stmt, oc: f.cur, thenBlock, joinBlock });
+              S.push({ t: "S", stmts: [stmt.consequent], idx: 0, cur: thenBlock });
+              continue;
+            }
+            case "WhileStatement": {
+              const headerBlock = cfg.createBlock();
+              const bodyBlock = cfg.createBlock();
+              const exitBlock = cfg.createBlock();
+              f.cur.connect(headerBlock);
+              headerBlock.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
+              headerBlock.connect(bodyBlock);
+              headerBlock.connect(exitBlock);
+              ctx.pushLoop(exitBlock, headerBlock, null);
+              S.push({ t: "W", headerBlock, exitBlock });
+              S.push({ t: "S", stmts: [stmt.body], idx: 0, cur: bodyBlock });
+              continue;
+            }
+            case "DoWhileStatement": {
+              const bodyBlock = cfg.createBlock();
+              const testBlock = cfg.createBlock();
+              const exitBlock = cfg.createBlock();
+              f.cur.connect(bodyBlock);
+              ctx.pushLoop(exitBlock, testBlock, null);
+              S.push({ t: "DW", stmt, bodyBlock, testBlock, exitBlock });
+              S.push({ t: "S", stmts: [stmt.body], idx: 0, cur: bodyBlock });
+              continue;
+            }
+            case "ForStatement": {
+              if (stmt.init) {
+                if (stmt.init.type === "VariableDeclaration") {
+                  for (const decl of stmt.init.declarations) {
+                    if (stmt.init.kind === "let" || stmt.init.kind === "const") decl._blockScoped = true;
+                    f.cur.addNode(decl);
+                  }
+                } else {
+                  f.cur.addNode(stmt.init);
+                }
+              }
+              const headerBlock = cfg.createBlock();
+              const bodyBlock = cfg.createBlock();
+              const updateBlock = cfg.createBlock();
+              const exitBlock = cfg.createBlock();
+              f.cur.connect(headerBlock);
+              if (stmt.test) {
+                headerBlock.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
+                headerBlock.connect(bodyBlock);
+                headerBlock.connect(exitBlock);
+              } else {
+                headerBlock.connect(bodyBlock);
+              }
+              ctx.pushLoop(exitBlock, updateBlock, null);
+              S.push({ t: "F", stmt, updateBlock, headerBlock, exitBlock });
+              S.push({ t: "S", stmts: [stmt.body], idx: 0, cur: bodyBlock });
+              continue;
+            }
+            case "ForInStatement":
+            case "ForOfStatement": {
+              const headerBlock = cfg.createBlock();
+              const bodyBlock = cfg.createBlock();
+              const exitBlock = cfg.createBlock();
+              f.cur.addNode(stmt.right);
+              f.cur.connect(headerBlock);
+              headerBlock.addNode({ type: "_ForInOf", left: stmt.left, right: stmt.right, loc: stmt.loc });
+              headerBlock.connect(bodyBlock);
+              headerBlock.connect(exitBlock);
+              ctx.pushLoop(exitBlock, headerBlock, null);
+              S.push({ t: "FI", headerBlock, exitBlock });
+              S.push({ t: "S", stmts: [stmt.body], idx: 0, cur: bodyBlock });
+              continue;
+            }
+            case "SwitchStatement": {
+              f.cur.addNode(stmt.discriminant);
+              const exitBlock = cfg.createBlock();
+              ctx.pushSwitch(exitBlock, null);
+              S.push({ t: "SW", stmt, ci: 0, pf: null, sc: f.cur, exitBlock });
+              continue;
+            }
+            case "TryStatement": {
+              const tryBlock = cfg.createBlock();
+              const joinBlock = cfg.createBlock();
+              f.cur.connect(tryBlock);
+              let catchBlock = null;
+              let prevThrow = null;
+              if (stmt.handler) {
+                catchBlock = cfg.createBlock();
+                catchBlock.addNode({ type: "_CatchParam", param: stmt.handler.param, loc: stmt.handler.loc });
+                prevThrow = ctx.throwTarget;
+                ctx.throwTarget = catchBlock;
+              }
+              S.push({ t: "TRY", step: 0, stmt, tryBlock, joinBlock, catchBlock, prevThrow });
+              S.push({ t: "S", stmts: [stmt.block], idx: 0, cur: tryBlock });
+              continue;
+            }
+            case "LabeledStatement": {
+              const label = stmt.label.name;
+              const exitBlock = cfg.createBlock();
+              ctx.breakTargets.push({ label, block: exitBlock });
+              S.push({ t: "L", label, exitBlock });
+              S.push({ t: "S", stmts: [stmt.body], idx: 0, cur: f.cur });
+              continue;
+            }
+            case "BlockStatement":
+              S.push({ t: "S", stmts: stmt.body, idx: 0, cur: f.cur });
+              continue;
+            case "WithStatement":
+              f.cur.addNode({ type: "_WithScope", object: stmt.object, loc: stmt.loc });
+              S.push({ t: "S", stmts: [stmt.body], idx: 0, cur: f.cur });
+              continue;
+            default:
+              f.cur.addNode(stmt);
+              continue;
+          }
+          break;
         }
-        return current;
-      case "ReturnStatement":
-        current.addNode(stmt);
-        current.connect(ctx.returnTarget);
-        return null;
-      // terminates
-      case "ThrowStatement":
-        current.addNode(stmt);
-        current.connect(ctx.throwTarget);
-        return null;
-      case "BreakStatement": {
-        const target = ctx.getBreakTarget(stmt.label?.name);
-        if (target) current.connect(target);
-        return null;
-      }
-      case "ContinueStatement": {
-        const target = ctx.getContinueTarget(stmt.label?.name);
-        if (target) current.connect(target);
-        return null;
-      }
-      case "IfStatement":
-        return buildIf(stmt, current, cfg, ctx);
-      case "WhileStatement":
-        return buildWhile(stmt, current, cfg, ctx);
-      case "DoWhileStatement":
-        return buildDoWhile(stmt, current, cfg, ctx);
-      case "ForStatement":
-        return buildFor(stmt, current, cfg, ctx);
-      case "ForInStatement":
-      case "ForOfStatement":
-        return buildForIn(stmt, current, cfg, ctx);
-      case "SwitchStatement":
-        return buildSwitch(stmt, current, cfg, ctx);
-      case "TryStatement":
-        return buildTry(stmt, current, cfg, ctx);
-      case "LabeledStatement":
-        return buildLabeled(stmt, current, cfg, ctx);
-      case "BlockStatement":
-        return buildStatements(stmt.body, current, cfg, ctx);
-      case "FunctionDeclaration":
-        current.addNode(stmt);
-        return current;
-      case "ClassDeclaration":
-        current.addNode(stmt);
-        return current;
-      case "ImportDeclaration":
-      case "ExportNamedDeclaration":
-      case "ExportDefaultDeclaration":
-      case "ExportAllDeclaration":
-        current.addNode(stmt);
-        return current;
-      case "WithStatement":
-        current.addNode({ type: "_WithScope", object: stmt.object, loc: stmt.loc });
-        return buildStatement(stmt.body, current, cfg, ctx);
-      case "EmptyStatement":
-      case "DebuggerStatement":
-        return current;
-      default:
-        current.addNode(stmt);
-        return current;
-    }
-  }
-  function buildIf(stmt, current, cfg, ctx) {
-    current.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
-    const thenBlock = cfg.createBlock();
-    const joinBlock = cfg.createBlock();
-    thenBlock.branchCondition = stmt.test;
-    thenBlock.branchPolarity = true;
-    current.connect(thenBlock);
-    const afterThen = buildStatement(stmt.consequent, thenBlock, cfg, ctx);
-    if (afterThen) afterThen.connect(joinBlock);
-    if (stmt.alternate) {
-      const elseBlock = cfg.createBlock();
-      elseBlock.branchCondition = stmt.test;
-      elseBlock.branchPolarity = false;
-      current.connect(elseBlock);
-      const afterElse = buildStatement(stmt.alternate, elseBlock, cfg, ctx);
-      if (afterElse) afterElse.connect(joinBlock);
-    } else {
-      if (!afterThen) {
-        joinBlock.branchCondition = stmt.test;
-        joinBlock.branchPolarity = false;
-      }
-      current.connect(joinBlock);
-    }
-    return joinBlock.predecessors.length > 0 ? joinBlock : null;
-  }
-  function buildWhile(stmt, current, cfg, ctx) {
-    const headerBlock = cfg.createBlock();
-    const bodyBlock = cfg.createBlock();
-    const exitBlock = cfg.createBlock();
-    current.connect(headerBlock);
-    headerBlock.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
-    headerBlock.connect(bodyBlock);
-    headerBlock.connect(exitBlock);
-    ctx.pushLoop(exitBlock, headerBlock, null);
-    const afterBody = buildStatement(stmt.body, bodyBlock, cfg, ctx);
-    ctx.popLoop();
-    if (afterBody) afterBody.connect(headerBlock);
-    return exitBlock;
-  }
-  function buildDoWhile(stmt, current, cfg, ctx) {
-    const bodyBlock = cfg.createBlock();
-    const testBlock = cfg.createBlock();
-    const exitBlock = cfg.createBlock();
-    current.connect(bodyBlock);
-    ctx.pushLoop(exitBlock, testBlock, null);
-    const afterBody = buildStatement(stmt.body, bodyBlock, cfg, ctx);
-    ctx.popLoop();
-    if (afterBody) afterBody.connect(testBlock);
-    testBlock.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
-    testBlock.connect(bodyBlock);
-    testBlock.connect(exitBlock);
-    return exitBlock;
-  }
-  function buildFor(stmt, current, cfg, ctx) {
-    if (stmt.init) {
-      if (stmt.init.type === "VariableDeclaration") {
-        for (const decl of stmt.init.declarations) {
-          if (stmt.init.kind === "let" || stmt.init.kind === "const") decl._blockScoped = true;
-          current.addNode(decl);
+        case "IF": {
+          switch (f.step) {
+            case 0: {
+              const afterThen = cr;
+              cr = void 0;
+              f.afterThen = afterThen;
+              if (afterThen) afterThen.connect(f.joinBlock);
+              if (f.stmt.alternate) {
+                f.step = 1;
+                const elseBlock = cfg.createBlock();
+                elseBlock.branchCondition = f.stmt.test;
+                elseBlock.branchPolarity = false;
+                f.oc.connect(elseBlock);
+                S.push({ t: "S", stmts: [f.stmt.alternate], idx: 0, cur: elseBlock });
+              } else {
+                if (!afterThen) {
+                  f.joinBlock.branchCondition = f.stmt.test;
+                  f.joinBlock.branchPolarity = false;
+                }
+                f.oc.connect(f.joinBlock);
+                cr = f.joinBlock.predecessors.length > 0 ? f.joinBlock : null;
+                S.pop();
+              }
+              continue;
+            }
+            case 1: {
+              const afterElse = cr;
+              cr = void 0;
+              if (afterElse) afterElse.connect(f.joinBlock);
+              cr = f.joinBlock.predecessors.length > 0 ? f.joinBlock : null;
+              S.pop();
+              continue;
+            }
+          }
+          break;
         }
-      } else {
-        current.addNode(stmt.init);
+        case "W": {
+          const afterBody = cr;
+          cr = void 0;
+          ctx.popLoop();
+          if (afterBody) afterBody.connect(f.headerBlock);
+          cr = f.exitBlock;
+          S.pop();
+          continue;
+        }
+        case "DW": {
+          const afterBody = cr;
+          cr = void 0;
+          ctx.popLoop();
+          if (afterBody) afterBody.connect(f.testBlock);
+          f.testBlock.addNode({ type: "_Test", test: f.stmt.test, loc: f.stmt.loc });
+          f.testBlock.connect(f.bodyBlock);
+          f.testBlock.connect(f.exitBlock);
+          cr = f.exitBlock;
+          S.pop();
+          continue;
+        }
+        case "F": {
+          const afterBody = cr;
+          cr = void 0;
+          ctx.popLoop();
+          if (afterBody) afterBody.connect(f.updateBlock);
+          if (f.stmt.update) f.updateBlock.addNode(f.stmt.update);
+          f.updateBlock.connect(f.headerBlock);
+          cr = f.exitBlock;
+          S.pop();
+          continue;
+        }
+        case "FI": {
+          const afterBody = cr;
+          cr = void 0;
+          ctx.popLoop();
+          if (afterBody) afterBody.connect(f.headerBlock);
+          cr = f.exitBlock;
+          S.pop();
+          continue;
+        }
+        case "SW": {
+          if (cr !== void 0) {
+            f.pf = cr;
+            cr = void 0;
+            f.ci++;
+          }
+          if (f.ci >= f.stmt.cases.length) {
+            ctx.popSwitch();
+            if (f.pf) f.pf.connect(f.exitBlock);
+            const hasDefault = f.stmt.cases.some((c) => c.test === null);
+            if (!hasDefault) f.sc.connect(f.exitBlock);
+            cr = f.exitBlock;
+            S.pop();
+            continue;
+          }
+          const caseNode = f.stmt.cases[f.ci];
+          const caseBlock = cfg.createBlock();
+          f.sc.connect(caseBlock);
+          if (f.pf) f.pf.connect(caseBlock);
+          if (caseNode.test) {
+            caseBlock.addNode({ type: "_Test", test: caseNode.test, loc: caseNode.loc });
+          }
+          S.push({ t: "S", stmts: caseNode.consequent, idx: 0, cur: caseBlock });
+          continue;
+        }
+        case "TRY": {
+          switch (f.step) {
+            case 0: {
+              const afterTry = cr;
+              cr = void 0;
+              if (f.catchBlock) {
+                ctx.throwTarget = f.prevThrow;
+                if (afterTry) afterTry.connect(f.joinBlock);
+                f.tryBlock.connect(f.catchBlock);
+                f.step = 1;
+                S.push({ t: "S", stmts: [f.stmt.handler.body], idx: 0, cur: f.catchBlock });
+              } else {
+                if (afterTry) afterTry.connect(f.joinBlock);
+                if (f.stmt.finalizer) {
+                  f.step = 2;
+                  const finallyBlock = cfg.createBlock();
+                  f.afterFinally = cfg.createBlock();
+                  f.joinBlock.connect(finallyBlock);
+                  S.push({ t: "S", stmts: [f.stmt.finalizer], idx: 0, cur: finallyBlock });
+                } else {
+                  cr = f.joinBlock.predecessors.length > 0 ? f.joinBlock : null;
+                  S.pop();
+                }
+              }
+              continue;
+            }
+            case 1: {
+              const afterCatch = cr;
+              cr = void 0;
+              if (afterCatch) afterCatch.connect(f.joinBlock);
+              if (f.stmt.finalizer) {
+                f.step = 2;
+                const finallyBlock = cfg.createBlock();
+                f.afterFinally = cfg.createBlock();
+                f.joinBlock.connect(finallyBlock);
+                S.push({ t: "S", stmts: [f.stmt.finalizer], idx: 0, cur: finallyBlock });
+              } else {
+                cr = f.joinBlock.predecessors.length > 0 ? f.joinBlock : null;
+                S.pop();
+              }
+              continue;
+            }
+            case 2: {
+              const afterFin = cr;
+              cr = void 0;
+              if (afterFin) afterFin.connect(f.afterFinally);
+              cr = f.afterFinally.predecessors.length > 0 ? f.afterFinally : null;
+              S.pop();
+              continue;
+            }
+          }
+          break;
+        }
+        case "L": {
+          const afterBody = cr;
+          cr = void 0;
+          const idx = ctx.breakTargets.findIndex((t) => t.label === f.label);
+          if (idx >= 0) ctx.breakTargets.splice(idx, 1);
+          if (afterBody) afterBody.connect(f.exitBlock);
+          cr = f.exitBlock.predecessors.length > 0 ? f.exitBlock : null;
+          S.pop();
+          continue;
+        }
       }
     }
-    const headerBlock = cfg.createBlock();
-    const bodyBlock = cfg.createBlock();
-    const updateBlock = cfg.createBlock();
-    const exitBlock = cfg.createBlock();
-    current.connect(headerBlock);
-    if (stmt.test) {
-      headerBlock.addNode({ type: "_Test", test: stmt.test, loc: stmt.loc });
-      headerBlock.connect(bodyBlock);
-      headerBlock.connect(exitBlock);
-    } else {
-      headerBlock.connect(bodyBlock);
-    }
-    ctx.pushLoop(exitBlock, updateBlock, null);
-    const afterBody = buildStatement(stmt.body, bodyBlock, cfg, ctx);
-    ctx.popLoop();
-    if (afterBody) afterBody.connect(updateBlock);
-    if (stmt.update) updateBlock.addNode(stmt.update);
-    updateBlock.connect(headerBlock);
-    return exitBlock;
-  }
-  function buildForIn(stmt, current, cfg, ctx) {
-    const headerBlock = cfg.createBlock();
-    const bodyBlock = cfg.createBlock();
-    const exitBlock = cfg.createBlock();
-    current.addNode(stmt.right);
-    current.connect(headerBlock);
-    headerBlock.addNode({ type: "_ForInOf", left: stmt.left, right: stmt.right, loc: stmt.loc });
-    headerBlock.connect(bodyBlock);
-    headerBlock.connect(exitBlock);
-    ctx.pushLoop(exitBlock, headerBlock, null);
-    const afterBody = buildStatement(stmt.body, bodyBlock, cfg, ctx);
-    ctx.popLoop();
-    if (afterBody) afterBody.connect(headerBlock);
-    return exitBlock;
-  }
-  function buildSwitch(stmt, current, cfg, ctx) {
-    current.addNode(stmt.discriminant);
-    const exitBlock = cfg.createBlock();
-    ctx.pushSwitch(exitBlock, null);
-    let prevFallthrough = null;
-    for (const caseNode of stmt.cases) {
-      const caseBlock = cfg.createBlock();
-      current.connect(caseBlock);
-      if (prevFallthrough) prevFallthrough.connect(caseBlock);
-      if (caseNode.test) {
-        caseBlock.addNode({ type: "_Test", test: caseNode.test, loc: caseNode.loc });
-      }
-      const afterCase = buildStatements(caseNode.consequent, caseBlock, cfg, ctx);
-      prevFallthrough = afterCase;
-    }
-    ctx.popSwitch();
-    if (prevFallthrough) prevFallthrough.connect(exitBlock);
-    const hasDefault = stmt.cases.some((c) => c.test === null);
-    if (!hasDefault) current.connect(exitBlock);
-    return exitBlock;
-  }
-  function buildTry(stmt, current, cfg, ctx) {
-    const tryBlock = cfg.createBlock();
-    const joinBlock = cfg.createBlock();
-    current.connect(tryBlock);
-    let catchBlock = null;
-    if (stmt.handler) {
-      catchBlock = cfg.createBlock();
-      catchBlock.addNode({ type: "_CatchParam", param: stmt.handler.param, loc: stmt.handler.loc });
-      const prevThrow = ctx.throwTarget;
-      ctx.throwTarget = catchBlock;
-      const afterTry = buildStatement(stmt.block, tryBlock, cfg, ctx);
-      ctx.throwTarget = prevThrow;
-      if (afterTry) afterTry.connect(joinBlock);
-      tryBlock.connect(catchBlock);
-      const afterCatch = buildStatement(stmt.handler.body, catchBlock, cfg, ctx);
-      if (afterCatch) afterCatch.connect(joinBlock);
-    } else {
-      const afterTry = buildStatement(stmt.block, tryBlock, cfg, ctx);
-      if (afterTry) afterTry.connect(joinBlock);
-    }
-    if (stmt.finalizer) {
-      const finallyBlock = cfg.createBlock();
-      const afterFinally = cfg.createBlock();
-      joinBlock.connect(finallyBlock);
-      const afterFin = buildStatement(stmt.finalizer, finallyBlock, cfg, ctx);
-      if (afterFin) afterFin.connect(afterFinally);
-      return afterFinally.predecessors.length > 0 ? afterFinally : null;
-    }
-    return joinBlock.predecessors.length > 0 ? joinBlock : null;
-  }
-  function buildLabeled(stmt, current, cfg, ctx) {
-    const label = stmt.label.name;
-    const exitBlock = cfg.createBlock();
-    ctx.breakTargets.push({ label, block: exitBlock });
-    const afterBody = buildStatement(stmt.body, current, cfg, ctx);
-    const idx = ctx.breakTargets.findIndex((t) => t.label === label);
-    if (idx >= 0) ctx.breakTargets.splice(idx, 1);
-    if (afterBody) afterBody.connect(exitBlock);
-    return exitBlock.predecessors.length > 0 ? exitBlock : null;
+    return cr;
   }
 
   // src/worker/taint.js
@@ -43668,18 +43782,33 @@ ${rootStack}`;
   ]);
   function nodeToString(node) {
     if (!node) return null;
-    if (node.type === "Identifier") return node.name;
-    if (node.type === "ThisExpression") return "this";
-    if ((node.type === "MemberExpression" || node.type === "OptionalMemberExpression") && !node.computed) {
-      const obj = nodeToString(node.object);
-      const prop = node.property.name || node.property.value || node.property.id?.name;
-      if (obj && prop) return `${obj}.${prop}`;
+    const parts = [];
+    let cur = node;
+    while (cur) {
+      if (cur.type === "Identifier") {
+        parts.push(cur.name);
+        break;
+      }
+      if (cur.type === "ThisExpression") {
+        parts.push("this");
+        break;
+      }
+      if ((cur.type === "MemberExpression" || cur.type === "OptionalMemberExpression") && !cur.computed) {
+        const prop = cur.property.name || cur.property.value || cur.property.id?.name;
+        if (!prop) return null;
+        parts.push(prop);
+        cur = cur.object;
+        continue;
+      }
+      if ((cur.type === "MemberExpression" || cur.type === "OptionalMemberExpression") && cur.computed && cur.property.type === "StringLiteral") {
+        parts.push(cur.property.value);
+        cur = cur.object;
+        continue;
+      }
+      return null;
     }
-    if ((node.type === "MemberExpression" || node.type === "OptionalMemberExpression") && node.computed && node.property.type === "StringLiteral") {
-      const obj = nodeToString(node.object);
-      if (obj) return `${obj}.${node.property.value}`;
-    }
-    return null;
+    parts.reverse();
+    return parts.join(".");
   }
   function checkMemberSource(node) {
     const str = nodeToString(node);
@@ -43960,7 +44089,17 @@ ${rootStack}`;
     if (block.branchCondition) {
       applyBranchCondition(block.branchCondition, block.branchPolarity, env);
     }
-    for (const node of block.nodes) processNode(node, env, ctx);
+    const startIdx = ctx._resumeNodeIdx || 0;
+    ctx._resumeNodeIdx = 0;
+    for (let i = startIdx; i < block.nodes.length; i++) {
+      const savedInlineIdx = ctx._inlineCallIdx;
+      processNode(block.nodes[i], env, ctx);
+      if (ctx._ipSuspended) {
+        ctx._suspendedNodeIdx = i;
+        ctx._suspendedInlineIdx = savedInlineIdx;
+        break;
+      }
+    }
     return env;
   }
   function applyBranchCondition(testNode, polarity, env) {
@@ -44162,26 +44301,51 @@ ${rootStack}`;
   }
   function resolveToConstant(node, _env, ctx) {
     if (!node) return void 0;
-    if (isStringLiteral(node)) return node.value;
-    if (node.type === "NumericLiteral" || node.type === "Literal" && typeof node.value === "number") return node.value;
-    if (node.type === "Identifier") {
-      if (ctx?._paramConstants?.has(node.name)) {
-        return ctx._paramConstants.get(node.name);
-      }
-      if (ctx?.scopeInfo) {
-        const bindingKey = ctx.scopeInfo.resolve(node);
-        if (bindingKey) {
-          const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-          if (declNode?.type === "VariableDeclarator" && declNode.init) {
-            return resolveToConstant(declNode.init, _env, ctx);
-          }
+    if (node.type === "BinaryExpression" && node.operator === "+") {
+      const leaves = [];
+      const flatStack = [node];
+      while (flatStack.length > 0) {
+        const n = flatStack.pop();
+        if (n.type === "BinaryExpression" && n.operator === "+") {
+          flatStack.push(n.right);
+          flatStack.push(n.left);
+        } else {
+          leaves.push(n);
         }
       }
+      let result = "";
+      for (const leaf of leaves) {
+        const val = resolveConstantLeaf(leaf, _env, ctx);
+        if (val === void 0) return void 0;
+        result += String(val);
+      }
+      return result;
     }
-    if (node.type === "BinaryExpression" && node.operator === "+") {
-      const left = resolveToConstant(node.left, _env, ctx);
-      const right = resolveToConstant(node.right, _env, ctx);
-      if (left !== void 0 && right !== void 0) return String(left) + String(right);
+    return resolveConstantLeaf(node, _env, ctx);
+  }
+  function resolveConstantLeaf(node, _env, ctx) {
+    let cur = node;
+    while (cur) {
+      if (!cur) return void 0;
+      if (isStringLiteral(cur)) return cur.value;
+      if (cur.type === "NumericLiteral" || cur.type === "Literal" && typeof cur.value === "number") return cur.value;
+      if (cur.type === "Identifier") {
+        if (ctx?._paramConstants?.has(cur.name)) {
+          return ctx._paramConstants.get(cur.name);
+        }
+        if (ctx?.scopeInfo) {
+          const bindingKey = ctx.scopeInfo.resolve(cur);
+          if (bindingKey) {
+            const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
+            if (declNode?.type === "VariableDeclarator" && declNode.init) {
+              cur = declNode.init;
+              continue;
+            }
+          }
+        }
+        return void 0;
+      }
+      return void 0;
     }
     return void 0;
   }
@@ -44210,58 +44374,90 @@ ${rootStack}`;
     return null;
   }
   function isConstantBoolLeaf(node, ctx) {
-    if (!node) return null;
-    if (node.type === "BooleanLiteral") return node.value;
-    if (node.type === "Literal" && typeof node.value === "boolean") return node.value;
-    if (node.type === "NumericLiteral" || node.type === "Literal" && typeof node.value === "number")
-      return node.value !== 0;
-    if (node.type === "StringLiteral" || node.type === "Literal" && typeof node.value === "string")
-      return node.value !== "";
-    if (node.type === "NullLiteral" || node.type === "Literal" && node.value === null) return false;
-    if (node.type === "Identifier" && node.name === "undefined") return false;
-    if (node.type === "Identifier" && ctx?.scopeInfo) {
-      const bindingKey = ctx.scopeInfo.resolve(node);
-      if (bindingKey) {
-        const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-        if (declNode?.type === "VariableDeclarator" && declNode.init)
-          return isConstantBoolLeaf(declNode.init, null);
+    let cur = node;
+    let curCtx = ctx;
+    while (cur) {
+      if (cur.type === "BooleanLiteral") return cur.value;
+      if (cur.type === "Literal" && typeof cur.value === "boolean") return cur.value;
+      if (cur.type === "NumericLiteral" || cur.type === "Literal" && typeof cur.value === "number")
+        return cur.value !== 0;
+      if (cur.type === "StringLiteral" || cur.type === "Literal" && typeof cur.value === "string")
+        return cur.value !== "";
+      if (cur.type === "NullLiteral" || cur.type === "Literal" && cur.value === null) return false;
+      if (cur.type === "Identifier" && cur.name === "undefined") return false;
+      if (cur.type === "Identifier" && curCtx?.scopeInfo) {
+        const bindingKey = curCtx.scopeInfo.resolve(cur);
+        if (bindingKey) {
+          const declNode = curCtx.scopeInfo.bindingNodes.get(bindingKey);
+          if (declNode?.type === "VariableDeclarator" && declNode.init) {
+            cur = declNode.init;
+            curCtx = null;
+            continue;
+          }
+        }
       }
+      return null;
     }
     return null;
   }
   function isConstantBool(node, ctx) {
     if (!node) return null;
     if (node.type !== "LogicalExpression") return isConstantBoolLeaf(node, ctx);
-    const work = [];
+    const frames = [];
     let cur = node;
-    while (cur.type === "LogicalExpression") {
-      work.push({ op: cur.operator, node: cur.right });
-      cur = cur.left;
-    }
-    let result = isConstantBool(cur, ctx);
-    for (let i = work.length - 1; i >= 0; i--) {
-      const { op, node: rhs } = work[i];
-      const rhsVal = () => isConstantBool(rhs, ctx);
-      if (op === "||") {
-        if (result === true) return true;
-        if (result === false) {
-          result = rhsVal();
-          continue;
-        }
-        return null;
-      } else if (op === "&&") {
-        if (result === false) return false;
-        if (result === true) {
-          result = rhsVal();
-          continue;
-        }
-        return null;
-      } else if (op === "??") {
-        if (result !== null && result !== void 0) continue;
-        return null;
+    for (; ; ) {
+      const work = [];
+      while (cur.type === "LogicalExpression") {
+        work.push({ op: cur.operator, node: cur.right });
+        cur = cur.left;
       }
+      frames.push({ work, idx: work.length - 1, result: isConstantBoolLeaf(cur, ctx) });
+      processFrames:
+        while (frames.length > 0) {
+          const frame = frames[frames.length - 1];
+          while (frame.idx >= 0) {
+            const { op, node: rhs } = frame.work[frame.idx];
+            if (op === "||") {
+              if (frame.result === true) {
+                frame.idx = -1;
+                break;
+              }
+              if (frame.result === null) {
+                frame.idx = -1;
+                frame.result = null;
+                break;
+              }
+            } else if (op === "&&") {
+              if (frame.result === false) {
+                frame.idx = -1;
+                break;
+              }
+              if (frame.result === null) {
+                frame.idx = -1;
+                frame.result = null;
+                break;
+              }
+            } else if (op === "??") {
+              if (frame.result !== null && frame.result !== void 0) {
+                frame.idx--;
+                continue;
+              }
+              frame.idx = -1;
+              frame.result = null;
+              break;
+            }
+            frame.idx--;
+            if (rhs.type === "LogicalExpression") {
+              cur = rhs;
+              break processFrames;
+            }
+            frame.result = isConstantBoolLeaf(rhs, ctx);
+          }
+          const doneResult = frames.pop().result;
+          if (frames.length === 0) return doneResult;
+          frames[frames.length - 1].result = doneResult;
+        }
     }
-    return result;
   }
   function findProtocolMember(node) {
     if (node?.type === "MemberExpression" && node.property?.name === "protocol") {
@@ -44581,7 +44777,9 @@ ${rootStack}`;
       ctx.funcMap.set(node.id.name, node.init);
     }
     if (node.id.type === "Identifier" && node.init && node.init.type === "ObjectExpression") {
-      const registerObjectMethods = (objExpr, prefix) => {
+      const romStack = [{ objExpr: node.init, prefix: node.id.name }];
+      while (romStack.length > 0) {
+        const { objExpr, prefix } = romStack.pop();
         for (const prop of objExpr.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
             const propName = prop.key.name || prop.key.value;
@@ -44600,7 +44798,7 @@ ${rootStack}`;
               }
             }
             if (propName && val && val.type === "ObjectExpression") {
-              registerObjectMethods(val, `${prefix}.${propName}`);
+              romStack.push({ objExpr: val, prefix: `${prefix}.${propName}` });
             }
           }
           if (prop.type === "ObjectMethod" && prop.key) {
@@ -44617,8 +44815,7 @@ ${rootStack}`;
             }
           }
         }
-      };
-      registerObjectMethods(node.init, node.id.name);
+      }
     }
     if (node.id.type === "Identifier" && node.init.type === "Identifier") {
       const refKey = resolveId(node.init, ctx);
@@ -45376,6 +45573,10 @@ ${rootStack}`;
     const V = [];
     W.push({ kind: W_EVAL_EXPR, node, env, ctx });
     while (W.length > 0) {
+      if (ctx._ipSuspended) {
+        V.push(TaintSet.empty());
+        break;
+      }
       const item = W.pop();
       switch (item.kind) {
         case W_EVAL_EXPR: {
@@ -46580,7 +46781,7 @@ ${rootStack}`;
             }
           }
           const body = funcNode.body.type === "BlockStatement" ? funcNode.body : { type: "BlockStatement", body: [{ type: "ReturnStatement", argument: funcNode.body }] };
-          const retTaint = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx);
+          const retTaint = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx, env);
           const thisTaint = TaintSet.empty();
           for (const [key, taint] of childEnv.bindings) {
             if (key.startsWith("this.") && key.length > 5) {
@@ -47306,7 +47507,38 @@ ${rootStack}`;
     }
     return cbResult;
   }
-  function analyzeInlineFunction(funcNode, env, ctx) {
+  var _GLOBAL_OBJ_PREFIXES = ["window.", "self.", "globalThis."];
+  function _finalizeFrame(frame) {
+    const { innerCtx, callerCtx, env, cfg, blockEnvs } = frame;
+    const exitState = blockEnvs.get(cfg.exit.id);
+    if (exitState) env.mergeFrom(exitState);
+    for (const pred of cfg.exit.predecessors) {
+      const state = blockEnvs.get(pred.id);
+      if (state) env.mergeFrom(state);
+    }
+    if (innerCtx.returnedFuncNode) callerCtx.returnedFuncNode = innerCtx.returnedFuncNode;
+    if (innerCtx.returnedMethods) callerCtx.returnedMethods = innerCtx.returnedMethods;
+    if (innerCtx.returnElementTaints) callerCtx.returnElementTaints = innerCtx.returnElementTaints;
+    if (innerCtx.returnPropertyTaints) callerCtx.returnPropertyTaints = innerCtx.returnPropertyTaints;
+    for (const [key, val] of innerCtx.funcMap) {
+      if (callerCtx.funcMap.has(key)) continue;
+      if (key.length > 2 && key[key.length - 1] === "]" && key[key.length - 2] === "[") {
+        callerCtx.funcMap.set(key, val);
+      } else if (key.charCodeAt(0) === 116 && key.startsWith("this.")) {
+        callerCtx.funcMap.set(key, val);
+      } else {
+        for (const prefix of _GLOBAL_OBJ_PREFIXES) {
+          if (key.length > prefix.length && key.slice(0, prefix.length) === prefix) {
+            callerCtx.funcMap.set(key, val);
+            const stripped = key.slice(prefix.length);
+            if (stripped && !callerCtx.funcMap.has(stripped)) callerCtx.funcMap.set(stripped, val);
+            break;
+          }
+        }
+      }
+    }
+  }
+  function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
     const innerCfg = buildCFG(funcNode.body);
     const innerCtx = new AnalysisContext(
       ctx.file,
@@ -47321,65 +47553,126 @@ ${rootStack}`;
     innerCtx.protoMethodMap = ctx.protoMethodMap;
     if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
     if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
-    const blockEnvs = /* @__PURE__ */ new Map();
-    blockEnvs.set(innerCfg.entry.id, env.clone());
-    const worklist = [innerCfg.entry];
-    const inWorklist = /* @__PURE__ */ new Set([innerCfg.entry.id]);
-    while (worklist.length > 0) {
-      const block = worklist.shift();
-      inWorklist.delete(block.id);
-      const entryEnv = blockEnvs.get(block.id);
-      if (!entryEnv) continue;
-      const exitEnv = processBlock(block, entryEnv.clone(), innerCtx);
-      for (const succ of block.successors) {
-        if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
-          const val = isConstantBool(succ.branchCondition);
-          if (val === false && succ.branchPolarity === true) continue;
-          if (val === true && succ.branchPolarity === false) continue;
-        }
-        const existing = blockEnvs.get(succ.id);
-        if (!existing) {
-          blockEnvs.set(succ.id, exitEnv.clone());
-          if (!inWorklist.has(succ.id)) {
-            worklist.push(succ);
-            inWorklist.add(succ.id);
+    const frame = {
+      cfg: innerCfg,
+      worklist: [innerCfg.entry],
+      blockEnvs: /* @__PURE__ */ new Map([[innerCfg.entry.id, env.clone()]]),
+      inWorklist: /* @__PURE__ */ new Set([innerCfg.entry.id]),
+      innerCtx,
+      callerCtx: ctx,
+      env,
+      postProcess: null
+    };
+    if (callerEnv) {
+      const _childEnv = env;
+      frame.postProcess = (result) => {
+        for (const [key, taint] of _childEnv.bindings) {
+          if (key.startsWith("this.") && key.length > 5) {
+            callerEnv.set(key, taint);
           }
+        }
+      };
+    }
+    if (ctx._ipStack) {
+      const callIdx = ctx._inlineCallIdx++;
+      const cacheKey = `${ctx._currentBlockId}:${callIdx}`;
+      if (!ctx._inlineResults) ctx._inlineResults = /* @__PURE__ */ new Map();
+      if (ctx._inlineResults.has(cacheKey)) {
+        const cached = ctx._inlineResults.get(cacheKey);
+        if (cached._returnedFuncNode) ctx.returnedFuncNode = cached._returnedFuncNode;
+        if (cached._returnedMethods) ctx.returnedMethods = cached._returnedMethods;
+        if (cached._returnElementTaints) ctx.returnElementTaints = cached._returnElementTaints;
+        if (cached._returnPropertyTaints) ctx.returnPropertyTaints = cached._returnPropertyTaints;
+        return cached.clone();
+      }
+      frame._inlineCacheKey = cacheKey;
+      frame._parentInlineResults = ctx._inlineResults;
+      ctx._ipStack.push(frame);
+      ctx._ipSuspended = true;
+      return TaintSet.empty();
+    }
+    return _runIPLoop([frame]);
+  }
+  function _runIPLoop(ipStack) {
+    let finalResult = TaintSet.empty();
+    while (ipStack.length > 0) {
+      const frame = ipStack[ipStack.length - 1];
+      const { worklist, blockEnvs, inWorklist, innerCtx } = frame;
+      innerCtx._ipStack = ipStack;
+      let suspended = false;
+      while (worklist.length > 0) {
+        const block = worklist.shift();
+        inWorklist.delete(block.id);
+        const entryEnv = blockEnvs.get(block.id);
+        if (!entryEnv) continue;
+        innerCtx._currentBlockId = block.id;
+        let processEnv;
+        if (frame._checkpoint && frame._checkpoint.blockId === block.id) {
+          processEnv = frame._checkpoint.env;
+          innerCtx._resumeNodeIdx = frame._checkpoint.nodeIdx;
+          innerCtx._inlineCallIdx = frame._checkpoint.inlineCallIdx;
+          frame._checkpoint = null;
         } else {
-          if (existing.mergeFrom(exitEnv) && !inWorklist.has(succ.id)) {
-            worklist.push(succ);
-            inWorklist.add(succ.id);
-          }
+          processEnv = entryEnv.clone();
+          innerCtx._inlineCallIdx = 0;
         }
-      }
-    }
-    const exitState = blockEnvs.get(innerCfg.exit.id);
-    if (exitState) env.mergeFrom(exitState);
-    for (const pred of innerCfg.exit.predecessors) {
-      const state = blockEnvs.get(pred.id);
-      if (state) env.mergeFrom(state);
-    }
-    if (innerCtx.returnedFuncNode) ctx.returnedFuncNode = innerCtx.returnedFuncNode;
-    if (innerCtx.returnedMethods) ctx.returnedMethods = innerCtx.returnedMethods;
-    if (innerCtx.returnElementTaints) ctx.returnElementTaints = innerCtx.returnElementTaints;
-    if (innerCtx.returnPropertyTaints) ctx.returnPropertyTaints = innerCtx.returnPropertyTaints;
-    const GLOBAL_OBJ_PREFIXES = ["window.", "self.", "globalThis."];
-    for (const [key, val] of innerCtx.funcMap) {
-      if (key.length > 2 && key[key.length - 1] === "]" && key[key.length - 2] === "[" && !ctx.funcMap.has(key)) {
-        ctx.funcMap.set(key, val);
-      }
-      if (key.startsWith("this.") && !ctx.funcMap.has(key)) {
-        ctx.funcMap.set(key, val);
-      }
-      for (const prefix of GLOBAL_OBJ_PREFIXES) {
-        if (key.length > prefix.length && key.slice(0, prefix.length) === prefix && !ctx.funcMap.has(key)) {
-          ctx.funcMap.set(key, val);
-          const stripped = key.slice(prefix.length);
-          if (stripped && !ctx.funcMap.has(stripped)) ctx.funcMap.set(stripped, val);
+        const exitEnv = processBlock(block, processEnv, innerCtx);
+        if (innerCtx._ipSuspended) {
+          innerCtx._ipSuspended = false;
+          frame._checkpoint = {
+            blockId: block.id,
+            env: exitEnv,
+            nodeIdx: innerCtx._suspendedNodeIdx,
+            inlineCallIdx: innerCtx._suspendedInlineIdx
+          };
+          worklist.unshift(block);
+          inWorklist.add(block.id);
+          suspended = true;
           break;
         }
+        for (const succ of block.successors) {
+          if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
+            const val = isConstantBool(succ.branchCondition);
+            if (val === false && succ.branchPolarity === true) continue;
+            if (val === true && succ.branchPolarity === false) continue;
+          }
+          const existing = blockEnvs.get(succ.id);
+          if (!existing) {
+            blockEnvs.set(succ.id, exitEnv.clone());
+            if (!inWorklist.has(succ.id)) {
+              worklist.push(succ);
+              inWorklist.add(succ.id);
+            }
+          } else {
+            if (existing.mergeFrom(exitEnv) && !inWorklist.has(succ.id)) {
+              worklist.push(succ);
+              inWorklist.add(succ.id);
+            }
+          }
+        }
+      }
+      if (suspended) continue;
+      innerCtx._ipStack = null;
+      _finalizeFrame(frame);
+      const returnTaint = innerCtx.returnTaint;
+      if (frame.postProcess) {
+        frame.postProcess(returnTaint);
+      }
+      if (frame._inlineCacheKey && frame._parentInlineResults) {
+        const cached = returnTaint.clone();
+        if (innerCtx.returnedFuncNode) cached._returnedFuncNode = innerCtx.returnedFuncNode;
+        if (innerCtx.returnedMethods) cached._returnedMethods = innerCtx.returnedMethods;
+        if (innerCtx.returnElementTaints) cached._returnElementTaints = innerCtx.returnElementTaints;
+        if (innerCtx.returnPropertyTaints) cached._returnPropertyTaints = innerCtx.returnPropertyTaints;
+        frame._parentInlineResults.set(frame._inlineCacheKey, cached);
+      }
+      ipStack.pop();
+      if (ipStack.length > 0) {
+      } else {
+        finalResult = returnTaint;
       }
     }
-    return innerCtx.returnTaint;
+    return finalResult;
   }
   function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     let funcNode = null;
@@ -47418,20 +47711,23 @@ ${rootStack}`;
       }
       if (!funcNode && callNode.callee.type === "ConditionalExpression") {
         const resolveTernaryBranches = (condNode) => {
-          const condConst = isConstantBool(condNode.test);
-          let branches;
-          if (condConst === true) branches = [condNode.consequent];
-          else if (condConst === false) branches = [condNode.alternate];
-          else branches = [condNode.consequent, condNode.alternate];
-          const result2 = [];
-          for (const branch of branches) {
-            if (branch.type === "ConditionalExpression") {
-              result2.push(...resolveTernaryBranches(branch));
-            } else {
-              result2.push(branch);
+          const result = [];
+          const rtbStack = [condNode];
+          while (rtbStack.length > 0) {
+            const cur = rtbStack.pop();
+            if (cur.type !== "ConditionalExpression") {
+              result.push(cur);
+              continue;
+            }
+            const condConst = isConstantBool(cur.test);
+            if (condConst === true) rtbStack.push(cur.consequent);
+            else if (condConst === false) rtbStack.push(cur.alternate);
+            else {
+              rtbStack.push(cur.alternate);
+              rtbStack.push(cur.consequent);
             }
           }
-          return result2;
+          return result;
         };
         const leafBranches = resolveTernaryBranches(callNode.callee);
         for (const branch of leafBranches) {
@@ -47493,8 +47789,15 @@ ${rootStack}`;
     if (!funcNode || !funcNode.body) return TaintSet.empty();
     const superSuffix = callNode.callee?.type === "Super" && ctx._currentSuperClass ? `:super=${ctx._currentSuperClass}` : "";
     const locSuffix = !calleeStr && funcNode.loc ? `:${funcNode.loc.start.line}:${funcNode.loc.start.column}` : "";
-    const callSig = `${calleeStr || "anon"}:${argTaints.map((t) => t.tainted ? "1" : "0").join("")}${superSuffix}${locSuffix}`;
-    if (ctx.analyzedCalls.has(callSig)) return ctx.analyzedCalls.get(callSig)?.clone() || TaintSet.empty();
+    let taintBits = 0;
+    for (let i = 0; i < argTaints.length; i++) if (argTaints[i].tainted) taintBits |= 1 << i;
+    const callSig = `${calleeStr || "anon"}:${taintBits}${superSuffix}${locSuffix}`;
+    if (ctx.analyzedCalls.has(callSig)) {
+      const cached = ctx.analyzedCalls.get(callSig);
+      if (cached && cached._returnedFuncNode) ctx.returnedFuncNode = cached._returnedFuncNode;
+      if (cached && cached._returnedMethods) ctx.returnedMethods = cached._returnedMethods;
+      return cached?.clone() || TaintSet.empty();
+    }
     ctx.analyzedCalls.set(callSig, TaintSet.empty());
     const closureEnv = funcNode._closureEnv || env;
     const childEnv = closureEnv.child();
@@ -47686,71 +47989,107 @@ ${rootStack}`;
     }
     if (paramConstants.size > 0) ctx._paramConstants = paramConstants;
     const body = funcNode.body.type === "BlockStatement" ? funcNode.body : { type: "BlockStatement", body: [{ type: "ReturnStatement", argument: funcNode.body }] };
-    const result = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx);
-    ctx._paramConstants = savedParamConstants;
-    ctx.funcMap = savedFuncMap;
-    for (const [key, val] of innerFuncMap) {
-      if (!savedFuncMap.has(key)) savedFuncMap.set(key, val);
-    }
-    if (callNode.callee?.type === "Super") {
-      for (const [key, taint] of childEnv.bindings) {
-        if (key.startsWith("this.") && taint.tainted) {
-          env.set(key, taint);
-        }
+    const innerCfg = buildCFG(body);
+    const innerCtx = new AnalysisContext(
+      ctx.file,
+      new Map(innerFuncMap),
+      ctx.findings,
+      ctx.globalEnv,
+      ctx.scopeInfo,
+      ctx.analyzedCalls
+    );
+    innerCtx.classBodyMap = ctx.classBodyMap;
+    innerCtx.superClassMap = ctx.superClassMap;
+    innerCtx.protoMethodMap = ctx.protoMethodMap;
+    if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
+    if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
+    const _callNode = callNode, _callSig = callSig, _childEnv = childEnv, _funcNode = funcNode, _methodObjName2 = _methodObjName, _paramNames = paramNames, _savedFuncMap = savedFuncMap, _savedParamConstants = savedParamConstants, _innerFuncMap = innerFuncMap, _callerEnv = env, _callerCtx = ctx;
+    const postProcess = (result) => {
+      _callerCtx._paramConstants = _savedParamConstants;
+      _callerCtx.funcMap = _savedFuncMap;
+      for (const [key, val] of _innerFuncMap) {
+        if (!_savedFuncMap.has(key)) _savedFuncMap.set(key, val);
       }
-    }
-    if (callNode.callee?.type === "MemberExpression" || callNode.callee?.type === "OptionalMemberExpression") {
-      const objName = nodeToString(callNode.callee.object);
-      for (const [key, taint] of childEnv.bindings) {
-        if (key.startsWith("this.") && taint.tainted) {
-          const propName = key.slice(5);
-          if (objName) env.set(`${objName}.${propName}`, taint);
-          env.set(key, taint);
-        }
-      }
-      if (objName) {
-        for (const [key, val] of innerFuncMap) {
-          if (key.startsWith("this.")) {
-            const propName = key.slice(5);
-            savedFuncMap.set(`${objName}.${propName}`, val);
+      if (_callNode.callee?.type === "Super") {
+        for (const [key, taint] of _childEnv.bindings) {
+          if (key.startsWith("this.") && taint.tainted) {
+            _callerEnv.set(key, taint);
           }
         }
       }
-    }
-    if (funcNode._closureEnv) {
-      for (const [key, taint] of childEnv.bindings) {
-        if (taint.tainted && !key.startsWith("this.") && !paramNames.has(key) && key !== "this") {
-          funcNode._closureEnv.set(key, taint);
+      if (_callNode.callee?.type === "MemberExpression" || _callNode.callee?.type === "OptionalMemberExpression") {
+        const objName = nodeToString(_callNode.callee.object);
+        for (const [key, taint] of _childEnv.bindings) {
+          if (key.startsWith("this.") && taint.tainted) {
+            const propName = key.slice(5);
+            if (objName) _callerEnv.set(`${objName}.${propName}`, taint);
+            _callerEnv.set(key, taint);
+          }
+        }
+        if (objName) {
+          for (const [key, val] of _innerFuncMap) {
+            if (key.startsWith("this.")) {
+              const propName = key.slice(5);
+              _savedFuncMap.set(`${objName}.${propName}`, val);
+            }
+          }
         }
       }
-    }
-    for (const [key, taint] of childEnv.bindings) {
-      if (key.startsWith("this.") || key === "this" || key.startsWith("global:") || paramNames.has(key) || key.indexOf(".") !== -1) continue;
-      if (env.has(key)) {
-        env.set(key, taint);
-      }
-    }
-    for (const [key, taint] of childEnv.bindings) {
-      if (taint.tainted && key.indexOf(".") !== -1 && key.slice(0, 5) !== "this." && key.slice(0, 7) !== "global:" && !(key[0] >= "0" && key[0] <= "9")) {
-        env.set(key, taint);
-      }
-    }
-    for (let i = 0; i < funcNode.params.length && i < callNode.arguments.length; i++) {
-      const param = funcNode.params[i];
-      if (param.type !== "Identifier") continue;
-      const pName = param.name;
-      const argNode = callNode.arguments[i];
-      const argStr = nodeToString(argNode);
-      if (!argStr || argStr === pName) continue;
-      for (const [key, taint] of childEnv.bindings) {
-        if (key.startsWith(pName + ".")) {
-          const suffix = key.slice(pName.length);
-          env.set(`${argStr}${suffix}`, taint);
+      if (_funcNode._closureEnv) {
+        for (const [key, taint] of _childEnv.bindings) {
+          if (taint.tainted && !key.startsWith("this.") && !_paramNames.has(key) && key !== "this") {
+            _funcNode._closureEnv.set(key, taint);
+          }
         }
       }
+      for (const [key, taint] of _childEnv.bindings) {
+        if (key.startsWith("this.") || key === "this" || key.startsWith("global:") || _paramNames.has(key) || key.indexOf(".") !== -1) continue;
+        if (_callerEnv.has(key)) {
+          _callerEnv.set(key, taint);
+        }
+      }
+      for (const [key, taint] of _childEnv.bindings) {
+        if (taint.tainted && key.indexOf(".") !== -1 && key.slice(0, 5) !== "this." && key.slice(0, 7) !== "global:" && !(key[0] >= "0" && key[0] <= "9")) {
+          _callerEnv.set(key, taint);
+        }
+      }
+      for (let i = 0; i < _funcNode.params.length && i < _callNode.arguments.length; i++) {
+        const param = _funcNode.params[i];
+        if (param.type !== "Identifier") continue;
+        const pName = param.name;
+        const argNode = _callNode.arguments[i];
+        const argStr = nodeToString(argNode);
+        if (!argStr || argStr === pName) continue;
+        for (const [key, taint] of _childEnv.bindings) {
+          if (key.startsWith(pName + ".")) {
+            const suffix = key.slice(pName.length);
+            _callerEnv.set(`${argStr}${suffix}`, taint);
+          }
+        }
+      }
+      const cachedResult = result.tainted ? result : TaintSet.empty();
+      if (innerCtx.returnedFuncNode) cachedResult._returnedFuncNode = innerCtx.returnedFuncNode;
+      if (innerCtx.returnedMethods) cachedResult._returnedMethods = innerCtx.returnedMethods;
+      _callerCtx.analyzedCalls.set(_callSig, cachedResult);
+    };
+    const frame = {
+      cfg: innerCfg,
+      worklist: [innerCfg.entry],
+      blockEnvs: /* @__PURE__ */ new Map([[innerCfg.entry.id, childEnv.clone()]]),
+      inWorklist: /* @__PURE__ */ new Set([innerCfg.entry.id]),
+      innerCtx,
+      callerCtx: ctx,
+      env: childEnv,
+      postProcess
+    };
+    if (ctx._ipStack) {
+      ctx._ipStack.push(frame);
+      ctx._ipSuspended = true;
+      ctx._paramConstants = savedParamConstants;
+      ctx.funcMap = savedFuncMap;
+      return TaintSet.empty();
     }
-    if (result.tainted) ctx.analyzedCalls.set(callSig, result);
-    return result;
+    return _runIPLoop([frame]);
   }
   function processForBinding(node, env, ctx) {
     let iterableTaint = evaluateExpr(node.right, env, ctx);
@@ -48284,27 +48623,30 @@ ${rootStack}`;
   };
   function walkPattern(node, visitor) {
     if (!node) return;
-    switch (node.type) {
-      case "Identifier":
-        visitor(node);
-        break;
-      case "ObjectPattern":
-        for (const prop of node.properties) {
-          if (prop.type === "RestElement") walkPattern(prop.argument, visitor);
-          else walkPattern(prop.value, visitor);
-        }
-        break;
-      case "ArrayPattern":
-        for (const elem of node.elements) {
-          if (elem) {
-            if (elem.type === "RestElement") walkPattern(elem.argument, visitor);
-            else walkPattern(elem, visitor);
+    const stack = [node];
+    while (stack.length > 0) {
+      const n = stack.pop();
+      if (!n) continue;
+      switch (n.type) {
+        case "Identifier":
+          visitor(n);
+          break;
+        case "ObjectPattern":
+          for (let i = n.properties.length - 1; i >= 0; i--) {
+            const prop = n.properties[i];
+            stack.push(prop.type === "RestElement" ? prop.argument : prop.value);
           }
-        }
-        break;
-      case "AssignmentPattern":
-        walkPattern(node.left, visitor);
-        break;
+          break;
+        case "ArrayPattern":
+          for (let i = n.elements.length - 1; i >= 0; i--) {
+            const elem = n.elements[i];
+            if (elem) stack.push(elem.type === "RestElement" ? elem.argument : elem);
+          }
+          break;
+        case "AssignmentPattern":
+          stack.push(n.left);
+          break;
+      }
     }
   }
 

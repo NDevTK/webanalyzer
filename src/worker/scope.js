@@ -129,26 +129,30 @@ export class ScopeInfo {
 // calling visitor for each Identifier leaf
 function walkPattern(node, visitor) {
   if (!node) return;
-  switch (node.type) {
-    case 'Identifier':
-      visitor(node);
-      break;
-    case 'ObjectPattern':
-      for (const prop of node.properties) {
-        if (prop.type === 'RestElement') walkPattern(prop.argument, visitor);
-        else walkPattern(prop.value, visitor);
-      }
-      break;
-    case 'ArrayPattern':
-      for (const elem of node.elements) {
-        if (elem) {
-          if (elem.type === 'RestElement') walkPattern(elem.argument, visitor);
-          else walkPattern(elem, visitor);
+  // Iterative: explicit stack of pattern nodes to visit
+  const stack = [node];
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (!n) continue;
+    switch (n.type) {
+      case 'Identifier':
+        visitor(n);
+        break;
+      case 'ObjectPattern':
+        for (let i = n.properties.length - 1; i >= 0; i--) {
+          const prop = n.properties[i];
+          stack.push(prop.type === 'RestElement' ? prop.argument : prop.value);
         }
-      }
-      break;
-    case 'AssignmentPattern':
-      walkPattern(node.left, visitor);
-      break;
+        break;
+      case 'ArrayPattern':
+        for (let i = n.elements.length - 1; i >= 0; i--) {
+          const elem = n.elements[i];
+          if (elem) stack.push(elem.type === 'RestElement' ? elem.argument : elem);
+        }
+        break;
+      case 'AssignmentPattern':
+        stack.push(n.left);
+        break;
+    }
   }
 }

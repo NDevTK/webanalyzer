@@ -181,18 +181,28 @@ export const SANITIZERS = new Set([
 // Resolve a MemberExpression or Identifier to a dot-path string
 export function nodeToString(node) {
   if (!node) return null;
-  if (node.type === 'Identifier') return node.name;
-  if (node.type === 'ThisExpression') return 'this';
-  if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') && !node.computed) {
-    const obj = nodeToString(node.object);
-    const prop = node.property.name || node.property.value || node.property.id?.name;
-    if (obj && prop) return `${obj}.${prop}`;
+  // Iterative: walk MemberExpression chain leftward, collect parts, reverse and join
+  const parts = [];
+  let cur = node;
+  while (cur) {
+    if (cur.type === 'Identifier') { parts.push(cur.name); break; }
+    if (cur.type === 'ThisExpression') { parts.push('this'); break; }
+    if ((cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression') && !cur.computed) {
+      const prop = cur.property.name || cur.property.value || cur.property.id?.name;
+      if (!prop) return null;
+      parts.push(prop);
+      cur = cur.object;
+      continue;
+    }
+    if ((cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression') && cur.computed && cur.property.type === 'StringLiteral') {
+      parts.push(cur.property.value);
+      cur = cur.object;
+      continue;
+    }
+    return null;
   }
-  if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') && node.computed && node.property.type === 'StringLiteral') {
-    const obj = nodeToString(node.object);
-    if (obj) return `${obj}.${node.property.value}`;
-  }
-  return null;
+  parts.reverse();
+  return parts.join('.');
 }
 
 // Check if a node is a taint source and return its label

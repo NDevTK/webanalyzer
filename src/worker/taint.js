@@ -273,7 +273,17 @@ function processBlock(block, env, ctx) {
   if (block.branchCondition) {
     applyBranchCondition(block.branchCondition, block.branchPolarity, env);
   }
-  for (const node of block.nodes) processNode(node, env, ctx);
+  const startIdx = ctx._resumeNodeIdx || 0;
+  ctx._resumeNodeIdx = 0;
+  for (let i = startIdx; i < block.nodes.length; i++) {
+    const savedInlineIdx = ctx._inlineCallIdx;
+    processNode(block.nodes[i], env, ctx);
+    if (ctx._ipSuspended) {
+      ctx._suspendedNodeIdx = i;
+      ctx._suspendedInlineIdx = savedInlineIdx;
+      break;
+    }
+  }
   return env;
 }
 
@@ -538,30 +548,53 @@ function isNumericLiteral(node, value) {
 // Uses scope info to find the variable's binding and check if it's a string literal
 function resolveToConstant(node, _env, ctx) {
   if (!node) return undefined;
-  if (isStringLiteral(node)) return node.value;
-  if (node.type === 'NumericLiteral' || (node.type === 'Literal' && typeof node.value === 'number')) return node.value;
-  if (node.type === 'Identifier') {
-    // Check interprocedural param constants: this[key] where key came from call-site arg
-    if (ctx?._paramConstants?.has(node.name)) {
-      return ctx._paramConstants.get(node.name);
-    }
-    if (ctx?.scopeInfo) {
-      // Resolve via scope info to find the declaration node
-      const bindingKey = ctx.scopeInfo.resolve(node);
-      if (bindingKey) {
-        const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-        // VariableDeclarator: var key = 'hash' or var key = expr
-        if (declNode?.type === 'VariableDeclarator' && declNode.init) {
-          return resolveToConstant(declNode.init, _env, ctx);
-        }
+  // BinaryExpression '+': flatten chain into leaves, resolve each iteratively
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    const leaves = [];
+    const flatStack = [node];
+    while (flatStack.length > 0) {
+      const n = flatStack.pop();
+      if (n.type === 'BinaryExpression' && n.operator === '+') {
+        flatStack.push(n.right);
+        flatStack.push(n.left);
+      } else {
+        leaves.push(n);
       }
     }
+    let result = '';
+    for (const leaf of leaves) {
+      const val = resolveConstantLeaf(leaf, _env, ctx);
+      if (val === undefined) return undefined;
+      result += String(val);
+    }
+    return result;
   }
-  // BinaryExpression '+': 'user' + 'Input' → 'userInput'
-  if (node.type === 'BinaryExpression' && node.operator === '+') {
-    const left = resolveToConstant(node.left, _env, ctx);
-    const right = resolveToConstant(node.right, _env, ctx);
-    if (left !== undefined && right !== undefined) return String(left) + String(right);
+  return resolveConstantLeaf(node, _env, ctx);
+}
+// Iterative leaf resolver: follows Identifier → declaration init chains without recursion
+function resolveConstantLeaf(node, _env, ctx) {
+  let cur = node;
+  while (cur) {
+    if (!cur) return undefined;
+    if (isStringLiteral(cur)) return cur.value;
+    if (cur.type === 'NumericLiteral' || (cur.type === 'Literal' && typeof cur.value === 'number')) return cur.value;
+    if (cur.type === 'Identifier') {
+      if (ctx?._paramConstants?.has(cur.name)) {
+        return ctx._paramConstants.get(cur.name);
+      }
+      if (ctx?.scopeInfo) {
+        const bindingKey = ctx.scopeInfo.resolve(cur);
+        if (bindingKey) {
+          const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
+          if (declNode?.type === 'VariableDeclarator' && declNode.init) {
+            cur = declNode.init;
+            continue;
+          }
+        }
+      }
+      return undefined;
+    }
+    return undefined;
   }
   return undefined;
 }
@@ -600,55 +633,82 @@ function findReturnedFunction(funcNode) {
 // Returns true/false if the node is a constant truthy/falsy literal, null if unknown
 // When ctx is provided, can resolve Identifier references to their constant values
 function isConstantBoolLeaf(node, ctx) {
-  if (!node) return null;
-  if (node.type === 'BooleanLiteral') return node.value;
-  if (node.type === 'Literal' && typeof node.value === 'boolean') return node.value;
-  if (node.type === 'NumericLiteral' || (node.type === 'Literal' && typeof node.value === 'number'))
-    return node.value !== 0;
-  if (node.type === 'StringLiteral' || (node.type === 'Literal' && typeof node.value === 'string'))
-    return node.value !== '';
-  if (node.type === 'NullLiteral' || (node.type === 'Literal' && node.value === null)) return false;
-  if (node.type === 'Identifier' && node.name === 'undefined') return false;
-  if (node.type === 'Identifier' && ctx?.scopeInfo) {
-    const bindingKey = ctx.scopeInfo.resolve(node);
-    if (bindingKey) {
-      const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-      if (declNode?.type === 'VariableDeclarator' && declNode.init)
-        return isConstantBoolLeaf(declNode.init, null); // null ctx prevents further resolution
+  // Iterative: loop follows Identifier → declaration init chains
+  let cur = node;
+  let curCtx = ctx;
+  while (cur) {
+    if (cur.type === 'BooleanLiteral') return cur.value;
+    if (cur.type === 'Literal' && typeof cur.value === 'boolean') return cur.value;
+    if (cur.type === 'NumericLiteral' || (cur.type === 'Literal' && typeof cur.value === 'number'))
+      return cur.value !== 0;
+    if (cur.type === 'StringLiteral' || (cur.type === 'Literal' && typeof cur.value === 'string'))
+      return cur.value !== '';
+    if (cur.type === 'NullLiteral' || (cur.type === 'Literal' && cur.value === null)) return false;
+    if (cur.type === 'Identifier' && cur.name === 'undefined') return false;
+    if (cur.type === 'Identifier' && curCtx?.scopeInfo) {
+      const bindingKey = curCtx.scopeInfo.resolve(cur);
+      if (bindingKey) {
+        const declNode = curCtx.scopeInfo.bindingNodes.get(bindingKey);
+        if (declNode?.type === 'VariableDeclarator' && declNode.init) {
+          cur = declNode.init;
+          curCtx = null; // prevents further resolution (same as original null ctx)
+          continue;
+        }
+      }
     }
+    return null;
   }
   return null;
 }
 function isConstantBool(node, ctx) {
   if (!node) return null;
   if (node.type !== 'LogicalExpression') return isConstantBoolLeaf(node, ctx);
-  // Flatten into work stack to avoid recursion on deeply nested chains
-  // Stack items: nodes to evaluate, processed right-to-left
-  const work = []; // { op, node } — node is a non-LogicalExpression leaf
+  // Fully iterative: frame stack for nested LogicalExpression evaluation
+  // Each frame: { work: [{op, node}], idx: number, result: bool|null }
+  const frames = [];
   let cur = node;
-  while (cur.type === 'LogicalExpression') {
-    work.push({ op: cur.operator, node: cur.right });
-    cur = cur.left;
-  }
-  // cur is the leftmost non-LogicalExpression node; work is in reverse order
-  let result = isConstantBool(cur, ctx);
-  for (let i = work.length - 1; i >= 0; i--) {
-    const { op, node: rhs } = work[i];
-    const rhsVal = () => isConstantBool(rhs, ctx);
-    if (op === '||') {
-      if (result === true) return true;
-      if (result === false) { result = rhsVal(); continue; }
-      return null;
-    } else if (op === '&&') {
-      if (result === false) return false;
-      if (result === true) { result = rhsVal(); continue; }
-      return null;
-    } else if (op === '??') {
-      if (result !== null && result !== undefined) continue;
-      return null;
+
+  for (;;) {
+    // Flatten left spine of current LogicalExpression into work array
+    const work = [];
+    while (cur.type === 'LogicalExpression') {
+      work.push({ op: cur.operator, node: cur.right });
+      cur = cur.left;
+    }
+    frames.push({ work, idx: work.length - 1, result: isConstantBoolLeaf(cur, ctx) });
+
+    processFrames:
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+
+      while (frame.idx >= 0) {
+        const { op, node: rhs } = frame.work[frame.idx];
+        // Short-circuit logic
+        if (op === '||') {
+          if (frame.result === true) { frame.idx = -1; break; }
+          if (frame.result === null) { frame.idx = -1; frame.result = null; break; }
+        } else if (op === '&&') {
+          if (frame.result === false) { frame.idx = -1; break; }
+          if (frame.result === null) { frame.idx = -1; frame.result = null; break; }
+        } else if (op === '??') {
+          if (frame.result !== null && frame.result !== undefined) { frame.idx--; continue; }
+          frame.idx = -1; frame.result = null; break;
+        }
+        frame.idx--;
+        // If rhs is a nested LogicalExpression, push new frame and descend
+        if (rhs.type === 'LogicalExpression') {
+          cur = rhs;
+          break processFrames;
+        }
+        frame.result = isConstantBoolLeaf(rhs, ctx);
+      }
+
+      // Frame done — pop and feed result to parent
+      const doneResult = frames.pop().result;
+      if (frames.length === 0) return doneResult;
+      frames[frames.length - 1].result = doneResult;
     }
   }
-  return result;
 }
 function findProtocolMember(node) {
   // Returns the base object name if node is X.protocol
@@ -1039,7 +1099,10 @@ function processVarDeclarator(node, env, ctx) {
   // Register function-valued properties from object literals: var obj = { render: function(){} }
   // Also recurses into nested objects: var obj = { inner: { getData: function(){} } }
   if (node.id.type === 'Identifier' && node.init && node.init.type === 'ObjectExpression') {
-    const registerObjectMethods = (objExpr, prefix) => {
+    // Iterative: explicit stack of {objExpr, prefix} for nested object method registration
+    const romStack = [{objExpr: node.init, prefix: node.id.name}];
+    while (romStack.length > 0) {
+      const {objExpr, prefix} = romStack.pop();
       for (const prop of objExpr.properties) {
         if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
           const propName = prop.key.name || prop.key.value;
@@ -1058,9 +1121,9 @@ function processVarDeclarator(node, env, ctx) {
               if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, refFunc);
             }
           }
-          // Recurse into nested ObjectExpression for deep method registration
+          // Push nested ObjectExpression onto stack for deep method registration
           if (propName && val && val.type === 'ObjectExpression') {
-            registerObjectMethods(val, `${prefix}.${propName}`);
+            romStack.push({objExpr: val, prefix: `${prefix}.${propName}`});
           }
         }
         if (prop.type === 'ObjectMethod' && prop.key) {
@@ -1079,8 +1142,7 @@ function processVarDeclarator(node, env, ctx) {
           }
         }
       }
-    };
-    registerObjectMethods(node.init, node.id.name);
+    }
   }
 
   // Alias: var fn = existingFunc — register the alias in funcMap
@@ -1957,6 +2019,7 @@ export function evaluateExpr(node, env, ctx) {
   W.push({ kind: W_EVAL_EXPR, node, env, ctx });
 
   while (W.length > 0) {
+    if (ctx._ipSuspended) { V.push(TaintSet.empty()); break; }
     const item = W.pop();
 
     switch (item.kind) {
@@ -3242,9 +3305,10 @@ function evaluateNewExpr(node, env, ctx) {
 
         const body = funcNode.body.type === 'BlockStatement' ? funcNode.body
           : { type: 'BlockStatement', body: [{ type: 'ReturnStatement', argument: funcNode.body }] };
-        const retTaint = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx);
+        const retTaint = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx, env);
 
         // Propagate this.* bindings to the parent env for instance resolution
+        // (also handled by postProcess in callerEnv mode for frame-based path)
         // Includes clean bindings so sanitized properties are tracked accurately
         const thisTaint = TaintSet.empty();
         for (const [key, taint] of childEnv.bindings) {
@@ -4150,8 +4214,52 @@ function analyzePromiseCallback(node, argTaints, objTaint, env, ctx) {
   return cbResult;
 }
 
+// ── Shared frame finalization ──
+// Propagates results (exit state, returnedFuncNode, funcMap entries) from child to caller.
+const _GLOBAL_OBJ_PREFIXES = ['window.', 'self.', 'globalThis.'];
+function _finalizeFrame(frame) {
+  const { innerCtx, callerCtx, env, cfg, blockEnvs } = frame;
+
+  // Merge exit state back to the frame's env
+  const exitState = blockEnvs.get(cfg.exit.id);
+  if (exitState) env.mergeFrom(exitState);
+  for (const pred of cfg.exit.predecessors) {
+    const state = blockEnvs.get(pred.id);
+    if (state) env.mergeFrom(state);
+  }
+
+  // Propagate returned function/method info to the caller context
+  if (innerCtx.returnedFuncNode) callerCtx.returnedFuncNode = innerCtx.returnedFuncNode;
+  if (innerCtx.returnedMethods) callerCtx.returnedMethods = innerCtx.returnedMethods;
+  if (innerCtx.returnElementTaints) callerCtx.returnElementTaints = innerCtx.returnElementTaints;
+  if (innerCtx.returnPropertyTaints) callerCtx.returnPropertyTaints = innerCtx.returnPropertyTaints;
+
+  // Propagate funcMap entries: array callbacks, this.*, global objects
+  // Skip entries already in caller (most entries) for O(delta) instead of O(N)
+  for (const [key, val] of innerCtx.funcMap) {
+    if (callerCtx.funcMap.has(key)) continue;
+    if (key.length > 2 && key[key.length - 1] === ']' && key[key.length - 2] === '[') {
+      callerCtx.funcMap.set(key, val);
+    } else if (key.charCodeAt(0) === 116 && key.startsWith('this.')) { // 't'
+      callerCtx.funcMap.set(key, val);
+    } else {
+      for (const prefix of _GLOBAL_OBJ_PREFIXES) {
+        if (key.length > prefix.length && key.slice(0, prefix.length) === prefix) {
+          callerCtx.funcMap.set(key, val);
+          const stripped = key.slice(prefix.length);
+          if (stripped && !callerCtx.funcMap.has(stripped)) callerCtx.funcMap.set(stripped, val);
+          break;
+        }
+      }
+    }
+  }
+}
+
 // ── Analyze inline function body ──
-function analyzeInlineFunction(funcNode, env, ctx) {
+// Fully iterative via the IP frame stack. Pushes a frame onto _ipStack when
+// available; otherwise runs _runIPLoop directly. Uses per-block counter-based
+// caching so re-processed blocks get cached results.
+function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
   const innerCfg = buildCFG(funcNode.body);
   const innerCtx = new AnalysisContext(
     ctx.file, new Map(ctx.funcMap), ctx.findings,
@@ -4160,87 +4268,167 @@ function analyzeInlineFunction(funcNode, env, ctx) {
   innerCtx.classBodyMap = ctx.classBodyMap;
   innerCtx.superClassMap = ctx.superClassMap;
   innerCtx.protoMethodMap = ctx.protoMethodMap;
-  // Propagate interprocedural param constants for computed property resolution
   if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
-  // Track which super class to resolve for super() calls inside this constructor
   if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
 
-  const blockEnvs = new Map();
-  blockEnvs.set(innerCfg.entry.id, env.clone());
-  const worklist = [innerCfg.entry];
-  const inWorklist = new Set([innerCfg.entry.id]);
+  const frame = {
+    cfg: innerCfg,
+    worklist: [innerCfg.entry],
+    blockEnvs: new Map([[innerCfg.entry.id, env.clone()]]),
+    inWorklist: new Set([innerCfg.entry.id]),
+    innerCtx,
+    callerCtx: ctx,
+    env,
+    postProcess: null,
+  };
 
-  while (worklist.length > 0) {
-    const block = worklist.shift();
-    inWorklist.delete(block.id);
-    const entryEnv = blockEnvs.get(block.id);
-    if (!entryEnv) continue;
-
-    const exitEnv = processBlock(block, entryEnv.clone(), innerCtx);
-
-    for (const succ of block.successors) {
-      // Constant-fold: skip unreachable branches
-      if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
-        const val = isConstantBool(succ.branchCondition);
-        if (val === false && succ.branchPolarity === true) continue;
-        if (val === true && succ.branchPolarity === false) continue;
+  // If caller provides callerEnv, set up postProcess to propagate this.* bindings
+  // (used by constructor analysis to propagate instance properties)
+  if (callerEnv) {
+    const _childEnv = env;
+    frame.postProcess = (result) => {
+      for (const [key, taint] of _childEnv.bindings) {
+        if (key.startsWith('this.') && key.length > 5) {
+          callerEnv.set(key, taint);
+        }
       }
-      const existing = blockEnvs.get(succ.id);
-      if (!existing) {
-        blockEnvs.set(succ.id, exitEnv.clone());
-        if (!inWorklist.has(succ.id)) { worklist.push(succ); inWorklist.add(succ.id); }
+    };
+  }
+
+  if (ctx._ipStack) {
+    // Check inline result cache (keyed by block + call index within that block)
+    const callIdx = ctx._inlineCallIdx++;
+    const cacheKey = `${ctx._currentBlockId}:${callIdx}`;
+    if (!ctx._inlineResults) ctx._inlineResults = new Map();
+    if (ctx._inlineResults.has(cacheKey)) {
+      const cached = ctx._inlineResults.get(cacheKey);
+      if (cached._returnedFuncNode) ctx.returnedFuncNode = cached._returnedFuncNode;
+      if (cached._returnedMethods) ctx.returnedMethods = cached._returnedMethods;
+      if (cached._returnElementTaints) ctx.returnElementTaints = cached._returnElementTaints;
+      if (cached._returnPropertyTaints) ctx.returnPropertyTaints = cached._returnPropertyTaints;
+      return cached.clone();
+    }
+    frame._inlineCacheKey = cacheKey;
+    frame._parentInlineResults = ctx._inlineResults;
+    ctx._ipStack.push(frame);
+    ctx._ipSuspended = true;
+    return TaintSet.empty();
+  }
+
+  return _runIPLoop([frame]);
+}
+
+// ── Interprocedural frame loop driver ──
+// Processes frames from the stack until all complete. Each frame is a function body
+// being analyzed via its CFG worklist. When a nested call is encountered, a child
+// frame is pushed; when it completes, the parent re-processes the suspended block.
+function _runIPLoop(ipStack) {
+  let finalResult = TaintSet.empty();
+
+  while (ipStack.length > 0) {
+    const frame = ipStack[ipStack.length - 1];
+    const { worklist, blockEnvs, inWorklist, innerCtx } = frame;
+
+    // Attach the stack to the context so nested calls can push frames
+    innerCtx._ipStack = ipStack;
+
+    let suspended = false;
+
+    while (worklist.length > 0) {
+      const block = worklist.shift();
+      inWorklist.delete(block.id);
+      const entryEnv = blockEnvs.get(block.id);
+      if (!entryEnv) continue;
+
+      // Resume from checkpoint if available, otherwise fresh processing
+      innerCtx._currentBlockId = block.id;
+      let processEnv;
+      if (frame._checkpoint && frame._checkpoint.blockId === block.id) {
+        processEnv = frame._checkpoint.env;
+        innerCtx._resumeNodeIdx = frame._checkpoint.nodeIdx;
+        innerCtx._inlineCallIdx = frame._checkpoint.inlineCallIdx;
+        frame._checkpoint = null;
       } else {
-        if (existing.mergeFrom(exitEnv) && !inWorklist.has(succ.id)) {
-          worklist.push(succ); inWorklist.add(succ.id);
+        processEnv = entryEnv.clone();
+        innerCtx._inlineCallIdx = 0;
+      }
+
+      const exitEnv = processBlock(block, processEnv, innerCtx);
+
+      if (innerCtx._ipSuspended) {
+        // A child frame was pushed during processBlock.
+        // Save checkpoint so we can resume at the suspended node instead of
+        // re-processing the entire block from scratch.
+        innerCtx._ipSuspended = false;
+        frame._checkpoint = {
+          blockId: block.id,
+          env: exitEnv,
+          nodeIdx: innerCtx._suspendedNodeIdx,
+          inlineCallIdx: innerCtx._suspendedInlineIdx,
+        };
+        worklist.unshift(block);
+        inWorklist.add(block.id);
+        suspended = true;
+        break;
+      }
+
+      // Propagate to successors
+      for (const succ of block.successors) {
+        if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
+          const val = isConstantBool(succ.branchCondition);
+          if (val === false && succ.branchPolarity === true) continue;
+          if (val === true && succ.branchPolarity === false) continue;
+        }
+        const existing = blockEnvs.get(succ.id);
+        if (!existing) {
+          blockEnvs.set(succ.id, exitEnv.clone());
+          if (!inWorklist.has(succ.id)) { worklist.push(succ); inWorklist.add(succ.id); }
+        } else {
+          if (existing.mergeFrom(exitEnv) && !inWorklist.has(succ.id)) {
+            worklist.push(succ); inWorklist.add(succ.id);
+          }
         }
       }
     }
-  }
 
-  // Merge exit state back to the caller's env so side effects are visible
-  // (e.g., this.data = x inside a method becomes visible as obj.data)
-  const exitState = blockEnvs.get(innerCfg.exit.id);
-  if (exitState) env.mergeFrom(exitState);
-  for (const pred of innerCfg.exit.predecessors) {
-    const state = blockEnvs.get(pred.id);
-    if (state) env.mergeFrom(state);
-  }
+    if (suspended) continue; // process the child frame next
 
-  // Propagate returned function/method info back to the caller
-  if (innerCtx.returnedFuncNode) ctx.returnedFuncNode = innerCtx.returnedFuncNode;
-  if (innerCtx.returnedMethods) ctx.returnedMethods = innerCtx.returnedMethods;
-  if (innerCtx.returnElementTaints) ctx.returnElementTaints = innerCtx.returnElementTaints;
-  if (innerCtx.returnPropertyTaints) ctx.returnPropertyTaints = innerCtx.returnPropertyTaints;
+    // Frame's worklist is empty — finalize it
+    innerCtx._ipStack = null;
 
-  // Propagate function entries discovered during inline analysis back to the caller:
-  // - Array-stored callbacks (key ends with [])
-  // - Global assignments via window.X (strip prefix for cross-file resolution)
-  // Propagate function entries discovered during inline analysis back to the caller:
-  // Array-stored callbacks (key ends with []) and global assignments (window.X, self.X, globalThis.X)
-  const GLOBAL_OBJ_PREFIXES = ['window.', 'self.', 'globalThis.'];
-  for (const [key, val] of innerCtx.funcMap) {
-    if (key.length > 2 && key[key.length - 1] === ']' && key[key.length - 2] === '[' && !ctx.funcMap.has(key)) {
-      ctx.funcMap.set(key, val);
+    _finalizeFrame(frame);
+
+    const returnTaint = innerCtx.returnTaint;
+
+    // Run call-level post-processing (env propagation, funcMap propagation, caching)
+    if (frame.postProcess) {
+      frame.postProcess(returnTaint);
     }
-    // Propagate this.* funcMap entries back so method side effects are visible
-    // Handles: on(event, fn) { this.handlers[event] = fn; } → this.handlers.data = fn
-    if (key.startsWith('this.') && !ctx.funcMap.has(key)) {
-      ctx.funcMap.set(key, val);
+
+    // Cache inline frame results for block re-processing
+    if (frame._inlineCacheKey && frame._parentInlineResults) {
+      const cached = returnTaint.clone();
+      if (innerCtx.returnedFuncNode) cached._returnedFuncNode = innerCtx.returnedFuncNode;
+      if (innerCtx.returnedMethods) cached._returnedMethods = innerCtx.returnedMethods;
+      if (innerCtx.returnElementTaints) cached._returnElementTaints = innerCtx.returnElementTaints;
+      if (innerCtx.returnPropertyTaints) cached._returnPropertyTaints = innerCtx.returnPropertyTaints;
+      frame._parentInlineResults.set(frame._inlineCacheKey, cached);
     }
-    for (const prefix of GLOBAL_OBJ_PREFIXES) {
-      if (key.length > prefix.length && key.slice(0, prefix.length) === prefix && !ctx.funcMap.has(key)) {
-        ctx.funcMap.set(key, val);
-        const stripped = key.slice(prefix.length);
-        if (stripped && !ctx.funcMap.has(stripped)) ctx.funcMap.set(stripped, val);
-        break;
-      }
+
+    ipStack.pop();
+
+    if (ipStack.length > 0) {
+      // Parent resumes from checkpoint on next iteration.
+    } else {
+      finalResult = returnTaint;
     }
   }
 
-  return innerCtx.returnTaint;
+  return finalResult;
 }
 
 // ── Interprocedural: analyze a called function ──
+// Fully iterative via explicit frame stack — no JS recursion.
 function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   let funcNode = null;
 
@@ -4257,13 +4445,11 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
   // super() call — resolve to parent class constructor via _superClass or superClassMap
   if (!funcNode && callNode.callee?.type === 'Super') {
-    // First try: use the _superClass from the currently analyzed function
     const currentSuper = ctx._currentSuperClass;
     if (currentSuper) {
       const parentCtor = ctx.funcMap.get(currentSuper);
       if (parentCtor) funcNode = parentCtor;
     }
-    // Fallback: iterate superClassMap
     if (!funcNode) {
       for (const [, parentClass] of ctx.superClassMap) {
         const parentCtor = ctx.funcMap.get(parentClass);
@@ -4286,22 +4472,17 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       }
     }
     // Ternary callee: (cond ? fnA : fnB)(args) — resolve the selected branch
-    // Respect constant-folding: if condition is known true/false, only use that branch
     if (!funcNode && callNode.callee.type === 'ConditionalExpression') {
-      // Resolve nested ternary chains: (a ? (b ? f1 : f2) : f3)(args)
       const resolveTernaryBranches = (condNode) => {
-        const condConst = isConstantBool(condNode.test);
-        let branches;
-        if (condConst === true) branches = [condNode.consequent];
-        else if (condConst === false) branches = [condNode.alternate];
-        else branches = [condNode.consequent, condNode.alternate];
         const result = [];
-        for (const branch of branches) {
-          if (branch.type === 'ConditionalExpression') {
-            result.push(...resolveTernaryBranches(branch));
-          } else {
-            result.push(branch);
-          }
+        const rtbStack = [condNode];
+        while (rtbStack.length > 0) {
+          const cur = rtbStack.pop();
+          if (cur.type !== 'ConditionalExpression') { result.push(cur); continue; }
+          const condConst = isConstantBool(cur.test);
+          if (condConst === true) rtbStack.push(cur.consequent);
+          else if (condConst === false) rtbStack.push(cur.alternate);
+          else { rtbStack.push(cur.alternate); rtbStack.push(cur.consequent); }
         }
         return result;
       };
@@ -4347,13 +4528,11 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     if (!funcNode && callNode.callee.computed) {
       const objStr = nodeToString(callNode.callee.object);
       if (objStr) {
-        // Try resolving the computed property to a constant string: obj["render"]() or obj[varHoldingName]()
         const resolvedMethod = resolveToConstant(callNode.callee.property, env, ctx);
         if (resolvedMethod) {
           const dotPath = `${objStr}.${resolvedMethod}`;
           if (ctx.funcMap.has(dotPath)) funcNode = ctx.funcMap.get(dotPath);
         }
-        // Fallback: arr[0](args) — resolve function pushed to array via arr[]
         if (!funcNode) {
           const arrFunc = ctx.funcMap.get(`${objStr}[]`);
           if (arrFunc) funcNode = arrFunc;
@@ -4373,8 +4552,15 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   const superSuffix = callNode.callee?.type === 'Super' && ctx._currentSuperClass ? `:super=${ctx._currentSuperClass}` : '';
   // For inline function expressions (IIFEs), use source location to disambiguate since they all resolve to 'anon'
   const locSuffix = (!calleeStr && funcNode.loc) ? `:${funcNode.loc.start.line}:${funcNode.loc.start.column}` : '';
-  const callSig = `${calleeStr || 'anon'}:${argTaints.map(t => t.tainted ? '1' : '0').join('')}${superSuffix}${locSuffix}`;
-  if (ctx.analyzedCalls.has(callSig)) return ctx.analyzedCalls.get(callSig)?.clone() || TaintSet.empty();
+  let taintBits = 0;
+  for (let i = 0; i < argTaints.length; i++) if (argTaints[i].tainted) taintBits |= (1 << i);
+  const callSig = `${calleeStr || 'anon'}:${taintBits}${superSuffix}${locSuffix}`;
+  if (ctx.analyzedCalls.has(callSig)) {
+    const cached = ctx.analyzedCalls.get(callSig);
+    if (cached && cached._returnedFuncNode) ctx.returnedFuncNode = cached._returnedFuncNode;
+    if (cached && cached._returnedMethods) ctx.returnedMethods = cached._returnedMethods;
+    return cached?.clone() || TaintSet.empty();
+  }
   ctx.analyzedCalls.set(callSig, TaintSet.empty());
 
   const closureEnv = funcNode._closureEnv || env;
@@ -4385,8 +4571,6 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   let _methodObjName = null;
   if (callNode.callee?.type === 'MemberExpression' || callNode.callee?.type === 'OptionalMemberExpression') {
     let objName = nodeToString(callNode.callee.object);
-    // For chained method calls like a.setData(x).render(), the receiver is a CallExpression.
-    // Trace back to the original object: a.setData(x) → callee a.setData → object a
     if (!objName && callNode.callee.object) {
       let receiver = callNode.callee.object;
       while (receiver && (receiver.type === 'CallExpression' || receiver.type === 'OptionalCallExpression')) {
@@ -4400,15 +4584,12 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       _methodObjName = objName;
       const objTaint = evaluateExpr(callNode.callee.object, env, ctx);
       childEnv.set('this', objTaint);
-      // Copy obj.* bindings to this.* (search all env layers)
       const objBindings = env.getTaintedWithPrefix(`${objName}.`);
       for (const [key, taint] of objBindings) {
         const propName = key.slice(objName.length + 1);
         childEnv.set(`this.${propName}`, taint);
       }
     } else {
-      // Anonymous receiver (chained calls on new X() or other expressions):
-      // Inherit this.* bindings from env set by a previous call in the chain
       const thisBindings = env.getTaintedWithPrefix('this.');
       for (const [key, taint] of thisBindings) {
         childEnv.set(key, taint);
@@ -4427,7 +4608,6 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       childEnv.set(`this.${propName}`, taint);
     }
   }
-  // Handle inline object literal as thisArg: fn.call({html: tainted})
   if (funcNode._boundThisNode) {
     const objNode = funcNode._boundThisNode;
     for (const prop of objNode.properties || []) {
@@ -4439,25 +4619,22 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         }
       }
     }
-    funcNode._boundThisNode = null; // consume
+    funcNode._boundThisNode = null;
   }
 
   // Handle pre-filled arguments from fn.bind(thisArg, arg1, arg2)
   if (funcNode._boundArgs) {
     const boundArgNodes = funcNode._boundArgs;
     const boundArgTaints = boundArgNodes.map(a => evaluateExpr(a, env, ctx));
-    // Prepend bound args to call args
     argTaints = [...boundArgTaints, ...argTaints];
     callNode = { ...callNode, arguments: [...boundArgNodes, ...(callNode.arguments || [])] };
-    funcNode._boundArgs = null; // consume
+    funcNode._boundArgs = null;
   }
 
   // Store function expression arguments in funcMap so they can be called inside the body
-  // Handles: doRender(function(html) { ... }) → fn(x) resolves fn to the passed function
   const innerFuncMap = new Map(ctx.funcMap);
 
   // Copy obj.* funcMap entries to this.* so method bodies can resolve this.prop functions
-  // Handles: emitter.handlers.data → fn becomes this.handlers.data → fn inside emit()
   if (_methodObjName) {
     const objPrefix = `${_methodObjName}.`;
     for (const [key, val] of ctx.funcMap) {
@@ -4477,7 +4654,6 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         const paramKey = resolveId(param, ctx);
         innerFuncMap.set(paramKey, argNode);
       }
-      // Also resolve identifier args that reference known functions
       if (argNode.type === 'Identifier') {
         const refKey = resolveId(argNode, ctx);
         const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(argNode.name);
@@ -4487,7 +4663,6 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
           innerFuncMap.set(paramKey, refFunc);
         }
       }
-      // Object literal arg: execute({handler: fn, data: x}) → register param.handler in funcMap
       if (argNode.type === 'ObjectExpression') {
         for (const prop of argNode.properties) {
           if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
@@ -4506,29 +4681,21 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       for (let j = i; j < argTaints.length; j++) restTaint.merge(argTaints[j]);
       assignToPattern(param.argument, restTaint, childEnv, ctx);
     } else {
-      // If an actual non-undefined argument was provided, assign directly to the param's
-      // left side (skip default evaluation even if the arg taint is empty).
-      // Passing undefined explicitly still triggers the default parameter.
       if (param.type === 'AssignmentPattern' && i < callNode.arguments.length) {
         const argNode = callNode.arguments[i];
         const isUndefined = argNode && argNode.type === 'Identifier' && argNode.name === 'undefined';
         if (isUndefined) {
-          // Treat as missing — let AssignmentPattern evaluate the default
           assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
         } else {
           assignToPattern(param.left, argTaints[i] || TaintSet.empty(), childEnv, ctx);
         }
       } else {
-        // For ObjectPattern params, use assignObjectPatternFromSource if the argument
-        // is a source object (e.g., render({ hash }) called with render(location))
         if (param.type === 'ObjectPattern' && callNode.arguments[i]) {
           const argNode = callNode.arguments[i];
           const argStr = nodeToString(argNode);
           if (argStr) {
             assignObjectPatternFromSource(param, argStr, argTaints[i] || TaintSet.empty(), childEnv, ctx);
           } else if (argNode.type === 'ObjectExpression') {
-            // Direct object literal argument: render({html: "safe"})
-            // Build per-property taint map and assign, skipping defaults for provided properties
             const literalProps = new Map();
             for (const prop of argNode.properties) {
               if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
@@ -4536,7 +4703,6 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
                 if (pName) literalProps.set(pName, evaluateExpr(prop.value, childEnv, ctx));
               }
               if (prop.type === 'SpreadElement' || prop.type === 'RestElement') {
-                // Spread: merge all properties from spread source
                 const spreadTaint = evaluateExpr(prop.argument || prop, childEnv, ctx);
                 if (spreadTaint.tainted) {
                   for (const pp of param.properties) {
@@ -4556,14 +4722,12 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
               const keyName = prop.key?.name || prop.key?.value;
               const target = prop.value || prop.key;
               if (keyName && literalProps.has(keyName)) {
-                // Explicit value provided — use it, skip default
                 if (target.type === 'AssignmentPattern') {
                   assignToPattern(target.left, literalProps.get(keyName), childEnv, ctx);
                 } else {
                   assignToPattern(target, literalProps.get(keyName), childEnv, ctx);
                 }
               } else {
-                // Not provided — let AssignmentPattern evaluate the default
                 assignToPattern(target, TaintSet.empty(), childEnv, ctx);
               }
             }
@@ -4596,7 +4760,6 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   }
 
   // Build a map of parameter → constant argument value for resolveToConstant
-  // Enables computed property resolution inside method bodies: this[key] where key is a param
   const savedParamConstants = ctx._paramConstants;
   const paramConstants = new Map();
   for (let i = 0; i < funcNode.params.length && i < callNode.arguments.length; i++) {
@@ -4612,109 +4775,139 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   const body = funcNode.body.type === 'BlockStatement'
     ? funcNode.body
     : { type: 'BlockStatement', body: [{ type: 'ReturnStatement', argument: funcNode.body }] };
-  const result = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx);
 
-  ctx._paramConstants = savedParamConstants;
-  ctx.funcMap = savedFuncMap;
+  // Build the CFG and inner context for the function body
+  const innerCfg = buildCFG(body);
+  const innerCtx = new AnalysisContext(
+    ctx.file, new Map(innerFuncMap), ctx.findings,
+    ctx.globalEnv, ctx.scopeInfo, ctx.analyzedCalls
+  );
+  innerCtx.classBodyMap = ctx.classBodyMap;
+  innerCtx.superClassMap = ctx.superClassMap;
+  innerCtx.protoMethodMap = ctx.protoMethodMap;
+  if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
+  if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
 
-  // Propagate new funcMap entries discovered during the call back to the caller's funcMap
-  // Handles: function on(fn) { handlers.push(fn); } — the handlers[] entry must survive
-  for (const [key, val] of innerFuncMap) {
-    if (!savedFuncMap.has(key)) savedFuncMap.set(key, val);
-  }
+  // Capture all state needed for post-processing in a closure
+  const _callNode = callNode, _callSig = callSig, _childEnv = childEnv,
+        _funcNode = funcNode, _methodObjName2 = _methodObjName, _paramNames = paramNames,
+        _savedFuncMap = savedFuncMap, _savedParamConstants = savedParamConstants,
+        _innerFuncMap = innerFuncMap, _callerEnv = env, _callerCtx = ctx;
 
-  // super() call: propagate this.* from parent constructor back to the current scope
-  if (callNode.callee?.type === 'Super') {
-    for (const [key, taint] of childEnv.bindings) {
-      if (key.startsWith('this.') && taint.tainted) {
-        env.set(key, taint);
-      }
+  // Post-processing runs after the function body analysis completes
+  const postProcess = (result) => {
+    _callerCtx._paramConstants = _savedParamConstants;
+    _callerCtx.funcMap = _savedFuncMap;
+
+    // Propagate new funcMap entries discovered during the call
+    for (const [key, val] of _innerFuncMap) {
+      if (!_savedFuncMap.has(key)) _savedFuncMap.set(key, val);
     }
-  }
 
-  // Propagate this.* side effects back to the receiver object (setter pattern)
-  // After obj.setData(tainted), if setData sets this.data, copy it back as obj.data
-  if (callNode.callee?.type === 'MemberExpression' || callNode.callee?.type === 'OptionalMemberExpression') {
-    const objName = nodeToString(callNode.callee.object);
-    for (const [key, taint] of childEnv.bindings) {
-      if (key.startsWith('this.') && taint.tainted) {
-        const propName = key.slice(5);
-        if (objName) env.set(`${objName}.${propName}`, taint);
-        // Also keep this.* in env for chained calls on anonymous receivers
-        // e.g., new Builder().set(x).build() — this.data persists across the chain
-        env.set(key, taint);
-      }
-    }
-    // Propagate this.* funcMap entries back as objName.* in caller's funcMap
-    // Handles: on(event, fn) { this.handlers[event] = fn; } → emitter.handlers.data → fn
-    if (objName) {
-      for (const [key, val] of innerFuncMap) {
-        if (key.startsWith('this.')) {
-          const propName = key.slice(5);
-          savedFuncMap.set(`${objName}.${propName}`, val);
+    // super() call: propagate this.* from parent constructor
+    if (_callNode.callee?.type === 'Super') {
+      for (const [key, taint] of _childEnv.bindings) {
+        if (key.startsWith('this.') && taint.tainted) {
+          _callerEnv.set(key, taint);
         }
       }
     }
-  }
 
-  // Propagate closure variable mutations back to the closure env
-  // When a method mutates a closure variable (e.g., data = d inside setData),
-  // sibling methods sharing the same closure need to see the mutation.
-  if (funcNode._closureEnv) {
-    for (const [key, taint] of childEnv.bindings) {
-      if (taint.tainted && !key.startsWith('this.') && !paramNames.has(key) && key !== 'this') {
-        // This is a non-local, non-param binding — likely a closure variable
-        funcNode._closureEnv.set(key, taint);
+    // Propagate this.* side effects back to the receiver object
+    if (_callNode.callee?.type === 'MemberExpression' || _callNode.callee?.type === 'OptionalMemberExpression') {
+      const objName = nodeToString(_callNode.callee.object);
+      for (const [key, taint] of _childEnv.bindings) {
+        if (key.startsWith('this.') && taint.tainted) {
+          const propName = key.slice(5);
+          if (objName) _callerEnv.set(`${objName}.${propName}`, taint);
+          _callerEnv.set(key, taint);
+        }
+      }
+      if (objName) {
+        for (const [key, val] of _innerFuncMap) {
+          if (key.startsWith('this.')) {
+            const propName = key.slice(5);
+            _savedFuncMap.set(`${objName}.${propName}`, val);
+          }
+        }
       }
     }
-  }
 
-  // Propagate closure variable mutations back to the caller's env
-  // Handles: var x = "safe"; function f() { x = tainted; } f(); sink(x);
-  // Also handles inverse: var x = tainted; function f() { x = "safe"; } f(); sink(x);
-  for (const [key, taint] of childEnv.bindings) {
-    if (key.startsWith('this.') || key === 'this' || key.startsWith('global:') ||
-        paramNames.has(key) || key.indexOf('.') !== -1) continue;
-    // Only propagate if the key is a closure variable (exists in caller's env)
-    if (env.has(key)) {
-      env.set(key, taint);
-    }
-  }
-
-  // Propagate global-scoped side effects back to the caller's env
-  // Handles: Config.init(val) sets Config.data = val → caller sees Config.data as tainted
-  // A dot-path binding (e.g., "Config.data") is a property path — propagate it back.
-  // Exclude internal namespaces: 'this.', 'global:', and scope-resolved keys (digit + ':').
-  for (const [key, taint] of childEnv.bindings) {
-    if (taint.tainted && key.indexOf('.') !== -1 &&
-        key.slice(0, 5) !== 'this.' && key.slice(0, 7) !== 'global:' &&
-        !(key[0] >= '0' && key[0] <= '9')) {
-      env.set(key, taint);
-    }
-  }
-
-  // Propagate parameter property mutations back to caller argument names
-  // Handles: function process(config) { config.html = tainted; } process(cfg);
-  // → callee has config.html tainted, caller needs cfg.html tainted
-  for (let i = 0; i < funcNode.params.length && i < callNode.arguments.length; i++) {
-    const param = funcNode.params[i];
-    if (param.type !== 'Identifier') continue;
-    const pName = param.name;
-    const argNode = callNode.arguments[i];
-    const argStr = nodeToString(argNode);
-    if (!argStr || argStr === pName) continue;
-    for (const [key, taint] of childEnv.bindings) {
-      if (key.startsWith(pName + '.')) {
-        const suffix = key.slice(pName.length);
-        env.set(`${argStr}${suffix}`, taint);
+    // Propagate closure variable mutations back to the closure env
+    if (_funcNode._closureEnv) {
+      for (const [key, taint] of _childEnv.bindings) {
+        if (taint.tainted && !key.startsWith('this.') && !_paramNames.has(key) && key !== 'this') {
+          _funcNode._closureEnv.set(key, taint);
+        }
       }
     }
+
+    // Propagate closure variable mutations back to the caller's env
+    for (const [key, taint] of _childEnv.bindings) {
+      if (key.startsWith('this.') || key === 'this' || key.startsWith('global:') ||
+          _paramNames.has(key) || key.indexOf('.') !== -1) continue;
+      if (_callerEnv.has(key)) {
+        _callerEnv.set(key, taint);
+      }
+    }
+
+    // Propagate global-scoped side effects
+    for (const [key, taint] of _childEnv.bindings) {
+      if (taint.tainted && key.indexOf('.') !== -1 &&
+          key.slice(0, 5) !== 'this.' && key.slice(0, 7) !== 'global:' &&
+          !(key[0] >= '0' && key[0] <= '9')) {
+        _callerEnv.set(key, taint);
+      }
+    }
+
+    // Propagate parameter property mutations back to caller argument names
+    for (let i = 0; i < _funcNode.params.length && i < _callNode.arguments.length; i++) {
+      const param = _funcNode.params[i];
+      if (param.type !== 'Identifier') continue;
+      const pName = param.name;
+      const argNode = _callNode.arguments[i];
+      const argStr = nodeToString(argNode);
+      if (!argStr || argStr === pName) continue;
+      for (const [key, taint] of _childEnv.bindings) {
+        if (key.startsWith(pName + '.')) {
+          const suffix = key.slice(pName.length);
+          _callerEnv.set(`${argStr}${suffix}`, taint);
+        }
+      }
+    }
+
+    // Cache the result (include returnedFuncNode/Methods so cache hits restore them)
+    const cachedResult = result.tainted ? result : TaintSet.empty();
+    if (innerCtx.returnedFuncNode) cachedResult._returnedFuncNode = innerCtx.returnedFuncNode;
+    if (innerCtx.returnedMethods) cachedResult._returnedMethods = innerCtx.returnedMethods;
+    _callerCtx.analyzedCalls.set(_callSig, cachedResult);
+  };
+
+  // Build the frame
+  const frame = {
+    cfg: innerCfg,
+    worklist: [innerCfg.entry],
+    blockEnvs: new Map([[innerCfg.entry.id, childEnv.clone()]]),
+    inWorklist: new Set([innerCfg.entry.id]),
+    innerCtx,
+    callerCtx: ctx,
+    env: childEnv,
+    postProcess,
+  };
+
+  // If we're inside the IP loop, push a frame and signal suspension
+  if (ctx._ipStack) {
+    ctx._ipStack.push(frame);
+    ctx._ipSuspended = true;
+    // Restore caller state immediately (postProcess will do it again, but we need
+    // the caller's ctx to be in a consistent state during re-processing)
+    ctx._paramConstants = savedParamConstants;
+    ctx.funcMap = savedFuncMap;
+    return TaintSet.empty(); // placeholder
   }
 
-  // Cache the result so repeated calls with the same signature return the correct taint
-  if (result.tainted) ctx.analyzedCalls.set(callSig, result);
-
-  return result;
+  // Top-level call: run the IP loop
+  return _runIPLoop([frame]);
 }
 
 // ── For-in/of binding ──
