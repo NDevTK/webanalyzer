@@ -75,6 +75,7 @@ export const CALL_SOURCES = {
   'decodeURIComponent': 'passthrough',  // propagates taint, doesn't create it
   'decodeURI': 'passthrough',
   'atob': 'passthrough',
+  'btoa': 'passthrough',
   'JSON.parse': 'passthrough',
   'fetch': 'passthrough',       // tainted URL → tainted response for .then chains
   'String': 'passthrough',
@@ -184,7 +185,7 @@ export function nodeToString(node) {
   if (node.type === 'ThisExpression') return 'this';
   if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') && !node.computed) {
     const obj = nodeToString(node.object);
-    const prop = node.property.name || node.property.value;
+    const prop = node.property.name || node.property.value || node.property.id?.name;
     if (obj && prop) return `${obj}.${prop}`;
   }
   if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') && node.computed && node.property.type === 'StringLiteral') {
