@@ -1505,7 +1505,25 @@ function processVarDeclarator(node, env, ctx) {
   } else {
     assignToPattern(node.id, taint, env, ctx);
   }
+  // Propagate per-property taints from Object.assign: var config = Object.assign({}, src1, src2)
+  // This ensures config.html reflects the LAST source's value (safe override wins)
+  if (node.init._assignPerPropertyTaints && node.id.type === 'Identifier') {
+    const varName = node.id.name;
+    const varKey = resolveId(node.id, ctx);
+    for (const [propName, pTaint] of node.init._assignPerPropertyTaints) {
+      env.set(`${varName}.${propName}`, pTaint);
+      if (varKey !== varName) env.set(`${varKey}.${propName}`, pTaint);
+    }
+    node.init._assignPerPropertyTaints = null;
+  }
+
   registerReturnedFunctions(node.id, ctx);
+
+  // Track bound built-in callee: var w = document.write.bind(document) → alias w to document.write
+  if (ctx._boundCalleeStr && node.id.type === 'Identifier') {
+    env.aliases.set(node.id.name, ctx._boundCalleeStr);
+    ctx._boundCalleeStr = null;
+  }
 
   // Track CustomEvent type: var ev = new CustomEvent('type', ...) → map ev → type
   if (ctx._pendingCustomEventType && node.id.type === 'Identifier') {
@@ -1540,6 +1558,45 @@ function processVarDeclarator(node, env, ctx) {
     // Transitive: if init is itself an alias, propagate
     const existing = env.aliases.get(initName);
     if (existing) env.aliases.set(node.id.name, existing);
+  }
+  // Resolve constant ternary: var fn = false ? console.log : eval → alias fn to eval
+  if (node.id.type === 'Identifier' && node.init.type === 'ConditionalExpression') {
+    const constCond = isConstantBool(node.init.test, ctx);
+    const selectedBranch = constCond === true ? node.init.consequent :
+                           constCond === false ? node.init.alternate : null;
+    if (selectedBranch && selectedBranch.type === 'Identifier') {
+      const ALIASABLE_GLOBALS = new Set(['location', 'document', 'window', 'self', 'globalThis', 'navigator', 'top', 'parent',
+        'eval', 'setTimeout', 'setInterval', 'Function', 'fetch', 'atob', 'decodeURIComponent', 'decodeURI',
+        'encodeURIComponent', 'encodeURI', 'parseInt', 'parseFloat', 'Number', 'Boolean', 'String', 'JSON', 'Math',
+        'DOMPurify', 'structuredClone', 'queueMicrotask', 'requestAnimationFrame']);
+      const branchName = selectedBranch.name;
+      const branchAlias = env.aliases.get(branchName) || branchName;
+      if (ALIASABLE_GLOBALS.has(branchAlias)) {
+        env.aliases.set(node.id.name, branchAlias);
+      }
+      // Also register funcMap alias if the branch is a known function
+      const refFunc = ctx.funcMap.get(branchName) || ctx.funcMap.get(resolveId(selectedBranch, ctx));
+      if (refFunc) {
+        const key = resolveId(node.id, ctx);
+        ctx.funcMap.set(key, refFunc);
+        ctx.funcMap.set(node.id.name, refFunc);
+      }
+    }
+    // Handle MemberExpression branches: var fn = false ? a : document.write
+    if (selectedBranch && (selectedBranch.type === 'MemberExpression' || selectedBranch.type === 'OptionalMemberExpression')) {
+      const branchStr = nodeToString(selectedBranch);
+      if (branchStr) {
+        const refFunc = ctx.funcMap.get(branchStr);
+        if (refFunc) {
+          const key = resolveId(node.id, ctx);
+          ctx.funcMap.set(key, refFunc);
+          ctx.funcMap.set(node.id.name, refFunc);
+        } else {
+          // For built-in sinks, store as alias
+          env.aliases.set(node.id.name, branchStr);
+        }
+      }
+    }
   }
   // Also: var search = location.search (MemberExpression alias)
   if (node.id.type === 'Identifier' && (node.init.type === 'MemberExpression' || node.init.type === 'OptionalMemberExpression')) {
@@ -1898,6 +1955,22 @@ function processAssignment(node, env, ctx) {
         analyzeInlineFunction(handler, childEnv, ctx);
       } else {
         evaluateExpr(handler.body, childEnv, ctx);
+      }
+    } else {
+      // Tainted string assigned to event handler property: el.onclick = taintedStr
+      // This is equivalent to setAttribute("onclick", taintedStr) — XSS sink
+      const rhsTaint = evaluateExpr(node.right, env, ctx);
+      if (rhsTaint.tainted) {
+        const propName = node.left.property.name;
+        const loc = getNodeLoc(node);
+        ctx.findings.push({
+          type: 'XSS',
+          severity: 'high',
+          title: `XSS: tainted data assigned to event handler property .${propName}`,
+          sink: makeSinkInfo(`.${propName}`, ctx, loc),
+          source: formatSources(rhsTaint),
+          path: buildTaintPath(rhsTaint, `.${propName}`),
+        });
       }
     }
   }
@@ -2404,14 +2477,15 @@ export function evaluateExpr(node, env, ctx) {
           case C_IMPORT_EXPR: {
             const specifierTaint = V.pop();
             if (specifierTaint.tainted) {
-              for (const label of specifierTaint.labels) {
-                item.ctx.findings.push({
-                  type: 'XSS',
-                  description: `XSS: tainted data flows to dynamic import()`,
-                  location: { file: item.ctx.file, line: item.node.loc?.start?.line || 0, column: item.node.loc?.start?.column || 0 },
-                  source: label,
-                });
-              }
+              const loc = getNodeLoc(item.node);
+              item.ctx.findings.push({
+                type: 'Script Injection',
+                severity: 'critical',
+                title: 'Script Injection: tainted data flows to dynamic import()',
+                sink: makeSinkInfo('import()', item.ctx, loc),
+                source: formatSources(specifierTaint),
+                path: buildTaintPath(specifierTaint, 'import()'),
+              });
             }
             V.push(TaintSet.empty());
             break;
@@ -2885,14 +2959,15 @@ function evaluateCallExpr(node, env, ctx) {
   if (node.callee.type === 'Import' && node.arguments.length > 0) {
     const specifierTaint = evaluateExpr(node.arguments[0], env, ctx);
     if (specifierTaint.tainted) {
-      for (const label of specifierTaint.labels) {
-        ctx.findings.push({
-          type: 'XSS',
-          description: `XSS: tainted data flows to dynamic import()`,
-          location: { file: ctx.file, line: node.loc?.start?.line || 0, column: node.loc?.start?.column || 0 },
-          source: label,
-        });
-      }
+      const loc = node.loc?.start || { line: 0, column: 0 };
+      ctx.findings.push({
+        type: 'Script Injection',
+        severity: 'critical',
+        title: 'Script Injection: tainted data flows to dynamic import()',
+        sink: makeSinkInfo('import()', ctx, loc),
+        source: formatSources(specifierTaint),
+        path: buildTaintPath(specifierTaint, 'import()'),
+      });
     }
     return TaintSet.empty();
   }
@@ -2929,6 +3004,20 @@ function evaluateCallExpr(node, env, ctx) {
     } else if (attrArg) {
       const resolved = resolveToConstant(attrArg, env, ctx);
       if (typeof resolved === 'string') attrName = resolved.toLowerCase();
+    }
+    // Tainted attribute NAME (arg 0) — attacker can set onclick/onfocus/etc.
+    const attrNameTaint = argTaints[0];
+    if (attrNameTaint && attrNameTaint.tainted && node.callee?.object) {
+      const objName = nodeToString(node.callee.object);
+      const loc = getNodeLoc(node);
+      ctx.findings.push({
+        type: 'XSS',
+        severity: 'high',
+        title: 'XSS: attacker-controlled attribute name in setAttribute',
+        sink: makeSinkInfo(`${objName || 'element'}.setAttribute(tainted, ...)`, ctx, loc),
+        source: formatSources(attrNameTaint),
+        path: buildTaintPath(attrNameTaint, `${objName || 'element'}.setAttribute(tainted, ...)`),
+      });
     }
     if (attrName) {
       const srcTaint = argTaints[1];
@@ -3136,16 +3225,36 @@ function evaluateCallExpr(node, env, ctx) {
   // Reflect.apply(fn, thisArg, argsArray) — interprocedural call
   if (isCalleeMatch(node, 'Reflect', 'apply', env) && node.arguments.length >= 3) {
     const fnNode = node.arguments[0];
-    const argsArrayTaint = argTaints[2] || TaintSet.empty();
+    const argsArrayNode = node.arguments[2];
+    // Extract individual arg taints from the array expression
+    let spreadArgTaints = [];
+    if (argsArrayNode && argsArrayNode.type === 'ArrayExpression' && argsArrayNode.elements) {
+      spreadArgTaints = argsArrayNode.elements.map(el => el ? evaluateExpr(el, env, ctx) : TaintSet.empty());
+    } else {
+      const argsArrayTaint = argTaints[2] || TaintSet.empty();
+      spreadArgTaints = [argsArrayTaint];
+    }
     const funcName = nodeToString(fnNode);
     const funcRef = fnNode.type === 'Identifier'
       ? (ctx.funcMap.get(resolveId(fnNode, ctx)) || ctx.funcMap.get(fnNode.name))
       : (funcName && ctx.funcMap.get(funcName));
     if (funcRef && funcRef.body) {
-      const synthCall = { ...node, callee: fnNode, arguments: node.arguments.slice(2) };
-      return analyzeCalledFunction(synthCall, funcName, [argsArrayTaint], env, ctx);
+      const synthArgs = argsArrayNode?.type === 'ArrayExpression' ? argsArrayNode.elements.filter(Boolean) : [];
+      const synthCall = { ...node, callee: fnNode, arguments: synthArgs };
+      return analyzeCalledFunction(synthCall, funcName, spreadArgTaints, env, ctx);
     }
-    return argsArrayTaint.clone();
+    // Check if target is a known call sink (e.g. eval, document.write)
+    if (funcName) {
+      const fnParts = funcName.split('.');
+      const fnMethodName = fnParts[fnParts.length - 1];
+      const sinkInfo = checkCallSink(funcName, fnMethodName);
+      if (sinkInfo) {
+        const synthArgs = argsArrayNode?.type === 'ArrayExpression' ? argsArrayNode.elements.filter(Boolean) : [];
+        const synthCall = { ...node, callee: fnNode, arguments: synthArgs };
+        checkSinkCall(synthCall, sinkInfo, spreadArgTaints, funcName, env, ctx);
+      }
+    }
+    return spreadArgTaints[0]?.clone() || TaintSet.empty();
   }
 
   // Reflect.construct(Target, args) — equivalent to new Target(...args)
@@ -3188,48 +3297,66 @@ function evaluateCallExpr(node, env, ctx) {
 
   // Object.assign(target, ...sources) — propagate taint from sources to target and return
   if (isCalleeMatch(node, 'Object', 'assign', env) && node.arguments.length >= 2) {
-    const merged = argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
     // If target is an identifier or member, update its taint in env
     const targetNode = node.arguments[0];
-    if (targetNode) {
-      const targetStr = nodeToString(targetNode);
-      if (targetStr) {
-        env.set(targetStr, env.get(targetStr).clone().merge(merged));
-        if (targetNode.type === 'Identifier') {
-          const key = resolveId(targetNode, ctx);
-          env.set(key, env.get(key).clone().merge(merged));
-        }
-        // Propagate per-property taints from source objects to target
-        // Handles: Object.assign(target, { html: tainted }) → target.html = tainted
-        for (let si = 1; si < node.arguments.length; si++) {
-          const srcNode = node.arguments[si];
-          if (srcNode.type === 'ObjectExpression') {
-            for (const prop of srcNode.properties) {
-              if (prop.type === 'SpreadElement') continue;
-              if (isObjectProp(prop) && prop.key) {
-                const propName = propKeyName(prop.key);
-                if (propName) {
-                  const propTaint = evaluateExpr(prop.value, env, ctx);
-                  env.set(`${targetStr}.${propName}`, propTaint);
-                }
-              }
+    // Collect per-property taints from all sources in order (later sources override earlier)
+    const propTaints = new Map();
+    let overallTaint = TaintSet.empty();
+
+    const targetStr = targetNode ? nodeToString(targetNode) : null;
+    const targetKey = targetNode?.type === 'Identifier' ? resolveId(targetNode, ctx) : null;
+
+    for (let si = 1; si < node.arguments.length; si++) {
+      const srcNode = node.arguments[si];
+      const srcTaint = argTaints[si] || TaintSet.empty();
+      overallTaint = overallTaint.merge(srcTaint);
+      if (srcNode.type === 'ObjectExpression') {
+        for (const prop of srcNode.properties) {
+          if (prop.type === 'SpreadElement') continue;
+          if (isObjectProp(prop) && prop.key) {
+            const propName = propKeyName(prop.key);
+            if (propName) {
+              const pTaint = evaluateExpr(prop.value, env, ctx);
+              propTaints.set(propName, pTaint);
             }
-          } else {
-            const srcStr = nodeToString(srcNode);
-            if (srcStr) {
-              // Copy per-property taints from source identifier
-              for (const [key, taint] of env.getTaintedWithPrefix(`${srcStr}.`)) {
-                const propName = key.slice(srcStr.length + 1);
-                if (propName && !propName.startsWith('#')) {
-                  env.set(`${targetStr}.${propName}`, taint);
-                }
-              }
+          }
+        }
+      } else {
+        const srcStr = nodeToString(srcNode);
+        if (srcStr) {
+          // Copy per-property taints from source identifier
+          for (const [key, taint] of env.getTaintedWithPrefix(`${srcStr}.`)) {
+            const propName = key.slice(srcStr.length + 1);
+            if (propName && !propName.startsWith('#')) {
+              propTaints.set(propName, taint);
             }
           }
         }
       }
     }
-    return merged;
+
+    // Compute actual return taint: only tainted if at least one property is still tainted
+    // after later sources may have overridden earlier ones with safe values
+    let resultTaint = TaintSet.empty();
+    for (const [, pTaint] of propTaints) {
+      if (pTaint.tainted) resultTaint = resultTaint.merge(pTaint);
+    }
+    // If no per-property info was collected, fall back to overall merge
+    if (propTaints.size === 0) resultTaint = overallTaint;
+
+    if (targetStr) {
+      env.set(targetStr, env.get(targetStr).clone().merge(resultTaint));
+      if (targetKey) env.set(targetKey, env.get(targetKey).clone().merge(resultTaint));
+      for (const [propName, pTaint] of propTaints) {
+        env.set(`${targetStr}.${propName}`, pTaint);
+        if (targetKey) env.set(`${targetKey}.${propName}`, pTaint);
+      }
+    }
+    // Store per-property taints for the result variable assignment (when target is {})
+    if (propTaints.size > 0) {
+      node._assignPerPropertyTaints = propTaints;
+    }
+    return resultTaint;
   }
 
   if (calleeStr && CALL_SOURCES[calleeStr] && CALL_SOURCES[calleeStr] !== 'passthrough') {
@@ -3357,6 +3484,12 @@ function evaluateNewExpr(node, env, ctx) {
   // new WebSocket(url) — tainted URL is injection risk (attacker-controlled endpoint)
   if (isGlobalRef(node.callee, 'WebSocket', env)) {
     checkSinkCall(node, { type: 'XSS', taintedArgs: [0] }, argTaints, 'new WebSocket()', env, ctx);
+  }
+
+  // new Worker(url) / new SharedWorker(url) — tainted URL is script injection
+  if ((isGlobalRef(node.callee, 'Worker', env) || isGlobalRef(node.callee, 'SharedWorker', env)) && argTaints[0]) {
+    const ctorName = isGlobalRef(node.callee, 'Worker', env) ? 'Worker' : 'SharedWorker';
+    checkSinkCall(node, { type: 'Script Injection', taintedArgs: [0] }, argTaints, `new ${ctorName}()`, env, ctx);
   }
 
   // new Blob([content], ...) — propagate taint from array content
@@ -3617,9 +3750,24 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       // so when the result is called, it resolves to the original function
       const callee = node.callee?.object;
       if (callee) {
-        const funcRef = callee.type === 'Identifier'
+        let funcRef = callee.type === 'Identifier'
           ? (ctx.funcMap.get(resolveId(callee, ctx)) || ctx.funcMap.get(callee.name))
           : null;
+        // For built-in Identifier callees (eval, setTimeout, etc.): store as alias
+        if (!funcRef && callee.type === 'Identifier') {
+          ctx._boundCalleeStr = callee.name;
+        }
+        // Also check MemberExpression callees: document.write.bind(document) → resolve document.write
+        if (!funcRef && (callee.type === 'MemberExpression' || callee.type === 'OptionalMemberExpression')) {
+          const calleeStr = nodeToString(callee);
+          if (calleeStr) {
+            funcRef = ctx.funcMap.get(calleeStr);
+            // For built-in sinks (eval, document.write, etc.), store callee string as alias
+            if (!funcRef) {
+              ctx._boundCalleeStr = calleeStr;
+            }
+          }
+        }
         if (funcRef) {
           // Store the thisArg node so analyzeCalledFunction can bind this.* properties
           const thisArgNode = node.arguments?.[0];
@@ -5163,6 +5311,17 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       }
     }
 
+    // Propagate thrown taint from callee back to caller (for interprocedural try/catch)
+    if (innerCtx.thrownTaint.tainted) {
+      _callerCtx.thrownTaint.merge(innerCtx.thrownTaint);
+    }
+    if (innerCtx._thrownProperties) {
+      if (!_callerCtx._thrownProperties) _callerCtx._thrownProperties = new Map();
+      for (const [suffix, propTaint] of innerCtx._thrownProperties) {
+        _callerCtx._thrownProperties.set(suffix, propTaint);
+      }
+    }
+
     // Cache the result (include returnedFuncNode/Methods so cache hits restore them)
     const cachedResult = result.tainted ? result : TaintSet.empty();
     if (innerCtx.returnedFuncNode) cachedResult._returnedFuncNode = innerCtx.returnedFuncNode;
@@ -5737,7 +5896,7 @@ function wrapDelivery(sourceType, value, pageUrl, sourceKey, propertyChain) {
       };
     }
     case 'window.name':
-      return { vector: `window.open(${JSON.stringify(page)}, ${JSON.stringify(value)})`, description: 'Open page with crafted window.name' };
+      return { vector: `// Attacker sets window.name before navigating:\nvar w = window.open('', ${JSON.stringify(value)});\nw.location = ${JSON.stringify(page)};\n// Target page reads window.name`, description: 'Open page with crafted window.name' };
     case 'url.hashchange':
       return { vector: `location.hash = ${JSON.stringify('#' + value)}`, description: 'Trigger hashchange event with crafted hash' };
     case 'url.document.referrer':

@@ -84,6 +84,11 @@ export function analyzeMultiple(scripts) {
     for (const [k, v] of funcMap) globalFuncMap.set(k, v);
   }
 
+  // Generate PoCs for all findings (same as single-file analyze)
+  for (const f of allFindings) {
+    if (!f.poc) f.poc = generatePoC(f);
+  }
+
   return allFindings;
 }
 
