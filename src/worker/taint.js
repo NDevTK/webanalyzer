@@ -2922,26 +2922,17 @@ function evaluateCallExpr(node, env, ctx) {
   if ((isCalleeIdentifier(node, 'setTimeout', env) || isCalleeIdentifier(node, 'setInterval', env) ||
        isCalleeIdentifier(node, 'queueMicrotask', env) || isCalleeIdentifier(node, 'requestAnimationFrame', env)) && node.arguments[0]) {
     let callback = node.arguments[0];
-    const origCallbackName = callback.type === 'Identifier' ? callback.name : null;
     if (callback.type === 'Identifier') {
       const refKey = resolveId(callback, ctx);
       callback = ctx.funcMap.get(refKey) || ctx.funcMap.get(callback.name) || callback;
     }
     if (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression' ||
         callback.type === 'FunctionDeclaration') {
-      // Guard against infinite recursion: skip if this callback is already being analyzed
-      // (e.g., function retry() { setTimeout(retry, 100) })
-      const cbKey = origCallbackName ? `timer:${origCallbackName}` : (callback.loc ? `timer:${callback.loc.start.line}:${callback.loc.start.column}` : null);
-      if (cbKey && ctx.analyzedCalls.has(cbKey)) {
-        // already analyzed — skip to avoid infinite loop
+      const childEnv = (callback._closureEnv || env).child();
+      if (callback.body.type === 'BlockStatement') {
+        analyzeInlineFunction(callback, childEnv, ctx);
       } else {
-        if (cbKey) ctx.analyzedCalls.set(cbKey, TaintSet.empty());
-        const childEnv = (callback._closureEnv || env).child();
-        if (callback.body.type === 'BlockStatement') {
-          analyzeInlineFunction(callback, childEnv, ctx);
-        } else {
-          evaluateExpr(callback.body, childEnv, ctx);
-        }
+        evaluateExpr(callback.body, childEnv, ctx);
       }
     }
   }
@@ -4458,11 +4449,21 @@ function _finalizeFrame(frame) {
 // available; otherwise runs _runIPLoop directly. Uses per-block counter-based
 // caching so re-processed blocks get cached results.
 function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
+  // Re-entrancy guard: prevent infinite recursion when a callback references itself
+  // (e.g., function retry() { setTimeout(retry, 100); addEventListener("load", retry); })
+  // Uses a stack-based check so the same function CAN be re-analyzed with different
+  // taint inputs (e.g., CustomEvent dispatch), just not recursively.
+  const loc = funcNode.loc?.start;
+  const aifKey = loc ? `aif:${loc.line}:${loc.column}` : null;
+  if (!ctx._aifStack) ctx._aifStack = new Set();
+  if (aifKey && ctx._aifStack.has(aifKey)) return TaintSet.empty();
+  if (aifKey) ctx._aifStack.add(aifKey);
   const innerCfg = buildCFG(funcNode.body);
   const innerCtx = new AnalysisContext(
     ctx.file, ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap), ctx.findings,
     ctx.globalEnv, ctx.scopeInfo, ctx.analyzedCalls
   );
+  innerCtx._aifStack = ctx._aifStack; // propagate re-entrancy guard to nested calls
   innerCtx.classBodyMap = ctx.classBodyMap;
   innerCtx.superClassMap = ctx.superClassMap;
   innerCtx.protoMethodMap = ctx.protoMethodMap;
@@ -4508,12 +4509,22 @@ function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
     }
     frame._inlineCacheKey = cacheKey;
     frame._parentInlineResults = ctx._inlineResults;
+    // Clean up re-entrancy guard when frame eventually completes (via postProcess)
+    const _origPostProcess = frame.postProcess;
+    const _aifCleanupKey = aifKey;
+    const _aifCleanupStack = ctx._aifStack;
+    frame.postProcess = (result) => {
+      if (_origPostProcess) _origPostProcess(result);
+      if (_aifCleanupKey) _aifCleanupStack.delete(_aifCleanupKey);
+    };
     ctx._ipStack.push(frame);
     ctx._ipSuspended = true;
     return TaintSet.empty();
   }
 
-  return _runIPLoop([frame]);
+  const _result = _runIPLoop([frame]);
+  if (aifKey) ctx._aifStack.delete(aifKey);
+  return _result;
 }
 
 // ── Interprocedural frame loop driver ──
