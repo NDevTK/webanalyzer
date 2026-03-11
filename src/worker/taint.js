@@ -3616,14 +3616,22 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       return cbTaint;
     }
 
-    case 'findIndex': case 'indexOf': case 'lastIndexOf':
-      // These return a number — kill taint
+    case 'findIndex':
+      // findIndex takes a callback — analyze it for sinks, returns number
       analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
       return TaintSet.empty();
 
-    case 'some': case 'every': case 'includes':
+    case 'indexOf': case 'lastIndexOf':
+      // These take a VALUE (not a callback) — returns number, kill taint
+      return TaintSet.empty();
+
+    case 'some': case 'every':
       // These return a boolean — kill taint, but analyze callback for sinks
       analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
+      return TaintSet.empty();
+
+    case 'includes':
+      // includes takes a VALUE (not a callback) — returns boolean, kill taint
       return TaintSet.empty();
 
     case 'reduce': case 'reduceRight': {
