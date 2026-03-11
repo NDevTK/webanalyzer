@@ -264,6 +264,26 @@ function renderFindings(findings) {
         ? `<div class="finding-warning"><span class="finding-warning-icon">&#9888;</span><span>${esc(weakWarning)}</span></div>`
         : '';
 
+      // PoC section
+      const poc = f.poc;
+      let pocHtml = '';
+      if (poc) {
+        const stepsHtml = (poc.steps || []).length > 0
+          ? poc.steps.map(s => `<div class="poc-step">${esc(s)}</div>`).join('')
+          : '';
+        pocHtml = `
+          <div class="finding-poc">
+            <div class="poc-header" title="Click to expand/collapse">&#9881; Proof of Concept</div>
+            <div class="poc-body">
+              ${poc.description ? `<div class="poc-desc">${esc(poc.description)}</div>` : ''}
+              ${stepsHtml ? `<div class="poc-steps"><strong>Data flow:</strong>${stepsHtml}</div>` : ''}
+              <div class="poc-vector"><strong>Payload:</strong> <code>${esc(poc.payload)}</code></div>
+              <pre class="poc-code">${esc(poc.vector)}</pre>
+              <button class="poc-copy-btn" title="Copy PoC">Copy PoC</button>
+            </div>
+          </div>`;
+      }
+
       el.innerHTML = `
         <div class="finding-header">
           <span class="finding-type ${cardClass}">${esc(f.type)}</span>
@@ -276,14 +296,38 @@ function renderFindings(findings) {
           <div class="finding-sink-row"><strong>Sink:</strong><br>${sinkText}</div>
         </div>
         ${pathLines ? `<div class="finding-path">${pathLines}</div>` : ''}
+        ${pocHtml}
         <button class="copy-btn" title="Copy finding">Copy</button>
       `;
+      // PoC toggle
+      const pocHeader = el.querySelector('.poc-header');
+      if (pocHeader) {
+        pocHeader.addEventListener('click', () => {
+          pocHeader.parentElement.classList.toggle('expanded');
+        });
+      }
+      // PoC copy
+      const pocCopyBtn = el.querySelector('.poc-copy-btn');
+      if (pocCopyBtn && poc) {
+        pocCopyBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const text = [
+            `PoC for: [${f.type}] ${f.title}`,
+            poc.description ? `\n${poc.description}` : '',
+            poc.steps?.length ? `\nData flow:\n${poc.steps.map(s => `  ${s}`).join('\n')}` : '',
+            `\nPayload: ${poc.payload}`,
+            `\nVector:\n${poc.vector}`,
+          ].filter(Boolean).join('\n');
+          navigator.clipboard.writeText(text);
+        });
+      }
       el.querySelector('.copy-btn').addEventListener('click', () => {
         const text = [
           `[${f.type}] ${f.title}`,
           `Source: ${(f.source || []).map(s => `${s.description || s.type} (${s.file}:${s.line})`).join(', ')}`,
           f.sink ? `Sink: ${f.sink.expression} (${f.sink.file}:${f.sink.line})` : '',
           ...(f.path || []).map(p => `  → ${p}`),
+          poc ? `\nPoC: ${poc.vector}` : '',
         ].filter(Boolean).join('\n');
         navigator.clipboard.writeText(text);
       });

@@ -426,3 +426,105 @@ body {
   color: #7ec8e3;
   text-decoration-style: solid;
 }
+
+/* ── Proof of Concept section ── */
+
+.finding-poc {
+  margin-top: 8px;
+  border: 1px solid #2a3a4e;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.poc-header {
+  padding: 5px 8px;
+  background: #1a2a3e;
+  color: #7ec8e3;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.poc-header:hover {
+  background: #1e3048;
+}
+
+.poc-body {
+  display: none;
+  padding: 8px;
+  background: #0e1a2a;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.finding-poc.expanded .poc-body {
+  display: block;
+}
+
+.poc-desc {
+  color: #aaa;
+  margin-bottom: 6px;
+}
+
+.poc-steps {
+  margin-bottom: 6px;
+  color: #888;
+}
+
+.poc-step {
+  padding-left: 10px;
+  color: #7ec8e3;
+  font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+  font-size: 10px;
+}
+
+.poc-step::before {
+  content: "\2192 ";
+  color: #444;
+}
+
+.poc-vector {
+  margin-bottom: 4px;
+  color: #aaa;
+}
+
+.poc-vector code {
+  color: #e94560;
+  background: #1a1a2e;
+  padding: 1px 4px;
+  border-radius: 2px;
+  font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+  font-size: 10px;
+}
+
+.poc-code {
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: #121225;
+  border-radius: 4px;
+  font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+  font-size: 10px;
+  color: #53d769;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.poc-copy-btn {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border: 1px solid #2a3a4e;
+  border-radius: 3px;
+  background: transparent;
+  color: #7ec8e3;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.poc-copy-btn:hover {
+  background: #1a2a3e;
+  border-color: #7ec8e3;
+}

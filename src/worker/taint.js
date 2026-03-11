@@ -11,17 +11,27 @@ import {
 import { buildCFG } from './cfg.js';
 
 // ── Taint label: tracks where taint originated ──
+const _NO_TRANSFORMS = [];
 export class TaintLabel {
-  constructor(sourceType, file, line, col, description) {
+  constructor(sourceType, file, line, col, description, transforms, sourceKey) {
     this.sourceType = sourceType;
     this.file = file;
     this.line = line;
     this.col = col;
     this.description = description;
+    this.transforms = transforms || _NO_TRANSFORMS;
+    this.sourceKey = sourceKey || null; // actual param/key name from the source call
   }
 
   get id() {
     return `${this.sourceType}@${this.file}:${this.line}:${this.col}`;
+  }
+
+  withTransform(op) {
+    const l = new TaintLabel(this.sourceType, this.file, this.line, this.col, this.description,
+      this.transforms === _NO_TRANSFORMS ? [op] : [...this.transforms, op]);
+    l.sourceKey = this.sourceKey;
+    return l;
   }
 }
 
@@ -73,6 +83,14 @@ export class TaintSet {
   }
 
   toArray() { return this.labels !== null ? [...this.labels.values()] : []; }
+
+  // Create a new TaintSet with a transform appended to all labels
+  withTransform(op) {
+    if (this.labels === null || this.labels.size === 0) return this;
+    const newLabels = new Map();
+    for (const [id, label] of this.labels) newLabels.set(id, label.withTransform(op));
+    return new TaintSet(newLabels);
+  }
 }
 
 // ── COW function map: layered Map with O(1) fork and O(delta) iteration ──
@@ -714,7 +732,11 @@ function getNodeLoc(node) {
 }
 
 function formatSources(taint) {
-  return taint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line }));
+  return taint.toArray().map(l => ({
+    type: l.sourceType, description: l.description, file: l.file, line: l.line,
+    transforms: l.transforms.length > 0 ? l.transforms : undefined,
+    sourceKey: l.sourceKey || undefined,
+  }));
 }
 
 function makeSinkInfo(expression, ctx, loc) {
@@ -2553,7 +2575,20 @@ function evaluateMemberExpr(node, env, ctx) {
 
   // Iterative evaluation for MemberExpression chains to avoid stack overflow on minified code.
   // Walk the chain, checking sources/env/getters at each level. Only recurse for computed access.
+  // Track properties accessed at outer levels so we can add transforms when the source is found deeper.
   let cur = node;
+  const outerProps = []; // properties accessed at levels above where the source/env-hit is found
+
+  // Helper: apply accumulated outer-property transforms to a taint result
+  const applyOuterProps = (taint) => {
+    if (!taint.tainted || outerProps.length === 0) return taint;
+    let result = taint;
+    for (let i = outerProps.length - 1; i >= 0; i--) {
+      result = result.withTransform({ op: 'property', args: [outerProps[i]] });
+    }
+    return result;
+  };
+
   while (cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression') {
     let sourceLabel = checkMemberSource(cur);
     // For computed members with resolvable keys: location[prop] where prop = "hash"
@@ -2569,7 +2604,7 @@ function evaluateMemberExpr(node, env, ctx) {
     }
     if (sourceLabel) {
       const loc = getNodeLoc(cur);
-      return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur)));
+      return applyOuterProps(TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur))));
     }
 
     // Resolve aliases: replace root identifier with its alias and re-check as source
@@ -2578,7 +2613,7 @@ function evaluateMemberExpr(node, env, ctx) {
       const resolvedStr = resolveAliasedPath(fullStr, env);
       if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
         const loc = getNodeLoc(cur);
-        return TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr));
+        return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr)));
       }
     }
     if (!cur.computed && cur.object?.type === 'Identifier') {
@@ -2587,14 +2622,14 @@ function evaluateMemberExpr(node, env, ctx) {
         const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
         if (MEMBER_SOURCES[deepPath]) {
           const loc = getNodeLoc(cur);
-          return TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath));
+          return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath)));
         }
       }
     }
 
     const fullPath = fullStr;
     if (fullPath) {
-      if (env.has(fullPath)) return env.get(fullPath).clone();
+      if (env.has(fullPath)) return applyOuterProps(env.get(fullPath).clone());
     }
     // Scope-resolved lookup
     if (!cur.computed && cur.object?.type === 'Identifier' && cur.property) {
@@ -2602,7 +2637,7 @@ function evaluateMemberExpr(node, env, ctx) {
       const memberProp = cur.property.name || cur.property.value;
       if (memberProp) {
         const scopedPath = `${resolvedObjKey}.${memberProp}`;
-        if (env.has(scopedPath)) return env.get(scopedPath).clone();
+        if (env.has(scopedPath)) return applyOuterProps(env.get(scopedPath).clone());
       }
     }
     if (fullPath) {
@@ -2610,7 +2645,7 @@ function evaluateMemberExpr(node, env, ctx) {
       if (getterFunc && getterFunc.body) {
         const childEnv = (getterFunc._closureEnv || env).child();
         const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
-        if (getterTaint.tainted) return getterTaint;
+        if (getterTaint.tainted) return applyOuterProps(getterTaint);
       }
     }
 
@@ -2622,14 +2657,16 @@ function evaluateMemberExpr(node, env, ctx) {
     // Computed access: evaluate object + key, handle property lookups, then return
     if (cur.computed) {
       const objTaint = evaluateExpr(cur.object, env, ctx);
-      return evaluateComputedMember(cur, objTaint, env, ctx);
+      return applyOuterProps(evaluateComputedMember(cur, objTaint, env, ctx));
     }
 
-    // Non-computed: continue walking up the chain
+    // Non-computed: record the property and continue walking up the chain
+    if (propName) outerProps.push(propName);
     cur = cur.object;
   }
   // Reached the root (non-MemberExpression node)
-  return evaluateExpr(cur, env, ctx);
+  const rootTaint = evaluateExpr(cur, env, ctx);
+  return applyOuterProps(rootTaint);
 }
 
 function evaluateComputedMember(node, objTaint, env, ctx) {
@@ -2653,13 +2690,25 @@ function evaluateComputedMember(node, objTaint, env, ctx) {
     if (litKey !== null && isDirectLiteral) {
       const objStr = nodeToString(node.object);
       if (objStr) {
-        if (env.has(`${objStr}.${litKey}`)) return env.get(`${objStr}.${litKey}`).clone();
-        if (/^\d+$/.test(litKey) && env.has(`${objStr}.#idx_${litKey}`)) return env.get(`${objStr}.#idx_${litKey}`).clone();
+        if (env.has(`${objStr}.${litKey}`)) {
+          const t = env.get(`${objStr}.${litKey}`).clone();
+          return t.tainted && /^\d+$/.test(litKey) ? t.withTransform({ op: 'index', args: [Number(litKey)] }) : t;
+        }
+        if (/^\d+$/.test(litKey) && env.has(`${objStr}.#idx_${litKey}`)) {
+          const t = env.get(`${objStr}.#idx_${litKey}`).clone();
+          return t.tainted ? t.withTransform({ op: 'index', args: [Number(litKey)] }) : t;
+        }
       }
       if (node.object?.type === 'Identifier') {
         const resolvedKey = resolveId(node.object, ctx);
-        if (env.has(`${resolvedKey}.${litKey}`)) return env.get(`${resolvedKey}.${litKey}`).clone();
-        if (/^\d+$/.test(litKey) && env.has(`${resolvedKey}.#idx_${litKey}`)) return env.get(`${resolvedKey}.#idx_${litKey}`).clone();
+        if (env.has(`${resolvedKey}.${litKey}`)) {
+          const t = env.get(`${resolvedKey}.${litKey}`).clone();
+          return t.tainted && /^\d+$/.test(litKey) ? t.withTransform({ op: 'index', args: [Number(litKey)] }) : t;
+        }
+        if (/^\d+$/.test(litKey) && env.has(`${resolvedKey}.#idx_${litKey}`)) {
+          const t = env.get(`${resolvedKey}.#idx_${litKey}`).clone();
+          return t.tainted ? t.withTransform({ op: 'index', args: [Number(litKey)] }) : t;
+        }
       }
     }
     // For variable-resolved keys (obj[key] where key='prop'), do per-property lookup
@@ -2705,7 +2754,10 @@ function evaluateComputedMember(node, objTaint, env, ctx) {
       }
     }
     // If the object itself is tainted (e.g. from JSON.parse), reading any property is tainted
-    if (objTaint.tainted) return objTaint.clone();
+    if (objTaint.tainted) {
+      const propName = !node.computed && node.property ? (node.property.name || node.property.value) : litKey;
+      return propName ? objTaint.withTransform({ op: 'property', args: [propName] }) : objTaint.clone();
+    }
     // If key is tainted but object has no tainted values, the read value is safe
   return objTaint;
 }
@@ -3182,10 +3234,18 @@ function evaluateCallExpr(node, env, ctx) {
 
   if (calleeStr && CALL_SOURCES[calleeStr] && CALL_SOURCES[calleeStr] !== 'passthrough') {
     const loc = getNodeLoc(node);
-    return TaintSet.from(new TaintLabel(CALL_SOURCES[calleeStr], ctx.file, loc.line || 0, loc.column || 0, calleeStr + '()'));
+    // Capture the first argument (param name, storage key, etc.) for PoC generation
+    const firstArg = node.arguments?.[0] ? resolveToConstant(node.arguments[0], env, ctx) : undefined;
+    const label = new TaintLabel(CALL_SOURCES[calleeStr], ctx.file, loc.line || 0, loc.column || 0,
+      firstArg !== undefined ? `${calleeStr}(${JSON.stringify(firstArg)})` : calleeStr + '()');
+    if (typeof firstArg === 'string') label.sourceKey = firstArg;
+    return TaintSet.from(label);
   }
 
-  if (calleeStr && isPassthrough(calleeStr)) return argTaints[0]?.clone() || TaintSet.empty();
+  if (calleeStr && isPassthrough(calleeStr)) {
+    const base = argTaints[0]?.clone() || TaintSet.empty();
+    return base.tainted ? base.withTransform({ op: calleeStr }) : base;
+  }
 
   // Check if there's a user-defined function for this exact callee path before deferring to builtins.
   // Only match full dot-path (e.g., "s.get") — prevents Map.get from intercepting class method s.get().
@@ -3522,8 +3582,11 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     case 'slice': case 'substring': case 'substr': case 'trim': case 'trimStart':
     case 'trimEnd': case 'toLowerCase': case 'toUpperCase': case 'normalize':
     case 'repeat': case 'at': case 'charAt':
-    case 'valueOf': case 'toString':
-      return objTaint.clone();
+    case 'valueOf': case 'toString': {
+      if (!objTaint.tainted) return objTaint.clone();
+      const cArgs = resolveConstantArgs(node.arguments, env, ctx);
+      return objTaint.withTransform({ op: methodName, args: cArgs });
+    }
 
     case 'padStart': case 'padEnd':
       // padStart/padEnd(targetLength, padString) — result includes both obj and pad string
@@ -3531,7 +3594,7 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
 
     case 'match': case 'matchAll':
       // Returns array of matches — preserve taint from the source string
-      return objTaint.clone();
+      return objTaint.tainted ? objTaint.withTransform({ op: methodName }) : objTaint.clone();
 
     case 'exec':
       // RegExp.exec(string) — taint comes from the argument string, not the regex
@@ -3578,11 +3641,18 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
     case 'concat':
       return objTaint.clone().merge(argTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
 
-    case 'replace': case 'replaceAll':
-      return objTaint.clone().merge(argTaints[1] || TaintSet.empty());
+    case 'replace': case 'replaceAll': {
+      const result = objTaint.clone().merge(argTaints[1] || TaintSet.empty());
+      if (!result.tainted) return result;
+      const cArgs = resolveConstantArgs(node.arguments, env, ctx);
+      return result.withTransform({ op: methodName, args: cArgs });
+    }
 
-    case 'split':
-      return objTaint.clone();
+    case 'split': {
+      if (!objTaint.tainted) return objTaint.clone();
+      const cArgs = resolveConstantArgs(node.arguments, env, ctx);
+      return objTaint.withTransform({ op: 'split', args: cArgs });
+    }
 
     case 'join':
       return objTaint.clone().merge(argTaints[0] || TaintSet.empty());
@@ -3913,7 +3983,13 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
           }
         }
       }
-      if (objTaint.tainted) return objTaint.clone();
+      if (objTaint.tainted) {
+        // Track .get('key') as a transform so PoC knows the parameter name
+        if (getKeyStr != null) {
+          return objTaint.withTransform({ op: 'get', args: [getKeyStr] });
+        }
+        return objTaint.clone();
+      }
       // Storage API: localStorage.get() / sessionStorage.get()
       if (node.callee?.object) {
         const storageObj = node.callee.object;
@@ -5428,4 +5504,330 @@ export function checkPrototypePollution(node, env, ctx) {
 
 function buildTaintPath(taintSet, sinkExpr) {
   return taintSet.toArray().map(label => `${label.description} (${label.file}:${label.line}) → ${sinkExpr}`);
+}
+
+// ── PoC generation from data flow transforms ──
+
+// Determine the base payload a sink needs to demonstrate exploitation
+function sinkPayload(sinkExpr, findingType) {
+  if (findingType === 'Prototype Pollution') return '{"__proto__":{"polluted":true}}';
+  if (findingType === 'CSS Injection') return 'color:red;background:url(//attacker.com/steal)';
+  if (findingType === 'Open Redirect') return 'https://attacker.com/phish';
+  if (findingType === 'Script Injection') return 'https://attacker.com/xss.js';
+  // XSS: depends on sink type
+  const s = sinkExpr || '';
+  if (/\blocation\b|\.href|\.assign|\.replace|window\.open/i.test(s)) return 'javascript:alert(1)';
+  if (/\beval\b|\bFunction\b|\bsetTimeout\b|\bsetInterval\b/i.test(s)) return 'alert(1)';
+  if (/setAttribute.*on\w+/i.test(s)) return 'alert(1)';
+  return '<img src=x onerror=alert(1)>';
+}
+
+// Reverse-apply transforms to work out what the source input must contain.
+// Walks the transform chain backwards from the sink payload.
+function reverseTransforms(payload, transforms) {
+  const steps = [];
+  let value = payload;
+  for (let i = transforms.length - 1; i >= 0; i--) {
+    const t = transforms[i];
+    switch (t.op) {
+      case 'slice': case 'substring': case 'substr': {
+        const start = typeof t.args[0] === 'number' ? t.args[0] : 0;
+        if (start > 0) {
+          const pad = '_'.repeat(start);
+          value = pad + value;
+          steps.unshift(`.${t.op}(${t.args.map(a => JSON.stringify(a)).join(', ')}) strips first ${start} char(s)`);
+        }
+        break;
+      }
+      case 'split': {
+        const sep = typeof t.args[0] === 'string' ? t.args[0] : null;
+        // Look for a following index/property transform (property with numeric key = array index)
+        const nextT = i + 1 < transforms.length ? transforms[i + 1] : null;
+        const isNextIndex = nextT && (nextT.op === 'index' || (nextT.op === 'property' && /^\d+$/.test(nextT.args[0])));
+        if (sep !== null && isNextIndex) {
+          // Handled by the index/property case — just skip the split step here
+          // to avoid duplicate steps
+        } else if (sep !== null) {
+          steps.unshift(`.split(${JSON.stringify(sep)}) splits on ${JSON.stringify(sep)}`);
+        }
+        break;
+      }
+      case 'index': {
+        // Handled by split lookahead above; standalone index just selects an element
+        if (i === 0 || transforms[i - 1].op !== 'split') {
+          steps.unshift(`[${t.args[0]}] selects element at index ${t.args[0]}`);
+        }
+        break;
+      }
+      case 'replace': case 'replaceAll': {
+        const pattern = t.args[0];
+        const replacement = t.args[1];
+        if (typeof pattern === 'string' && typeof replacement === 'string') {
+          // If the code removes something from the input (replaces with ''), our payload just shouldn't contain that pattern
+          // If the code replaces pattern→replacement, and replacement is in our payload, swap back
+          if (replacement === '' && !value.includes(pattern)) {
+            steps.unshift(`.${t.op}(${JSON.stringify(pattern)}, '') removes ${JSON.stringify(pattern)} (payload unaffected)`);
+          } else if (replacement !== '' && value.includes(replacement)) {
+            value = value.replace(replacement, pattern);
+            steps.unshift(`.${t.op}(${JSON.stringify(pattern)}, ${JSON.stringify(replacement)}) substitutes text`);
+          }
+        }
+        break;
+      }
+      case 'decodeURIComponent': case 'decodeURI':
+        // Input is URL-encoded; our payload can stay decoded (browser sends it encoded)
+        steps.unshift(`${t.op}() decodes URL-encoded input`);
+        break;
+      case 'atob':
+        // Input is base64-encoded
+        try { value = btoa(value); } catch { /* leave as-is */ }
+        steps.unshift('atob() decodes base64 — payload must be base64-encoded');
+        break;
+      case 'btoa':
+        steps.unshift('btoa() encodes to base64 (taint carries through)');
+        break;
+      case 'JSON.parse':
+        value = JSON.stringify(value);
+        steps.unshift('JSON.parse() parses JSON — payload must be valid JSON string');
+        break;
+      case 'property': {
+        const prop = t.args[0];
+        // Numeric property after split acts as array index
+        if (prop && /^\d+$/.test(prop)) {
+          const prev = i > 0 ? transforms[i - 1] : null;
+          if (prev && prev.op === 'split') {
+            const sep = typeof prev.args[0] === 'string' ? prev.args[0] : null;
+            const idx = Number(prop);
+            if (sep !== null) {
+              if (idx > 0) {
+                const prefix = ('x' + sep).repeat(idx);
+                value = prefix + value;
+              }
+              steps.unshift(`.split(${JSON.stringify(sep)})[${idx}] takes segment at index ${idx}`);
+              break;
+            }
+          }
+          steps.unshift(`[${prop}] selects element at index ${prop}`);
+        } else if (prop) {
+          // Collect consecutive property transforms and check if preceded by JSON.parse.
+          // E.g., JSON.parse(x).config.template → wrap in {config:{template: value}}
+          // Look backwards through consecutive properties to find a JSON.parse predecessor.
+          let jsonParseIdx = -1;
+          let scanIdx = i;
+          const propChain = [prop];
+          while (scanIdx > 0) {
+            const prevScan = transforms[scanIdx - 1];
+            if (prevScan.op === 'property' && typeof prevScan.args[0] === 'string' && !/^\d+$/.test(prevScan.args[0])) {
+              propChain.push(prevScan.args[0]);
+              scanIdx--;
+            } else if (prevScan.op === 'JSON.parse') {
+              jsonParseIdx = scanIdx - 1;
+              break;
+            } else {
+              break;
+            }
+          }
+          if (jsonParseIdx >= 0) {
+            // Wrap value in nested object matching the property chain
+            let wrapped = value;
+            for (const p of propChain) {
+              wrapped = JSON.stringify({ [p]: wrapped });
+              // Unwrap inner stringify for nesting: {"key":"val"} not {"key":"\"val\""}
+              // Re-parse and re-stringify to get correct nesting
+            }
+            // Actually build properly with real objects
+            let obj = value;
+            for (const p of propChain) {
+              obj = { [p]: obj };
+            }
+            value = JSON.stringify(obj);
+            const keyList = [...propChain].reverse().map(p => JSON.stringify(p)).join('.');
+            steps.unshift(`.${[...propChain].reverse().join('.')} reads from parsed JSON — payload must include ${keyList} path`);
+            i = jsonParseIdx; // skip past JSON.parse and consumed property transforms
+          } else {
+            steps.unshift(`.${prop} reads property "${prop}" from tainted object`);
+          }
+        }
+        break;
+      }
+      case 'get': {
+        // .get(key) on URLSearchParams/Map — the key name is used in delivery
+        const getKey = t.args[0];
+        if (getKey != null) {
+          steps.unshift(`.get(${JSON.stringify(getKey)}) reads parameter ${JSON.stringify(getKey)}`);
+        }
+        break;
+      }
+      case 'toLowerCase': case 'toUpperCase':
+        steps.unshift(`.${t.op}() changes case (payload unaffected)`);
+        break;
+      case 'trim': case 'trimStart': case 'trimEnd':
+        steps.unshift(`.${t.op}() trims whitespace (payload unaffected)`);
+        break;
+      case 'match': case 'matchAll':
+        steps.unshift(`.${t.op}() extracts regex matches from tainted string`);
+        break;
+      case 'charAt': case 'at': {
+        const idx = typeof t.args[0] === 'number' ? t.args[0] : 0;
+        steps.unshift(`.${t.op}(${idx}) extracts single character (limited exploitation)`);
+        break;
+      }
+      default:
+        if (t.op) steps.unshift(`${t.op}() transforms the data`);
+        break;
+    }
+  }
+  return { value, steps };
+}
+
+// Build a nested object literal from property transforms.
+// E.g. transforms [{op:'property',args:['data']},{op:'property',args:['html']}] + value
+// → { data: { html: value } }
+function buildNestedObject(propChain, value) {
+  let result = value;
+  for (let i = propChain.length - 1; i >= 0; i--) {
+    result = `{${JSON.stringify(propChain[i])}: ${typeof result === 'string' && result.startsWith('{') ? result : JSON.stringify(result)}}`;
+  }
+  return result;
+}
+
+// Wrap the reverse-transformed payload in the appropriate delivery for the source type
+function wrapDelivery(sourceType, value, pageUrl, sourceKey, propertyChain) {
+  const page = pageUrl || 'https://victim.com/page';
+  switch (sourceType) {
+    case 'url.location.hash':
+      return { vector: `${page}#${value}`, description: 'Navigate to URL with crafted fragment' };
+    case 'url.location.search':
+      return { vector: `${page}?${value}`, description: 'Navigate to URL with crafted query string' };
+    case 'url.location.href':
+    case 'url.document.URL':
+    case 'url.document.documentURI':
+    case 'url.document.baseURI':
+      return { vector: `${page}?${value}#${value}`, description: 'Navigate to URL with crafted query/fragment' };
+    case 'url.location.pathname':
+      return { vector: `https://victim.com/${value}`, description: 'Navigate to URL with crafted path' };
+    case 'url.searchParam': {
+      const paramName = sourceKey || 'param';
+      return { vector: `${page}?${paramName}=${encodeURIComponent(value)}`, description: `Navigate to URL with crafted "${paramName}" query parameter` };
+    }
+    case 'cookie': {
+      const cookieName = sourceKey || 'key';
+      return { vector: `document.cookie = "${cookieName}=${value}"`, description: `Set cookie "${cookieName}" via JavaScript console (requires prior XSS or subdomain control)` };
+    }
+    case 'storage.local': {
+      const storageKey = sourceKey || 'key';
+      return { vector: `localStorage.setItem(${JSON.stringify(storageKey)}, ${JSON.stringify(value)})`, description: `Set localStorage key "${storageKey}" via JavaScript console (requires prior XSS on same origin)` };
+    }
+    case 'storage.session': {
+      const storageKey = sourceKey || 'key';
+      return { vector: `sessionStorage.setItem(${JSON.stringify(storageKey)}, ${JSON.stringify(value)})`, description: `Set sessionStorage key "${storageKey}" via JavaScript console (requires prior XSS on same origin)` };
+    }
+    case 'postMessage.data':
+    case 'postMessage (weak origin check)': {
+      // Build the postMessage data shape from property chain
+      let msgData;
+      if (propertyChain && propertyChain.length > 0) {
+        msgData = buildNestedObject(propertyChain, value);
+      } else {
+        msgData = JSON.stringify(value);
+      }
+      return {
+        vector: `// From attacker page:\nvar w = window.open(${JSON.stringify(page)});\nsetTimeout(() => w.postMessage(${msgData}, '*'), 1000);`,
+        description: 'Send postMessage from attacker-controlled window'
+      };
+    }
+    case 'window.name':
+      return { vector: `window.open(${JSON.stringify(page)}, ${JSON.stringify(value)})`, description: 'Open page with crafted window.name' };
+    case 'url.hashchange':
+      return { vector: `location.hash = ${JSON.stringify('#' + value)}`, description: 'Trigger hashchange event with crafted hash' };
+    case 'url.document.referrer':
+      return { vector: `// Navigate from: https://attacker.com/redirect?to=${encodeURIComponent(page)}\n// Referrer header will contain attacker-controlled URL`, description: 'Control document.referrer via navigation from attacker page' };
+    case 'url.constructed':
+      return { vector: `new URL(${JSON.stringify(value)})`, description: 'Constructed URL object carries taint from input' };
+    default:
+      return { vector: value, description: `Inject via ${sourceType}` };
+  }
+}
+
+// Generate a PoC for a finding using its source labels' transforms and the sink
+// Sources where the delivery prefix IS the first character of the value
+// (e.g., location.hash returns "#foo", so slice(1) strips the "#" which is the URL fragment delimiter)
+const SOURCE_PREFIX_CHAR = {
+  'url.location.hash': '#',
+  'url.location.search': '?',
+};
+
+export function generatePoC(finding) {
+  const sources = finding.source || [];
+  if (sources.length === 0) return null;
+
+  // Use the first source (primary taint path) for PoC generation
+  const primarySource = sources[0];
+  const transforms = primarySource.transforms || [];
+  const sinkExpr = finding.sink?.expression || '';
+  const payload = sinkPayload(sinkExpr, finding.type);
+  let { value: rawInput, steps } = reverseTransforms(payload, transforms);
+
+  // For hash/search sources: the delivery delimiter (#/?) IS the first character of the value.
+  // When the first transform is slice(1)/substring(1), it strips that delimiter — so the
+  // generic "_" padding from reverseTransforms is wrong; the delimiter already provides it.
+  const prefixChar = SOURCE_PREFIX_CHAR[primarySource.type];
+  if (prefixChar && transforms.length > 0) {
+    const first = transforms[0];
+    if ((first.op === 'slice' || first.op === 'substring' || first.op === 'substr') && first.args[0] === 1) {
+      // Remove the generic padding — the delivery prefix handles it
+      if (rawInput.startsWith('_')) rawInput = rawInput.slice(1);
+    }
+  }
+
+  // Extract leading property chain from transforms for postMessage data shape reconstruction.
+  // Property transforms at the START of the chain (before any string ops) represent
+  // the object structure the code destructures from the source (e.g., e.data.html).
+  const propertyChain = [];
+  for (const t of transforms) {
+    if (t.op === 'property' && typeof t.args[0] === 'string' && !/^\d+$/.test(t.args[0])) {
+      propertyChain.push(t.args[0]);
+    } else {
+      break; // stop at first non-property transform
+    }
+  }
+
+  // Extract .get('key') parameter name from transforms for URL query parameter delivery.
+  // When source is url.location.search and code does new URLSearchParams(search).get('q'),
+  // the PoC should show ?q=PAYLOAD instead of raw ?PAYLOAD.
+  let getParamName = null;
+  for (const t of transforms) {
+    if (t.op === 'get' && t.args[0] != null) {
+      getParamName = String(t.args[0]);
+      break;
+    }
+  }
+
+  // Override source type for URL search + .get() → treat as named query parameter
+  let effectiveSourceType = primarySource.type;
+  if (getParamName && (primarySource.type === 'url.location.search' || primarySource.type === 'url.location.href')) {
+    effectiveSourceType = 'url.searchParam';
+  }
+
+  const delivery = wrapDelivery(effectiveSourceType, rawInput, null, primarySource.sourceKey || getParamName, propertyChain);
+
+  return {
+    payload,
+    input: rawInput,
+    vector: delivery.vector,
+    description: delivery.description,
+    steps,
+    transforms,
+  };
+}
+
+// Resolve call arguments to constant values for transform tracking
+function resolveConstantArgs(args, env, ctx) {
+  if (!args || args.length === 0) return [];
+  const result = [];
+  for (const arg of args) {
+    const v = resolveToConstant(arg, env, ctx);
+    result.push(v !== undefined ? v : null);
+  }
+  return result;
 }

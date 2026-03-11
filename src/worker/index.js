@@ -4,7 +4,7 @@
 
 import { parse } from '@babel/parser';
 import { buildCFG } from './cfg.js';
-import { analyzeCFG, TaintEnv } from './taint.js';
+import { analyzeCFG, TaintEnv, generatePoC } from './taint.js';
 import {
   ModuleGraph, extractImports, extractExports,
   extractGlobalDeclarations, resolveImportTaint, checkPostMessageHandler,
@@ -436,6 +436,9 @@ function deduplicateFindings(findings) {
 }
 
 function postFindings(tabId, findings) {
+  for (const f of findings) {
+    if (!f.poc) f.poc = generatePoC(f);
+  }
   self.postMessage({
     type: 'findings',
     tabId,

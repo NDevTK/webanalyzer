@@ -3,7 +3,7 @@
 
 import { parse } from '@babel/parser';
 import { buildCFG } from '../src/worker/cfg.js';
-import { analyzeCFG, TaintEnv, TaintSet, TaintLabel, checkPrototypePollution } from '../src/worker/taint.js';
+import { analyzeCFG, TaintEnv, TaintSet, TaintLabel, checkPrototypePollution, generatePoC } from '../src/worker/taint.js';
 import { buildScopeInfo } from '../src/worker/scope.js';
 import { extractGlobalDeclarations } from '../src/worker/module-graph.js';
 import { nodeToString } from '../src/worker/sources-sinks.js';
@@ -43,6 +43,11 @@ export function analyze(source, { file = 'test.js', isModule = false, globalEnv 
   walkAST(ast.program, (node) => {
     if (node.type === 'AssignmentExpression') checkPrototypePollution(node, env, ppCtx);
   });
+
+  // Generate PoCs for all findings (same as worker/index.js postFindings)
+  for (const f of findings) {
+    if (!f.poc) f.poc = generatePoC(f);
+  }
 
   return { findings, env, funcMap, ast };
 }

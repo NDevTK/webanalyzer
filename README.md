@@ -10,9 +10,9 @@ A Chrome extension (MV3) that performs real-time, AST-based taint analysis on we
 
 2. **AST parsing** — Scripts are sent to a web worker (via an offscreen document) where Babel parses them into ASTs. This works on both formatted and minified code since the parser operates on syntax structure, not formatting.
 
-3. **Control flow graph** — A CFG is built from each AST with a worklist-based fixpoint algorithm, handling branches, loops, try/catch, and short-circuit evaluation.
+3. **Control flow graph** — A CFG is built from each AST, with basic blocks connected by edges for branches, loops, try/catch, and short-circuit evaluation.
 
-4. **Taint analysis** — The engine tracks data flow from sources (e.g. `location.hash`, `document.cookie`, `postMessage` data) through assignments, function calls, and object properties to sinks (e.g. `innerHTML`, `eval`, `document.write`). It supports:
+4. **Taint analysis** — A worklist algorithm iterates over the CFG to a fixpoint, tracking data flow from sources (e.g. `location.hash`, `document.cookie`, `postMessage` data) through assignments, function calls, and object properties to sinks (e.g. `innerHTML`, `eval`, `document.write`). It supports:
    - Interprocedural analysis (function calls, closures, factories)
    - Cross-file analysis (shared globals, ES module imports/exports)
    - Object property and `this.*` binding propagation
@@ -20,6 +20,11 @@ A Chrome extension (MV3) that performs real-time, AST-based taint analysis on we
    - Sanitizer recognition (DOMPurify, encodeURIComponent, etc.)
 
 5. **Reporting** — Findings appear as badge counts and browser notifications, with full details in the side panel including source/sink locations, taint flow paths, and remediation advice. Findings persist in IndexedDB across browser restarts.
+
+6. **Proof of Concept generation** — Each finding includes an auto-generated PoC derived from the actual data flow. The engine records every transform applied to tainted data (e.g. `slice`, `split`, `JSON.parse`, property access) and reverses them to compute the exact input needed to trigger the vulnerability. PoCs include:
+   - The specific source delivery mechanism (URL with the exact query parameter name, `localStorage.setItem` with the actual key, `postMessage` with the exact data shape)
+   - The payload appropriate for the sink type (`<img onerror>` for `innerHTML`, `javascript:` for navigation sinks, `alert(1)` for `eval`)
+   - Data flow steps showing each transform in the chain
 
 ## Project Structure
 
@@ -87,6 +92,7 @@ The test suite includes:
 - **Positive detections** — vulnerable code patterns that must be flagged
 - **Negative/safe patterns** — sanitized or safe code that must not produce false positives
 - **Function tracing** — interprocedural analysis: closures, factories, callbacks, aliases, class methods
+- **PoC accuracy** — verifying that generated PoCs use exact parameter names, storage keys, postMessage data shapes, correct payloads per sink type, and proper transform reversal
 - **Minified code** — taint detection on compressed/minified JavaScript
 - **Baseline libraries** — jQuery, Lodash, React, Vue, Angular minified builds scanned for zero false positives
 

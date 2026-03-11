@@ -66,6 +66,12 @@ test('location.hash → innerHTML (direct)', () => {
     document.getElementById('x').innerHTML = location.hash;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: direct flow — no transforms, hash delivery, HTML payload
+  const poc = findings[0].poc;
+  if (!poc) throw new Error('Expected PoC');
+  if (!poc.vector.startsWith('https://victim.com/page#')) throw new Error('PoC: expected hash delivery URL, got: ' + poc.vector);
+  if (poc.payload !== '<img src=x onerror=alert(1)>') throw new Error('PoC: expected HTML payload for innerHTML, got: ' + poc.payload);
+  if (findings[0].source[0].transforms?.length) throw new Error('PoC: expected no transforms for direct flow');
 });
 
 test('location.search → variable → innerHTML', () => {
@@ -74,6 +80,8 @@ test('location.search → variable → innerHTML', () => {
     document.getElementById('x').innerHTML = q;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: search source → query string delivery
+  if (!findings[0].poc?.vector.startsWith('https://victim.com/page?')) throw new Error('PoC: expected search delivery URL, got: ' + findings[0].poc?.vector);
 });
 
 test('location.hash → substring → innerHTML', () => {
@@ -82,6 +90,10 @@ test('location.hash → substring → innerHTML', () => {
     document.getElementById('out').innerHTML = h;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: substring(1) tracked as transform
+  const t = findings[0].source[0].transforms;
+  if (!t || !t.some(x => x.op === 'substring' && x.args[0] === 1)) throw new Error('PoC: expected substring(1) transform, got: ' + JSON.stringify(t));
+  if (!findings[0].poc.steps.some(s => s.includes('substring'))) throw new Error('PoC: expected substring in data flow steps');
 });
 
 test('location.search → split → join → innerHTML', () => {
@@ -91,6 +103,9 @@ test('location.search → split → join → innerHTML', () => {
     document.getElementById('out').innerHTML = result;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: split('&') tracked as transform
+  const t = findings[0].source[0].transforms;
+  if (!t || !t.some(x => x.op === 'split' && x.args[0] === '&')) throw new Error('PoC: expected split("&") transform, got: ' + JSON.stringify(t));
 });
 
 test('location.hash → template literal → innerHTML', () => {
@@ -136,6 +151,9 @@ test('document.cookie → innerHTML', () => {
     document.body.innerHTML = document.cookie;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: cookie source → document.cookie delivery with payload
+  if (!findings[0].poc.vector.startsWith('document.cookie = "key=')) throw new Error('PoC: expected cookie delivery, got: ' + findings[0].poc.vector);
+  if (findings[0].poc.payload !== '<img src=x onerror=alert(1)>') throw new Error('PoC: expected innerHTML payload, got: ' + findings[0].poc.payload);
 });
 
 test('location.href → innerHTML', () => {
@@ -184,6 +202,10 @@ test('location.hash → eval', () => {
     eval(location.hash.substring(1));
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: eval sink → JS payload (not HTML), substring(1) tracked
+  if (findings[0].poc.payload !== 'alert(1)') throw new Error('PoC: expected alert(1) for eval, got: ' + findings[0].poc.payload);
+  const t = findings[0].source[0].transforms;
+  if (!t || !t.some(x => x.op === 'substring')) throw new Error('PoC: expected substring transform');
 });
 
 test('location.search → new Function()', () => {
@@ -208,6 +230,8 @@ test('location.hash → setTimeout(string)', () => {
     setTimeout(h, 100);
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: setTimeout with string arg → JS payload
+  if (findings[0].poc.payload !== 'alert(1)') throw new Error('PoC: expected alert(1) for setTimeout, got: ' + findings[0].poc.payload);
 });
 
 test('location.search → document.writeln', () => {
@@ -314,6 +338,8 @@ test('location.hash → location.href', () => {
     location.href = location.hash.substring(1);
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: navigation sink → javascript: payload
+  if (!findings[0].poc.payload.includes('javascript:')) throw new Error('PoC: expected javascript: payload for location.href, got: ' + findings[0].poc.payload);
 });
 
 test('URLSearchParams → window.open', () => {
@@ -854,6 +880,8 @@ test('URLSearchParams.get → innerHTML', () => {
     document.getElementById('out').innerHTML = q;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: should show the actual query parameter name "q" in the URL
+  if (!findings[0].poc.vector.includes('?q=')) throw new Error('PoC: expected ?q= in URL, got: ' + findings[0].poc.vector);
 });
 
 test('new URL(location.href).searchParams.get → innerHTML', () => {
@@ -871,6 +899,8 @@ test('new URLSearchParams(location.search) → get → innerHTML', () => {
     document.body.innerHTML = params.get('name');
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: should show ?name= in the URL
+  if (!findings[0].poc.vector.includes('?name=')) throw new Error('PoC: expected ?name= in URL, got: ' + findings[0].poc.vector);
 });
 
 
@@ -885,6 +915,10 @@ test('postMessage data → innerHTML (no origin check)', () => {
     });
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: postMessage source → postMessage delivery vector with exact data
+  if (!findings[0].poc.vector.includes('w.postMessage(')) throw new Error('PoC: expected postMessage delivery, got: ' + findings[0].poc.vector);
+  if (!findings[0].poc.vector.includes("window.open(")) throw new Error('PoC: expected window.open in postMessage vector');
+  if (findings[0].poc.payload !== '<img src=x onerror=alert(1)>') throw new Error('PoC: expected innerHTML payload, got: ' + findings[0].poc.payload);
 });
 
 test('postMessage data → eval (no origin check)', () => {
@@ -894,6 +928,9 @@ test('postMessage data → eval (no origin check)', () => {
     });
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: eval sink → alert(1) payload, postMessage delivery
+  if (findings[0].poc.payload !== 'alert(1)') throw new Error('PoC: expected alert(1) for eval, got: ' + findings[0].poc.payload);
+  if (!findings[0].poc.vector.includes('w.postMessage(')) throw new Error('PoC: expected postMessage delivery, got: ' + findings[0].poc.vector);
 });
 
 test('window.onmessage = handler without origin check → innerHTML', () => {
@@ -935,6 +972,9 @@ test('localStorage.getItem → innerHTML', () => {
     document.body.innerHTML = saved;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: localStorage source → localStorage.setItem with actual key name "data"
+  if (!findings[0].poc.vector.includes('localStorage.setItem("data"')) throw new Error('PoC: expected localStorage.setItem with key "data", got: ' + findings[0].poc.vector);
+  if (findings[0].poc.payload !== '<img src=x onerror=alert(1)>') throw new Error('PoC: expected innerHTML payload, got: ' + findings[0].poc.payload);
 });
 
 test('sessionStorage.getItem → innerHTML', () => {
@@ -942,6 +982,8 @@ test('sessionStorage.getItem → innerHTML', () => {
     document.body.innerHTML = sessionStorage.getItem('html');
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: sessionStorage with actual key "html"
+  if (!findings[0].poc.vector.includes('sessionStorage.setItem("html"')) throw new Error('PoC: expected sessionStorage.setItem with key "html", got: ' + findings[0].poc.vector);
 });
 
 
@@ -1088,6 +1130,10 @@ test('location.hash → replace → toLowerCase → innerHTML', () => {
     document.body.innerHTML = h;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: chained replace + toLowerCase both tracked
+  const ops = (findings[0].source[0].transforms || []).map(t => t.op);
+  if (!ops.includes('replace')) throw new Error('PoC: expected replace transform, got: ' + JSON.stringify(ops));
+  if (!ops.includes('toLowerCase')) throw new Error('PoC: expected toLowerCase transform, got: ' + JSON.stringify(ops));
 });
 
 test('tainted → toString → innerHTML', () => {
@@ -1209,6 +1255,10 @@ test('location.hash → JSON.parse → innerHTML', () => {
     document.body.innerHTML = data;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: JSON.parse passthrough tracked in transforms
+  const ops = (findings[0].source[0].transforms || []).map(t => t.op);
+  if (!ops.includes('JSON.parse')) throw new Error('PoC: expected JSON.parse transform, got: ' + JSON.stringify(ops));
+  if (!ops.includes('slice')) throw new Error('PoC: expected slice transform, got: ' + JSON.stringify(ops));
 });
 
 test('location.hash → decodeURIComponent → innerHTML', () => {
@@ -1217,6 +1267,10 @@ test('location.hash → decodeURIComponent → innerHTML', () => {
     document.body.innerHTML = h;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: decodeURIComponent passthrough tracked + slice
+  const ops = (findings[0].source[0].transforms || []).map(t => t.op);
+  if (!ops.includes('decodeURIComponent')) throw new Error('PoC: expected decodeURIComponent transform, got: ' + JSON.stringify(ops));
+  if (!findings[0].poc.steps.some(s => s.includes('decodeURIComponent'))) throw new Error('PoC: expected decodeURIComponent in steps');
 });
 
 test('location.hash → atob → innerHTML', () => {
@@ -1225,6 +1279,10 @@ test('location.hash → atob → innerHTML', () => {
     document.body.innerHTML = decoded;
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: atob passthrough tracked — steps should mention base64
+  const ops = (findings[0].source[0].transforms || []).map(t => t.op);
+  if (!ops.includes('atob')) throw new Error('PoC: expected atob transform, got: ' + JSON.stringify(ops));
+  if (!findings[0].poc.steps.some(s => s.includes('base64'))) throw new Error('PoC: expected base64 in steps');
 });
 
 
@@ -1381,6 +1439,9 @@ test('nested computed assignment with tainted keys', () => {
     obj[key1][key2] = 'polluted';
   `);
   expect(findings).toHaveType('Prototype Pollution');
+  // PoC: prototype pollution → __proto__ payload
+  const ppFinding = findings.find(f => f.type === 'Prototype Pollution');
+  if (!ppFinding.poc.payload.includes('__proto__')) throw new Error('PoC: expected __proto__ payload, got: ' + ppFinding.poc.payload);
 });
 
 test('prototype pollution via URLSearchParams keys', () => {
@@ -2777,6 +2838,9 @@ test('startsWith http → location.href is Open Redirect', () => {
   `);
   expect(findings).toHaveType('Open Redirect');
   expect(findings).not.toHaveType('XSS');
+  // PoC: open redirect → attacker URL payload (not javascript:)
+  const poc = findings[0].poc;
+  if (!poc.payload.includes('attacker.com')) throw new Error('PoC: expected attacker URL for redirect, got: ' + poc.payload);
 });
 
 test('startsWith https:// → location.assign is Open Redirect', () => {
@@ -2788,6 +2852,8 @@ test('startsWith https:// → location.assign is Open Redirect', () => {
   `);
   expect(findings).toHaveType('Open Redirect');
   expect(findings).not.toHaveType('XSS');
+  // PoC: should show ?next= parameter name
+  if (!findings[0].poc.vector.includes('?next=')) throw new Error('PoC: expected ?next= in URL, got: ' + findings[0].poc.vector);
 });
 
 test('startsWith / (relative URL) → window.location.href is Open Redirect', () => {
@@ -4632,6 +4698,9 @@ test('message handler: event.data.html → innerHTML', () => {
     });
   `);
   expect(findings).toHaveType('XSS');
+  // PoC: postMessage vector should show the exact data shape {html: PAYLOAD}
+  if (!findings[0].poc.vector.includes('"html"')) throw new Error('PoC: expected "html" property in postMessage data shape, got: ' + findings[0].poc.vector);
+  if (!findings[0].poc.vector.includes('w.postMessage(')) throw new Error('PoC: expected postMessage delivery');
 });
 
 
@@ -11893,6 +11962,9 @@ test('element.style.cssText = tainted → CSS Injection', () => {
     el.style.cssText = location.hash;
   `);
   expect(findings).toHaveType('CSS Injection');
+  // PoC: CSS injection → CSS payload with url()
+  const cssFinding = findings.find(f => f.type === 'CSS Injection');
+  if (!cssFinding.poc.payload.includes('url(')) throw new Error('PoC: expected CSS payload with url(), got: ' + cssFinding.poc.payload);
 });
 
 test('setAttribute("style", tainted) → CSS Injection', () => {
@@ -28943,6 +29015,224 @@ test('event emitter class fires tainted event data', () => {
     emitter.emit("data", location.hash);
   `);
   expect(findings).toHaveType('XSS');
+});
+
+// ╔═══════════════════════════════════════════════════════╗
+// ║  PoC data-flow-aware generation                      ║
+// ╚═══════════════════════════════════════════════════════╝
+
+console.log('\n--- PoC: data-flow-aware vectors ---');
+
+test('PoC: URLSearchParams.get shows param name in URL', () => {
+  const { findings } = analyze(`
+    var params = new URLSearchParams(location.search);
+    var input = params.get('userInput');
+    document.body.innerHTML = input;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('?userInput=')) throw new Error('PoC: expected ?userInput= in vector, got: ' + poc.vector);
+  if (poc.payload !== '<img src=x onerror=alert(1)>') throw new Error('PoC: expected innerHTML payload');
+});
+
+test('PoC: localStorage.getItem shows actual key name', () => {
+  const { findings } = analyze(`
+    var config = localStorage.getItem('appConfig');
+    document.body.innerHTML = config;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('localStorage.setItem("appConfig"')) throw new Error('PoC: expected key "appConfig", got: ' + poc.vector);
+});
+
+test('PoC: sessionStorage.getItem shows actual key name', () => {
+  const { findings } = analyze(`
+    var tmpl = sessionStorage.getItem('userTemplate');
+    document.body.innerHTML = tmpl;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('sessionStorage.setItem("userTemplate"')) throw new Error('PoC: expected key "userTemplate", got: ' + poc.vector);
+});
+
+test('PoC: postMessage e.data.html shows data shape', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      document.body.innerHTML = e.data.html;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('"html"')) throw new Error('PoC: expected "html" key in postMessage data, got: ' + poc.vector);
+  if (!poc.vector.includes('w.postMessage(')) throw new Error('PoC: expected postMessage delivery');
+});
+
+test('PoC: postMessage e.data.config.template shows nested data shape', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      document.body.innerHTML = e.data.config.template;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('"config"')) throw new Error('PoC: expected "config" key in postMessage data, got: ' + poc.vector);
+  if (!poc.vector.includes('"template"')) throw new Error('PoC: expected "template" key in postMessage data, got: ' + poc.vector);
+});
+
+test('PoC: JSON.parse(hash).html shows JSON payload with key', () => {
+  const { findings } = analyze(`
+    var data = JSON.parse(location.hash.slice(1));
+    document.body.innerHTML = data.html;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('#{"html":')) throw new Error('PoC: expected #{"html":...} in vector, got: ' + poc.vector);
+});
+
+test('PoC: JSON.parse with nested property shows nested JSON', () => {
+  const { findings } = analyze(`
+    var obj = JSON.parse(location.hash.slice(1));
+    document.body.innerHTML = obj.config.template;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('"config"')) throw new Error('PoC: expected "config" in JSON payload, got: ' + poc.vector);
+  if (!poc.vector.includes('"template"')) throw new Error('PoC: expected "template" in JSON payload, got: ' + poc.vector);
+});
+
+test('PoC: hash.slice(1) does not pad with underscore', () => {
+  const { findings } = analyze(`
+    var h = location.hash.slice(1);
+    document.body.innerHTML = h;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  // The # delimiter handles the slice(1), no underscore padding needed
+  if (poc.vector.includes('#_')) throw new Error('PoC: should not have _ padding after #, got: ' + poc.vector);
+  if (!poc.vector.startsWith('https://victim.com/page#')) throw new Error('PoC: expected hash delivery');
+});
+
+test('PoC: search.substring(1) does not pad with underscore', () => {
+  const { findings } = analyze(`
+    var s = location.search.substring(1);
+    document.body.innerHTML = s;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (poc.vector.includes('?_')) throw new Error('PoC: should not have _ padding after ?, got: ' + poc.vector);
+});
+
+test('PoC: eval sink uses alert(1) payload', () => {
+  const { findings } = analyze(`
+    var cmd = location.hash.slice(1);
+    eval(cmd);
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (poc.payload !== 'alert(1)') throw new Error('PoC: expected alert(1) for eval, got: ' + poc.payload);
+  if (!poc.vector.includes('#alert(1)')) throw new Error('PoC: expected #alert(1) in vector, got: ' + poc.vector);
+});
+
+test('PoC: location.href sink uses javascript: payload', () => {
+  const { findings } = analyze(`
+    location.href = location.hash.slice(1);
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.payload.includes('javascript:')) throw new Error('PoC: expected javascript: for location.href, got: ' + poc.payload);
+  if (!poc.vector.includes('#javascript:')) throw new Error('PoC: expected #javascript: in vector, got: ' + poc.vector);
+});
+
+test('PoC: atob transform shows base64 encoding', () => {
+  const { findings } = analyze(`
+    var decoded = atob(location.hash.slice(1));
+    document.body.innerHTML = decoded;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.steps.some(s => s.includes('base64'))) throw new Error('PoC: expected base64 in steps');
+  // The input should be base64-encoded
+  if (!poc.input) throw new Error('PoC: expected input value');
+});
+
+test('PoC: split/index transform shows segment selection', () => {
+  const { findings } = analyze(`
+    var parts = location.hash.split('#');
+    document.body.innerHTML = parts[1];
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  const t = findings[0].source[0].transforms;
+  if (!t.some(x => x.op === 'split')) throw new Error('PoC: expected split transform');
+});
+
+test('PoC: decodeURIComponent in data flow steps', () => {
+  const { findings } = analyze(`
+    var h = decodeURIComponent(location.hash.slice(1));
+    document.body.innerHTML = h;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.steps.some(s => s.includes('decodeURIComponent'))) throw new Error('PoC: expected decodeURIComponent in steps');
+});
+
+test('PoC: prototype pollution shows __proto__ payload', () => {
+  const { findings } = analyze(`
+    var data = JSON.parse(location.hash.slice(1));
+    var key = Object.keys(data)[0];
+    Object.prototype[key] = data[key];
+  `);
+  const ppFindings = findings.filter(f => f.type === 'Prototype Pollution');
+  if (ppFindings.length === 0) throw new Error('Expected Prototype Pollution finding');
+  if (!ppFindings[0].poc.payload.includes('__proto__')) throw new Error('PoC: expected __proto__ in payload, got: ' + ppFindings[0].poc.payload);
+});
+
+test('PoC: open redirect uses attacker URL', () => {
+  const { findings } = analyze(`
+    var next = new URLSearchParams(location.search).get('redirect');
+    if (next.startsWith('http')) {
+      location.href = next;
+    }
+  `);
+  const redirectFindings = findings.filter(f => f.type === 'Open Redirect');
+  if (redirectFindings.length === 0) throw new Error('Expected Open Redirect finding');
+  const poc = redirectFindings[0].poc;
+  if (!poc.payload.includes('attacker.com')) throw new Error('PoC: expected attacker URL, got: ' + poc.payload);
+  if (!poc.vector.includes('?redirect=')) throw new Error('PoC: expected ?redirect= in URL, got: ' + poc.vector);
+});
+
+test('PoC: cookie source shows document.cookie delivery', () => {
+  const { findings } = analyze(`
+    var prefs = document.cookie.split(';')[0].split('=')[1];
+    document.body.innerHTML = prefs;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('document.cookie')) throw new Error('PoC: expected document.cookie delivery, got: ' + poc.vector);
+  const t = findings[0].source[0].transforms;
+  if (!t.some(x => x.op === 'split')) throw new Error('PoC: expected split transform in cookie parsing');
+});
+
+test('PoC: window.name source shows window.open delivery', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = window.name;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  if (!poc.vector.includes('window.open(')) throw new Error('PoC: expected window.open delivery, got: ' + poc.vector);
+});
+
+test('PoC: multiple transforms tracked in order', () => {
+  const { findings } = analyze(`
+    var raw = location.hash.substring(1);
+    var decoded = decodeURIComponent(raw);
+    var lower = decoded.toLowerCase();
+    document.body.innerHTML = lower;
+  `);
+  expect(findings).toHaveType('XSS');
+  const ops = (findings[0].source[0].transforms || []).map(t => t.op);
+  if (ops.indexOf('substring') > ops.indexOf('decodeURIComponent')) throw new Error('PoC: transforms should be in order: substring before decodeURIComponent');
+  if (ops.indexOf('decodeURIComponent') > ops.indexOf('toLowerCase')) throw new Error('PoC: transforms should be in order');
 });
 
 // ═══════════════════════════════════════════════════════
