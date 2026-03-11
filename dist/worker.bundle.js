@@ -44142,6 +44142,11 @@ ${rootStack}`;
       this.protoMethodMap = /* @__PURE__ */ new Map();
     }
   };
+  function propKeyName(key) {
+    if (!key) return null;
+    const name = key.name || key.value;
+    return name != null ? String(name) : null;
+  }
   function resolveId(node, ctx) {
     if (ctx.scopeInfo) {
       const key = ctx.scopeInfo.resolve(node);
@@ -44606,7 +44611,7 @@ ${rootStack}`;
             const methods = {};
             for (const prop of arg.properties) {
               if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key && (prop.key.type === "Identifier" || prop.key.type === "StringLiteral")) {
-                const name = prop.key.name || prop.key.value;
+                const name = propKeyName(prop.key);
                 const val = prop.value;
                 if (val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
                   val._closureEnv = env;
@@ -44622,7 +44627,7 @@ ${rootStack}`;
                 }
               }
               if (prop.type === "ObjectMethod" && prop.key) {
-                const name = prop.key.name || prop.key.value;
+                const name = propKeyName(prop.key);
                 prop._closureEnv = env;
                 methods[name] = prop;
               }
@@ -44637,7 +44642,7 @@ ${rootStack}`;
             const propTaints = /* @__PURE__ */ new Map();
             for (const prop of arg.properties) {
               if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-                const pName = prop.key.name || prop.key.value;
+                const pName = propKeyName(prop.key);
                 if (pName) propTaints.set(pName, evaluateExpr(prop.value, env, ctx));
               }
             }
@@ -44664,7 +44669,7 @@ ${rootStack}`;
               const resolved = resolveToConstant(member.key, env, ctx);
               if (typeof resolved === "string") mname = resolved;
             } else {
-              mname = member.key?.name || member.key?.value;
+              mname = propKeyName(member.key);
             }
             if (!mname) continue;
             if (member.static) {
@@ -44695,7 +44700,7 @@ ${rootStack}`;
           }
           for (const member of node.body.body) {
             if ((member.type === "ClassProperty" || member.type === "PropertyDefinition") && member.static && member.value && member.key) {
-              const fieldName = member.key.name || member.key.value;
+              const fieldName = propKeyName(member.key);
               if (fieldName) {
                 const fieldTaint = evaluateExpr(member.value, env, ctx);
                 env.set(`${className}.${fieldName}`, fieldTaint);
@@ -44811,7 +44816,7 @@ ${rootStack}`;
           if (typeof resolved === "string") keyName = resolved;
         }
       } else if (prop.key) {
-        keyName = prop.key.name || prop.key.value;
+        keyName = propKeyName(prop.key);
       }
       if (keyName) {
         const propKey = `${srcStr}.${keyName}`;
@@ -44852,7 +44857,7 @@ ${rootStack}`;
         continue;
       }
       if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-        const propName = prop.key.name || prop.key.value;
+        const propName = propKeyName(prop.key);
         if (propName) {
           const propTaint = evaluateExpr(prop.value, env, ctx);
           env.set(`${varName}.${propName}`, propTaint);
@@ -44898,7 +44903,7 @@ ${rootStack}`;
         const { objExpr, prefix } = romStack.pop();
         for (const prop of objExpr.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-            const propName = prop.key.name || prop.key.value;
+            const propName = propKeyName(prop.key);
             const val = prop.value;
             if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
               val._closureEnv = env;
@@ -44918,7 +44923,7 @@ ${rootStack}`;
             }
           }
           if (prop.type === "ObjectMethod" && prop.key) {
-            const propName = prop.key.name || prop.key.value;
+            const propName = propKeyName(prop.key);
             if (propName) {
               prop._closureEnv = env;
               const accessorPrefix = prop.kind === "get" ? "getter:" : prop.kind === "set" ? "setter:" : "";
@@ -44970,7 +44975,7 @@ ${rootStack}`;
         const literalProps = /* @__PURE__ */ new Map();
         for (const prop of node.init.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-            const pName = prop.key.name || prop.key.value;
+            const pName = propKeyName(prop.key);
             if (pName) literalProps.set(pName, evaluateExpr(prop.value, env, ctx));
           }
         }
@@ -44979,7 +44984,7 @@ ${rootStack}`;
             assignToPattern(prop.argument, taint, env, ctx);
             continue;
           }
-          const keyName = prop.key ? prop.key.name || prop.key.value : null;
+          const keyName = propKeyName(prop.key);
           if (keyName && literalProps.has(keyName)) {
             const target = prop.value.type === "AssignmentPattern" ? prop.value.left : prop.value;
             assignToPattern(target, literalProps.get(keyName), env, ctx);
@@ -44995,7 +45000,7 @@ ${rootStack}`;
             assignToPattern(prop.argument, taint, env, ctx);
             continue;
           }
-          const keyName = prop.key ? prop.key.name || prop.key.value : null;
+          const keyName = propKeyName(prop.key);
           const target = prop.value?.type === "AssignmentPattern" ? prop.value.left : prop.value;
           if (keyName && retProps.has(keyName)) {
             assignToPattern(target, retProps.get(keyName), env, ctx);
@@ -45403,7 +45408,7 @@ ${rootStack}`;
       if (leftStr) {
         for (const prop of node.right.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-            const propName = prop.key.name || prop.key.value;
+            const propName = propKeyName(prop.key);
             const val = prop.value;
             if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
               val._closureEnv = env;
@@ -45412,7 +45417,7 @@ ${rootStack}`;
             }
           }
           if (prop.type === "ObjectMethod" && prop.key) {
-            const propName = prop.key.name || prop.key.value;
+            const propName = propKeyName(prop.key);
             if (propName) {
               prop._closureEnv = env;
               ctx.funcMap.set(`${leftStr}.${propName}`, prop);
@@ -45583,7 +45588,7 @@ ${rootStack}`;
       if (classBody) {
         for (const member of classBody) {
           if (member.type !== "ClassMethod" && member.type !== "MethodDefinition") continue;
-          const mname = member.key?.name || member.key?.value;
+          const mname = propKeyName(member.key);
           if (mname && mname !== "constructor" && !member.static) {
             const getterPrefix = member.kind === "get" ? "getter:" : member.kind === "set" ? "setter:" : "";
             constructorFuncs.push([`${getterPrefix}${instanceName}.${mname}`, member]);
@@ -46503,7 +46508,7 @@ ${rootStack}`;
         const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
         for (const prop of descNode.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-            const descPropName = prop.key.name || prop.key.value;
+            const descPropName = propKeyName(prop.key);
             if (descPropName === "value") {
               const valTaint = evaluateExpr(prop.value, env, ctx);
               if (valTaint.tainted && objStr && propName) {
@@ -46562,7 +46567,7 @@ ${rootStack}`;
         const resultTaint = TaintSet.empty();
         for (const prop of descMapNode.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key && prop.value) {
-            const propName = prop.key.name || prop.key.value;
+            const propName = propKeyName(prop.key);
             if (propName && prop.value.type === "ObjectExpression") {
               for (const descProp of prop.value.properties) {
                 if ((descProp.type === "ObjectProperty" || descProp.type === "Property") && descProp.key && (descProp.key.name === "value" || descProp.key.value === "value")) {
@@ -46632,7 +46637,7 @@ ${rootStack}`;
               for (const prop of srcNode.properties) {
                 if (prop.type === "SpreadElement") continue;
                 if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-                  const propName = prop.key.name || prop.key.value;
+                  const propName = propKeyName(prop.key);
                   if (propName) {
                     const propTaint = evaluateExpr(prop.value, env, ctx);
                     env.set(`${targetStr}.${propName}`, propTaint);
@@ -46716,7 +46721,7 @@ ${rootStack}`;
       const classBody = node.callee.body.body;
       for (const member of classBody) {
         if (member.type !== "ClassMethod" && member.type !== "MethodDefinition") continue;
-        const mname = member.key?.name || member.key?.value;
+        const mname = propKeyName(member.key);
         if (!mname) continue;
         if (mname === "constructor") {
           ctx.classBodyMap.set(synthName, classBody);
@@ -46776,7 +46781,7 @@ ${rootStack}`;
       if (optionsNode && optionsNode.type === "ObjectExpression") {
         for (const prop of optionsNode.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-            const pname = prop.key.name || prop.key.value;
+            const pname = propKeyName(prop.key);
             if (pname === "detail") {
               const detailTaint = evaluateExpr(prop.value, env, ctx);
               if (detailTaint.tainted) {
@@ -46794,7 +46799,7 @@ ${rootStack}`;
       if (handlerNode.type === "ObjectExpression") {
         for (const prop of handlerNode.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property" || prop.type === "ObjectMethod") && prop.key) {
-            const pname = prop.key.name || prop.key.value;
+            const pname = propKeyName(prop.key);
             if (pname === "apply") {
               if (targetNode?.type === "Identifier") {
                 const targetFunc = ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name);
@@ -46888,7 +46893,7 @@ ${rootStack}`;
           if (classBody) {
             for (const member of classBody) {
               if ((member.type === "ClassProperty" || member.type === "PropertyDefinition") && member.value && member.key) {
-                const fieldName = member.key.name || member.key.value;
+                const fieldName = propKeyName(member.key);
                 if (fieldName && !member.static) {
                   const fieldTaint = evaluateExpr(member.value, childEnv, ctx);
                   childEnv.set(`this.${fieldName}`, fieldTaint);
@@ -47867,7 +47872,7 @@ ${rootStack}`;
       if (methodName) {
         for (const prop of callNode.callee.object.properties) {
           if ((prop.type === "ObjectProperty" || prop.type === "Property" || prop.type === "ObjectMethod") && prop.key) {
-            const pName = prop.key.name || prop.key.value;
+            const pName = propKeyName(prop.key);
             if (pName === methodName) {
               funcNode = prop.type === "ObjectMethod" ? prop : prop.value;
               break;
@@ -47960,7 +47965,7 @@ ${rootStack}`;
       const objNode = funcNode._boundThisNode;
       for (const prop of objNode.properties || []) {
         if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-          const propName = prop.key.name || prop.key.value;
+          const propName = propKeyName(prop.key);
           if (propName && prop.value) {
             const propTaint = evaluateExpr(prop.value, env, ctx);
             childEnv.set(`this.${propName}`, propTaint);
@@ -48007,7 +48012,7 @@ ${rootStack}`;
         if (argNode.type === "ObjectExpression") {
           for (const prop of argNode.properties) {
             if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-              const pName = prop.key.name || prop.key.value;
+              const pName = propKeyName(prop.key);
               const val = prop.value;
               if (pName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
                 val._closureEnv = env;
@@ -48040,7 +48045,7 @@ ${rootStack}`;
               const literalProps = /* @__PURE__ */ new Map();
               for (const prop of argNode.properties) {
                 if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
-                  const pName = prop.key.name || prop.key.value;
+                  const pName = propKeyName(prop.key);
                   if (pName) literalProps.set(pName, evaluateExpr(prop.value, childEnv, ctx));
                 }
                 if (prop.type === "SpreadElement" || prop.type === "RestElement") {
@@ -48048,7 +48053,7 @@ ${rootStack}`;
                   if (spreadTaint.tainted) {
                     for (const pp of param.properties) {
                       if (pp.type !== "RestElement") {
-                        const ppName = pp.key?.name || pp.key?.value;
+                        const ppName = propKeyName(pp.key);
                         if (ppName && !literalProps.has(ppName)) literalProps.set(ppName, spreadTaint);
                       }
                     }
@@ -48060,7 +48065,7 @@ ${rootStack}`;
                   assignToPattern(prop.argument, argTaints[i] || TaintSet.empty(), childEnv, ctx);
                   continue;
                 }
-                const keyName = prop.key?.name || prop.key?.value;
+                const keyName = propKeyName(prop.key);
                 const target = prop.value || prop.key;
                 if (keyName && literalProps.has(keyName)) {
                   if (target.type === "AssignmentPattern") {
