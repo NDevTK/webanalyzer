@@ -8,16 +8,20 @@ import { buildScopeInfo } from '../src/worker/scope.js';
 import { extractGlobalDeclarations } from '../src/worker/module-graph.js';
 import { nodeToString } from '../src/worker/sources-sinks.js';
 
+const BABEL_PLUGINS = [
+  'jsx', 'typescript', 'dynamicImport', 'optionalChaining',
+  'nullishCoalescingOperator', 'classProperties', 'decorators-legacy',
+  'objectRestSpread', 'topLevelAwait', 'classPrivateProperties',
+  'classPrivateMethods', 'asyncGenerators', 'optionalCatchBinding',
+];
+
+const WALK_SKIP_KEYS = new Set(['loc', 'start', 'end', 'leadingComments', 'trailingComments', 'innerComments', '_closureEnv']);
+
 // Analyze a single JS source string, return findings
 export function analyze(source, { file = 'test.js', isModule = false, globalEnv = null } = {}) {
   const ast = parse(source, {
     sourceType: isModule ? 'module' : 'script',
-    plugins: [
-      'jsx', 'typescript', 'dynamicImport', 'optionalChaining',
-      'nullishCoalescingOperator', 'classProperties', 'decorators-legacy',
-      'objectRestSpread', 'topLevelAwait', 'classPrivateProperties',
-      'classPrivateMethods', 'asyncGenerators', 'optionalCatchBinding',
-    ],
+    plugins: BABEL_PLUGINS,
     errorRecovery: true,
     allowReturnOutsideFunction: true,
     allowSuperOutsideMethod: true,
@@ -52,11 +56,7 @@ export function analyzeMultiple(scripts) {
   for (const { source, file, isModule } of scripts) {
     const ast = parse(source, {
       sourceType: isModule ? 'module' : 'script',
-      plugins: [
-        'jsx', 'typescript', 'dynamicImport', 'optionalChaining',
-        'nullishCoalescingOperator', 'classProperties', 'decorators-legacy',
-        'objectRestSpread', 'topLevelAwait', 'asyncGenerators', 'optionalCatchBinding',
-      ],
+      plugins: BABEL_PLUGINS,
       errorRecovery: true,
       allowReturnOutsideFunction: true,
     });
@@ -86,7 +86,7 @@ function walkAST(node, visitor) {
   if (!node || typeof node !== 'object') return;
   if (node.type) visitor(node);
   for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'start' || key === 'end' || key === 'leadingComments' || key === 'trailingComments' || key === 'innerComments' || key === '_closureEnv') continue;
+    if (WALK_SKIP_KEYS.has(key)) continue;
     const child = node[key];
     if (Array.isArray(child)) {
       for (const item of child) {

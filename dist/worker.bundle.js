@@ -43234,21 +43234,19 @@ ${rootStack}`;
     popSwitch() {
       this.breakTargets.pop();
     }
-    getBreakTarget(label) {
+    _getTarget(targets, label) {
       if (label) {
-        for (let i = this.breakTargets.length - 1; i >= 0; i--) {
-          if (this.breakTargets[i].label === label) return this.breakTargets[i].block;
+        for (let i = targets.length - 1; i >= 0; i--) {
+          if (targets[i].label === label) return targets[i].block;
         }
       }
-      return this.breakTargets.length > 0 ? this.breakTargets[this.breakTargets.length - 1].block : null;
+      return targets.length > 0 ? targets[targets.length - 1].block : null;
+    }
+    getBreakTarget(label) {
+      return this._getTarget(this.breakTargets, label);
     }
     getContinueTarget(label) {
-      if (label) {
-        for (let i = this.continueTargets.length - 1; i >= 0; i--) {
-          if (this.continueTargets[i].label === label) return this.continueTargets[i].block;
-        }
-      }
-      return this.continueTargets.length > 0 ? this.continueTargets[this.continueTargets.length - 1].block : null;
+      return this._getTarget(this.continueTargets, label);
     }
   };
   function buildCFG(bodyNode) {
@@ -43261,6 +43259,12 @@ ${rootStack}`;
     const afterBlock = buildStatements(stmts, cfg.entry, cfg, ctx);
     if (afterBlock) afterBlock.connect(cfg.exit);
     return cfg;
+  }
+  function addDeclarations(declarations, kind, block) {
+    for (const decl of declarations) {
+      if (kind === "let" || kind === "const") decl._blockScoped = true;
+      block.addNode(decl);
+    }
   }
   function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
     const S = [];
@@ -43287,10 +43291,7 @@ ${rootStack}`;
               f.cur.addNode(stmt.expression);
               continue;
             case "VariableDeclaration":
-              for (const decl of stmt.declarations) {
-                if (stmt.kind === "let" || stmt.kind === "const") decl._blockScoped = true;
-                f.cur.addNode(decl);
-              }
+              addDeclarations(stmt.declarations, stmt.kind, f.cur);
               continue;
             case "ReturnStatement":
               f.cur.addNode(stmt);
@@ -43363,10 +43364,7 @@ ${rootStack}`;
             case "ForStatement": {
               if (stmt.init) {
                 if (stmt.init.type === "VariableDeclaration") {
-                  for (const decl of stmt.init.declarations) {
-                    if (stmt.init.kind === "let" || stmt.init.kind === "const") decl._blockScoped = true;
-                    f.cur.addNode(decl);
-                  }
+                  addDeclarations(stmt.init.declarations, stmt.init.kind, f.cur);
                 } else {
                   f.cur.addNode(stmt.init);
                 }
@@ -43622,60 +43620,44 @@ ${rootStack}`;
 
   // src/worker/sources-sinks.js
   init_define_process_env();
-  var MEMBER_SOURCES = {
-    // location properties
-    "location.href": "url.location.href",
-    "location.hash": "url.location.hash",
-    "location.search": "url.location.search",
-    "location.pathname": "url.location.pathname",
-    "location.host": "url.location.host",
-    "location.hostname": "url.location.hostname",
-    "window.location.href": "url.location.href",
-    "window.location.hash": "url.location.hash",
-    "window.location.search": "url.location.search",
-    "window.location.pathname": "url.location.pathname",
-    // document.location aliases
-    "document.location.href": "url.location.href",
-    "document.location.hash": "url.location.hash",
-    "document.location.search": "url.location.search",
-    "document.location.pathname": "url.location.pathname",
-    // document properties
-    "document.URL": "url.document.URL",
-    "document.documentURI": "url.document.documentURI",
-    "document.referrer": "url.document.referrer",
-    "document.cookie": "cookie",
-    "document.baseURI": "url.document.baseURI",
-    "window.document.cookie": "cookie",
-    // globalThis aliases (same as window/location)
-    "globalThis.location.href": "url.location.href",
-    "globalThis.location.hash": "url.location.hash",
-    "globalThis.location.search": "url.location.search",
-    "globalThis.location.pathname": "url.location.pathname",
-    // self aliases (workers, but also valid in window context)
-    "self.location.href": "url.location.href",
-    "self.location.hash": "url.location.hash",
-    "self.location.search": "url.location.search",
-    "self.location.pathname": "url.location.pathname",
-    // window
-    "window.name": "window.name",
-    // Cross-window/frame sources (opener, parent, top)
-    "opener.location.href": "url.location.href",
-    "opener.location.hash": "url.location.hash",
-    "opener.location.search": "url.location.search",
-    "opener.location.pathname": "url.location.pathname",
-    "window.opener.location.href": "url.location.href",
-    "window.opener.location.hash": "url.location.hash",
-    "window.opener.location.search": "url.location.search",
-    "window.opener.location.pathname": "url.location.pathname",
-    "parent.location.href": "url.location.href",
-    "parent.location.hash": "url.location.hash",
-    "parent.location.search": "url.location.search",
-    "parent.location.pathname": "url.location.pathname",
-    "top.location.href": "url.location.href",
-    "top.location.hash": "url.location.hash",
-    "top.location.search": "url.location.search",
-    "top.location.pathname": "url.location.pathname"
+  var LOCATION_PREFIXES = [
+    "location",
+    "window.location",
+    "document.location",
+    "globalThis.location",
+    "self.location",
+    "opener.location",
+    "window.opener.location",
+    "parent.location",
+    "top.location"
+  ];
+  var LOCATION_PROPS = {
+    "href": "url.location.href",
+    "hash": "url.location.hash",
+    "search": "url.location.search",
+    "pathname": "url.location.pathname"
   };
+  var LOCATION_EXTRA_PROPS = {
+    "host": "url.location.host",
+    "hostname": "url.location.hostname"
+  };
+  var MEMBER_SOURCES = Object.assign(
+    {},
+    ...LOCATION_PREFIXES.flatMap(
+      (prefix) => Object.entries(LOCATION_PROPS).map(([prop, label]) => ({ [`${prefix}.${prop}`]: label }))
+    ),
+    ...Object.entries(LOCATION_EXTRA_PROPS).map(([prop, label]) => ({ [`location.${prop}`]: label })),
+    // Non-location sources
+    {
+      "document.URL": "url.document.URL",
+      "document.documentURI": "url.document.documentURI",
+      "document.referrer": "url.document.referrer",
+      "document.cookie": "cookie",
+      "document.baseURI": "url.document.baseURI",
+      "window.document.cookie": "cookie",
+      "window.name": "window.name"
+    }
+  );
   var CALL_SOURCES = {
     // URLSearchParams
     "URLSearchParams.prototype.get": "url.searchParam",
@@ -43751,6 +43733,13 @@ ${rootStack}`;
     "document.createElement": { type: "Script Injection", taintedArgs: [0], checkValue: "script" }
     // Fetch with tainted URL (SSRF-like in browser context, but mainly for data exfil)
   };
+  var CALL_SINKS_BY_METHOD = /* @__PURE__ */ new Map();
+  for (const [pattern, info] of Object.entries(CALL_SINKS)) {
+    const parts = pattern.split(".");
+    const method = parts[parts.length - 1];
+    if (!CALL_SINKS_BY_METHOD.has(method)) CALL_SINKS_BY_METHOD.set(method, []);
+    CALL_SINKS_BY_METHOD.get(method).push({ pattern, info });
+  }
   var SANITIZERS = /* @__PURE__ */ new Set([
     "DOMPurify.sanitize",
     "dompurify.sanitize",
@@ -43819,24 +43808,22 @@ ${rootStack}`;
   var LOCATION_ONLY_SINKS = /* @__PURE__ */ new Set(["replace", "assign"]);
   function checkCallSink(calleeStr, methodName) {
     if (CALL_SINKS[calleeStr]) return CALL_SINKS[calleeStr];
-    for (const [pattern, info] of Object.entries(CALL_SINKS)) {
-      const parts = pattern.split(".");
-      const method = parts[parts.length - 1];
-      if (method === methodName) {
-        if (GLOBAL_ONLY_SINKS.has(method)) {
-          if (!calleeStr || calleeStr === method || calleeStr === `window.${method}` || calleeStr === `globalThis.${method}` || calleeStr === `self.${method}`) {
-            return info;
-          }
-          continue;
+    const entries = CALL_SINKS_BY_METHOD.get(methodName);
+    if (!entries) return null;
+    for (const { info } of entries) {
+      if (GLOBAL_ONLY_SINKS.has(methodName)) {
+        if (!calleeStr || calleeStr === methodName || calleeStr === `window.${methodName}` || calleeStr === `globalThis.${methodName}` || calleeStr === `self.${methodName}`) {
+          return info;
         }
-        if (LOCATION_ONLY_SINKS.has(method)) {
-          if (calleeStr && (calleeStr.includes("location") || calleeStr.includes("Location"))) {
-            return info;
-          }
-          continue;
-        }
-        return info;
+        continue;
       }
+      if (LOCATION_ONLY_SINKS.has(methodName)) {
+        if (calleeStr && (calleeStr.includes("location") || calleeStr.includes("Location"))) {
+          return info;
+        }
+        continue;
+      }
+      return info;
     }
     return null;
   }
@@ -44420,6 +44407,37 @@ ${rootStack}`;
     if (node.type === "Literal" && typeof node.value === "number" && node.value === value) return true;
     return false;
   }
+  function isObjectProp(node) {
+    return node.type === "ObjectProperty" || node.type === "Property";
+  }
+  function isNumericLit(node) {
+    return node.type === "NumericLiteral" || node.type === "Literal" && typeof node.value === "number";
+  }
+  function isFuncExpr(node) {
+    return node.type === "ArrowFunctionExpression" || node.type === "FunctionExpression";
+  }
+  function getNodeLoc(node) {
+    return node.loc?.start || {};
+  }
+  function formatSources(taint) {
+    return taint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line }));
+  }
+  function makeSinkInfo(expression, ctx, loc) {
+    return { expression, file: ctx.file, line: loc.line || 0, col: loc.column || 0 };
+  }
+  function getSeverity(type) {
+    return type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
+  }
+  function resolveInitFromScope(identNode, ctx) {
+    if (identNode.type === "Identifier" && ctx?.scopeInfo) {
+      const bindingKey = ctx.scopeInfo.resolve(identNode);
+      if (bindingKey) {
+        const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
+        if (declNode?.type === "VariableDeclarator" && declNode.init) return declNode.init;
+      }
+    }
+    return null;
+  }
   function resolveToConstant(node, _env, ctx) {
     if (!node) return void 0;
     if (node.type === "BinaryExpression" && node.operator === "+") {
@@ -44449,20 +44467,15 @@ ${rootStack}`;
     while (cur) {
       if (!cur) return void 0;
       if (isStringLiteral(cur)) return cur.value;
-      if (cur.type === "NumericLiteral" || cur.type === "Literal" && typeof cur.value === "number") return cur.value;
+      if (isNumericLit(cur)) return cur.value;
       if (cur.type === "Identifier") {
         if (ctx?._paramConstants?.has(cur.name)) {
           return ctx._paramConstants.get(cur.name);
         }
-        if (ctx?.scopeInfo) {
-          const bindingKey = ctx.scopeInfo.resolve(cur);
-          if (bindingKey) {
-            const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-            if (declNode?.type === "VariableDeclarator" && declNode.init) {
-              cur = declNode.init;
-              continue;
-            }
-          }
+        const _init = resolveInitFromScope(cur, ctx);
+        if (_init) {
+          cur = _init;
+          continue;
         }
         return void 0;
       }
@@ -44500,7 +44513,7 @@ ${rootStack}`;
     while (cur) {
       if (cur.type === "BooleanLiteral") return cur.value;
       if (cur.type === "Literal" && typeof cur.value === "boolean") return cur.value;
-      if (cur.type === "NumericLiteral" || cur.type === "Literal" && typeof cur.value === "number")
+      if (isNumericLit(cur))
         return cur.value !== 0;
       if (cur.type === "StringLiteral" || cur.type === "Literal" && typeof cur.value === "string")
         return cur.value !== "";
@@ -44603,14 +44616,14 @@ ${rootStack}`;
       case "ReturnStatement":
         if (node.argument) {
           const arg = node.argument;
-          if (arg.type === "ArrowFunctionExpression" || arg.type === "FunctionExpression") {
+          if (isFuncExpr(arg)) {
             arg._closureEnv = env;
             ctx.returnedFuncNode = arg;
           }
           if (arg.type === "ObjectExpression") {
             const methods = {};
             for (const prop of arg.properties) {
-              if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key && (prop.key.type === "Identifier" || prop.key.type === "StringLiteral")) {
+              if (isObjectProp(prop) && prop.key && (prop.key.type === "Identifier" || prop.key.type === "StringLiteral")) {
                 const name = propKeyName(prop.key);
                 const val = prop.value;
                 if (val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
@@ -44641,7 +44654,7 @@ ${rootStack}`;
           if (arg.type === "ObjectExpression" && arg.properties.length > 0) {
             const propTaints = /* @__PURE__ */ new Map();
             for (const prop of arg.properties) {
-              if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+              if (isObjectProp(prop) && prop.key) {
                 const pName = propKeyName(prop.key);
                 if (pName) propTaints.set(pName, evaluateExpr(prop.value, env, ctx));
               }
@@ -44785,7 +44798,7 @@ ${rootStack}`;
             if (sourcePath.startsWith(withObj + ".")) {
               const propName = sourcePath.slice(withObj.length + 1);
               if (propName && !propName.includes(".")) {
-                const loc = node.loc?.start || {};
+                const loc = getNodeLoc(node);
                 const taint = TaintSet.from(new TaintLabel(label, ctx.file, loc.line || 0, loc.column || 0, `with(${withObj}).${propName}`));
                 env.set(propName, taint);
                 env.set(`global:${propName}`, taint);
@@ -44856,7 +44869,7 @@ ${rootStack}`;
         }
         continue;
       }
-      if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+      if (isObjectProp(prop) && prop.key) {
         const propName = propKeyName(prop.key);
         if (propName) {
           const propTaint = evaluateExpr(prop.value, env, ctx);
@@ -44902,7 +44915,7 @@ ${rootStack}`;
       while (romStack.length > 0) {
         const { objExpr, prefix } = romStack.pop();
         for (const prop of objExpr.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+          if (isObjectProp(prop) && prop.key) {
             const propName = propKeyName(prop.key);
             const val = prop.value;
             if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
@@ -44974,7 +44987,7 @@ ${rootStack}`;
       } else if (node.init.type === "ObjectExpression") {
         const literalProps = /* @__PURE__ */ new Map();
         for (const prop of node.init.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+          if (isObjectProp(prop) && prop.key) {
             const pName = propKeyName(prop.key);
             if (pName) literalProps.set(pName, evaluateExpr(prop.value, env, ctx));
           }
@@ -45148,7 +45161,7 @@ ${rootStack}`;
           const resolvedPath = `${resolvedObj}.${prop}`;
           const sourceTaint = checkMemberSource({ type: "MemberExpression", object: { type: "Identifier", name: resolvedObj }, property: node.init.property, computed: false });
           if (sourceTaint) {
-            const loc = node.init.loc?.start || {};
+            const loc = getNodeLoc(node.init);
             env.set(node.id.name, TaintSet.from(new TaintLabel(sourceTaint, ctx.file, loc.line || 0, loc.column || 0, resolvedPath)));
           }
         }
@@ -45407,7 +45420,7 @@ ${rootStack}`;
       const leftStr = nodeToString(node.left);
       if (leftStr) {
         for (const prop of node.right.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+          if (isObjectProp(prop) && prop.key) {
             const propName = propKeyName(prop.key);
             const val = prop.value;
             if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
@@ -45455,7 +45468,7 @@ ${rootStack}`;
             const paramName = handler.params[0].type === "Identifier" ? handler.params[0].name : null;
             if (paramName) {
               const childEnv = env.child();
-              const loc = handler.loc?.start || {};
+              const loc = getNodeLoc(handler);
               const desc = originCheck === "weak" ? `${paramName}.data (weak origin check)` : `${paramName}.data (no origin check)`;
               const label = new TaintLabel("postMessage.data", ctx.file, loc.line || 0, loc.column || 0, desc);
               assignToPattern(handler.params[0], TaintSet.from(label), childEnv, ctx);
@@ -45659,12 +45672,9 @@ ${rootStack}`;
           return;
         }
         let resolvedLn = ln;
-        if (ln.type === "Identifier" && ln.name !== "undefined" && ctx?.scopeInfo) {
-          const bindingKey = ctx.scopeInfo.resolve(ln);
-          if (bindingKey) {
-            const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-            if (declNode?.type === "VariableDeclarator" && declNode.init) resolvedLn = declNode.init;
-          }
+        if (ln.type === "Identifier" && ln.name !== "undefined") {
+          const _init = resolveInitFromScope(ln, ctx);
+          if (_init) resolvedLn = _init;
         }
         const isNonNullishConst = resolvedLn.type === "StringLiteral" || resolvedLn.type === "NumericLiteral" || resolvedLn.type === "BooleanLiteral" || resolvedLn.type === "Literal" && resolvedLn.value !== null && resolvedLn.value !== void 0 || resolvedLn.type === "ObjectExpression" || resolvedLn.type === "ArrayExpression";
         if (isNonNullishConst) {
@@ -45839,7 +45849,7 @@ ${rootStack}`;
                 const prop = props[i];
                 if (prop.type === "SpreadElement")
                   W.push({ kind: W_EVAL_EXPR, node: prop.argument, env: _e, ctx: _c });
-                else if (prop.type === "ObjectProperty" || prop.type === "Property")
+                else if (isObjectProp(prop))
                   W.push({ kind: W_EVAL_EXPR, node: prop.value, env: _e, ctx: _c });
                 else
                   W.push({ kind: W_EVAL_EXPR, node: null, env: _e, ctx: _c });
@@ -46065,14 +46075,14 @@ ${rootStack}`;
         }
       }
       if (sourceLabel) {
-        const loc = cur.loc?.start || {};
+        const loc = getNodeLoc(cur);
         return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur)));
       }
       const fullStr = nodeToString(cur);
       if (fullStr) {
         const resolvedStr = resolveAliasedPath(fullStr, env);
         if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
-          const loc = cur.loc?.start || {};
+          const loc = getNodeLoc(cur);
           return TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr));
         }
       }
@@ -46081,7 +46091,7 @@ ${rootStack}`;
         if (alias && cur.property) {
           const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
           if (MEMBER_SOURCES[deepPath]) {
-            const loc = cur.loc?.start || {};
+            const loc = getNodeLoc(cur);
             return TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath));
           }
         }
@@ -46123,7 +46133,7 @@ ${rootStack}`;
     let litKey = null;
     if (isStringLiteral(node.property)) {
       litKey = stringLiteralValue(node.property);
-    } else if (node.property.type === "NumericLiteral" || node.property.type === "Literal" && typeof node.property.value === "number") {
+    } else if (isNumericLit(node.property)) {
       litKey = String(node.property.value);
     } else {
       const resolved = resolveToConstant(node.property, env, ctx);
@@ -46399,13 +46409,13 @@ ${rootStack}`;
           const objName = nodeToString(node.callee.object);
           const objKey = node.callee.object.type === "Identifier" ? resolveId(node.callee.object, ctx) : objName;
           if (attrName === "src" && objName && (ctx.scriptElements.has(objKey) || ctx.scriptElements.has(objName))) {
-            const loc = node.loc?.start || {};
+            const loc = getNodeLoc(node);
             ctx.findings.push({
               type: "Script Injection",
               severity: "critical",
               title: "Script Injection: tainted data flows to script element src",
-              sink: { expression: `${objName}.setAttribute('src')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-              source: srcTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+              sink: makeSinkInfo(`${objName}.setAttribute('src')`, ctx, loc),
+              source: formatSources(srcTaint),
               path: buildTaintPath(srcTaint, `${objName}.setAttribute('src')`)
             });
           }
@@ -46434,13 +46444,13 @@ ${rootStack}`;
             const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
             const isCss = attrName === "style";
             const type = isCss ? "CSS Injection" : "XSS";
-            const loc = node.loc?.start || {};
+            const loc = getNodeLoc(node);
             ctx.findings.push({
               type,
               severity: isCss ? "high" : isEventHandler ? "critical" : "high",
               title: `${type}: tainted data flows to setAttribute('${attrName}')`,
-              sink: { expression: `${objName || "element"}.setAttribute('${attrName}')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-              source: srcTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+              sink: makeSinkInfo(`${objName || "element"}.setAttribute('${attrName}')`, ctx, loc),
+              source: formatSources(srcTaint),
               path: buildTaintPath(srcTaint, `${objName || "element"}.setAttribute('${attrName}')`)
             });
           }
@@ -46470,13 +46480,13 @@ ${rootStack}`;
     if (isCalleeMatch(node, "Object", "setPrototypeOf", env) && node.arguments.length >= 2) {
       const protoTaint = argTaints[1];
       if (protoTaint && protoTaint.tainted) {
-        const loc = node.loc?.start || {};
+        const loc = getNodeLoc(node);
         ctx.findings.push({
           type: "Prototype Pollution",
           severity: "critical",
           title: "Prototype Pollution: tainted data passed to Object.setPrototypeOf",
-          sink: { expression: "Object.setPrototypeOf()", file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-          source: protoTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+          sink: makeSinkInfo("Object.setPrototypeOf()", ctx, loc),
+          source: formatSources(protoTaint),
           path: buildTaintPath(protoTaint, "Object.setPrototypeOf()")
         });
       }
@@ -46507,7 +46517,7 @@ ${rootStack}`;
         const objStr = nodeToString(objNode);
         const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
         for (const prop of descNode.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+          if (isObjectProp(prop) && prop.key) {
             const descPropName = propKeyName(prop.key);
             if (descPropName === "value") {
               const valTaint = evaluateExpr(prop.value, env, ctx);
@@ -46566,11 +46576,11 @@ ${rootStack}`;
       if (descMapNode && descMapNode.type === "ObjectExpression") {
         const resultTaint = TaintSet.empty();
         for (const prop of descMapNode.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key && prop.value) {
+          if (isObjectProp(prop) && prop.key && prop.value) {
             const propName = propKeyName(prop.key);
             if (propName && prop.value.type === "ObjectExpression") {
               for (const descProp of prop.value.properties) {
-                if ((descProp.type === "ObjectProperty" || descProp.type === "Property") && descProp.key && (descProp.key.name === "value" || descProp.key.value === "value")) {
+                if (isObjectProp(descProp) && descProp.key && (descProp.key.name === "value" || descProp.key.value === "value")) {
                   const valTaint = evaluateExpr(descProp.value, env, ctx);
                   if (valTaint.tainted) resultTaint.merge(valTaint);
                 }
@@ -46636,7 +46646,7 @@ ${rootStack}`;
             if (srcNode.type === "ObjectExpression") {
               for (const prop of srcNode.properties) {
                 if (prop.type === "SpreadElement") continue;
-                if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+                if (isObjectProp(prop) && prop.key) {
                   const propName = propKeyName(prop.key);
                   if (propName) {
                     const propTaint = evaluateExpr(prop.value, env, ctx);
@@ -46661,7 +46671,7 @@ ${rootStack}`;
       return merged;
     }
     if (calleeStr && CALL_SOURCES[calleeStr] && CALL_SOURCES[calleeStr] !== "passthrough") {
-      const loc = node.loc?.start || {};
+      const loc = getNodeLoc(node);
       return TaintSet.from(new TaintLabel(CALL_SOURCES[calleeStr], ctx.file, loc.line || 0, loc.column || 0, calleeStr + "()"));
     }
     if (calleeStr && isPassthrough(calleeStr)) return argTaints[0]?.clone() || TaintSet.empty();
@@ -46741,7 +46751,7 @@ ${rootStack}`;
     if (constructorName && CONSTRUCTOR_SOURCES[constructorName]) {
       const argTaint = argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
       if (argTaint.tainted) return argTaint;
-      const loc = node.loc?.start || {};
+      const loc = getNodeLoc(node);
       return TaintSet.from(new TaintLabel(CONSTRUCTOR_SOURCES[constructorName], ctx.file, loc.line || 0, loc.column || 0, `new ${constructorName}()`));
     }
     if (isGlobalRef(node.callee, "Function", env)) {
@@ -46756,7 +46766,7 @@ ${rootStack}`;
     }
     if (isGlobalRef(node.callee, "Promise", env) && node.arguments[0]) {
       let callback = node.arguments[0];
-      if (callback.type === "ArrowFunctionExpression" || callback.type === "FunctionExpression") {
+      if (isFuncExpr(callback)) {
         const childEnv = env.child();
         const resolveName = callback.params[0]?.type === "Identifier" ? callback.params[0].name : null;
         if (resolveName) {
@@ -46780,7 +46790,7 @@ ${rootStack}`;
       }
       if (optionsNode && optionsNode.type === "ObjectExpression") {
         for (const prop of optionsNode.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+          if (isObjectProp(prop) && prop.key) {
             const pname = propKeyName(prop.key);
             if (pname === "detail") {
               const detailTaint = evaluateExpr(prop.value, env, ctx);
@@ -46798,7 +46808,7 @@ ${rootStack}`;
       const targetNode = node.arguments[0];
       if (handlerNode.type === "ObjectExpression") {
         for (const prop of handlerNode.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property" || prop.type === "ObjectMethod") && prop.key) {
+          if ((isObjectProp(prop) || prop.type === "ObjectMethod") && prop.key) {
             const pname = propKeyName(prop.key);
             if (pname === "apply") {
               if (targetNode?.type === "Identifier") {
@@ -47021,7 +47031,7 @@ ${rootStack}`;
       case "reduce":
       case "reduceRight": {
         const cbReduce = node.arguments[0];
-        if (cbReduce && (cbReduce.type === "ArrowFunctionExpression" || cbReduce.type === "FunctionExpression")) {
+        if (cbReduce && isFuncExpr(cbReduce)) {
           const childEnv = env.child();
           const accTaint = objTaint.clone().merge(argTaints[1] || TaintSet.empty());
           if (cbReduce.params[0]) assignToPattern(cbReduce.params[0], accTaint, childEnv, ctx);
@@ -47252,11 +47262,11 @@ ${rootStack}`;
         if (node.callee?.object) {
           const storageObj = node.callee.object;
           if (isGlobalRef(storageObj, "localStorage", env)) {
-            const loc = node.loc?.start || {};
+            const loc = getNodeLoc(node);
             return TaintSet.from(new TaintLabel("storage.local", ctx.file, loc.line || 0, loc.column || 0, "localStorage.getItem()"));
           }
           if (isGlobalRef(storageObj, "sessionStorage", env)) {
-            const loc = node.loc?.start || {};
+            const loc = getNodeLoc(node);
             return TaintSet.from(new TaintLabel("storage.session", ctx.file, loc.line || 0, loc.column || 0, "sessionStorage.getItem()"));
           }
         }
@@ -47268,11 +47278,11 @@ ${rootStack}`;
         if (node.callee?.object) {
           const storageObj = node.callee.object;
           if (isGlobalRef(storageObj, "localStorage", env)) {
-            const loc = node.loc?.start || {};
+            const loc = getNodeLoc(node);
             return TaintSet.from(new TaintLabel("storage.local", ctx.file, loc.line || 0, loc.column || 0, "localStorage.getItem()"));
           }
           if (isGlobalRef(storageObj, "sessionStorage", env)) {
-            const loc = node.loc?.start || {};
+            const loc = getNodeLoc(node);
             return TaintSet.from(new TaintLabel("storage.session", ctx.file, loc.line || 0, loc.column || 0, "sessionStorage.getItem()"));
           }
         }
@@ -47359,7 +47369,7 @@ ${rootStack}`;
       const paramName = callback.params[0].type === "Identifier" ? callback.params[0].name : null;
       if (paramName) {
         const evtSource = EVENT_SOURCES[eventName];
-        const loc = callback.loc?.start || {};
+        const loc = getNodeLoc(callback);
         const label = new TaintLabel(evtSource.label, ctx.file, loc.line || 0, loc.column || 0, `${paramName}.${evtSource.property}`);
         childEnv.set(`${paramName}.${evtSource.property}`, TaintSet.from(label));
         assignToPattern(callback.params[0], TaintSet.from(label), childEnv, ctx);
@@ -47370,7 +47380,7 @@ ${rootStack}`;
       if (originCheck !== "strong") {
         const paramName = callback.params[0].type === "Identifier" ? callback.params[0].name : null;
         if (paramName) {
-          const loc = callback.loc?.start || {};
+          const loc = getNodeLoc(callback);
           const desc = originCheck === "weak" ? `${paramName}.data (weak origin check)` : `${paramName}.data (no origin check)`;
           const label = new TaintLabel("postMessage.data", ctx.file, loc.line || 0, loc.column || 0, desc);
           assignToPattern(callback.params[0], TaintSet.from(label), childEnv, ctx);
@@ -47602,7 +47612,7 @@ ${rootStack}`;
     const methodName = node.callee?.property?.name || "";
     const callback = node.arguments[0];
     if (methodName === "finally") {
-      if (callback && (callback.type === "ArrowFunctionExpression" || callback.type === "FunctionExpression")) {
+      if (callback && isFuncExpr(callback)) {
         const childEnv2 = env.child();
         if (callback.body.type === "BlockStatement") analyzeInlineFunction(callback, childEnv2, ctx);
         else evaluateExpr(callback.body, childEnv2, ctx);
@@ -47860,7 +47870,7 @@ ${rootStack}`;
               break;
             }
           }
-          if (branch.type === "ArrowFunctionExpression" || branch.type === "FunctionExpression") {
+          if (isFuncExpr(branch)) {
             funcNode = branch;
             break;
           }
@@ -47871,7 +47881,7 @@ ${rootStack}`;
       const methodName = callNode.callee.property?.name;
       if (methodName) {
         for (const prop of callNode.callee.object.properties) {
-          if ((prop.type === "ObjectProperty" || prop.type === "Property" || prop.type === "ObjectMethod") && prop.key) {
+          if ((isObjectProp(prop) || prop.type === "ObjectMethod") && prop.key) {
             const pName = propKeyName(prop.key);
             if (pName === methodName) {
               funcNode = prop.type === "ObjectMethod" ? prop : prop.value;
@@ -47964,7 +47974,7 @@ ${rootStack}`;
     if (funcNode._boundThisNode) {
       const objNode = funcNode._boundThisNode;
       for (const prop of objNode.properties || []) {
-        if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+        if (isObjectProp(prop) && prop.key) {
           const propName = propKeyName(prop.key);
           if (propName && prop.value) {
             const propTaint = evaluateExpr(prop.value, env, ctx);
@@ -48011,7 +48021,7 @@ ${rootStack}`;
         }
         if (argNode.type === "ObjectExpression") {
           for (const prop of argNode.properties) {
-            if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+            if (isObjectProp(prop) && prop.key) {
               const pName = propKeyName(prop.key);
               const val = prop.value;
               if (pName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
@@ -48044,7 +48054,7 @@ ${rootStack}`;
             } else if (argNode.type === "ObjectExpression") {
               const literalProps = /* @__PURE__ */ new Map();
               for (const prop of argNode.properties) {
-                if ((prop.type === "ObjectProperty" || prop.type === "Property") && prop.key) {
+                if (isObjectProp(prop) && prop.key) {
                   const pName = propKeyName(prop.key);
                   if (pName) literalProps.set(pName, evaluateExpr(prop.value, childEnv, ctx));
                 }
@@ -48270,7 +48280,7 @@ ${rootStack}`;
           }
           const sourceLabel = checkMemberSource(node);
           if (sourceLabel) {
-            const loc = node.loc?.start || {};
+            const loc = getNodeLoc(node);
             taintOut.merge(TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, str)));
             continue;
           }
@@ -48318,13 +48328,13 @@ ${rootStack}`;
     if (!objName) return;
     const objKey = leftNode.object.type === "Identifier" ? resolveId(leftNode.object, ctx) : objName;
     if (!ctx.scriptElements.has(objKey) && !ctx.scriptElements.has(objName)) return;
-    const loc = leftNode.loc?.start || {};
+    const loc = getNodeLoc(leftNode);
     ctx.findings.push({
       type: "Script Injection",
       severity: "critical",
       title: `Script Injection: tainted data flows to script element ${propName}`,
-      sink: { expression: `${objName}.${propName}`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-      source: rhsTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+      sink: makeSinkInfo(`${objName}.${propName}`, ctx, loc),
+      source: formatSources(rhsTaint),
       path: buildTaintPath(rhsTaint, `${objName}.${propName}`)
     });
   }
@@ -48342,14 +48352,7 @@ ${rootStack}`;
           if (typeof resolved === "string") {
             propName = resolved;
           } else {
-            let initNode = prop;
-            if (prop.type === "Identifier" && ctx?.scopeInfo) {
-              const bindingKey = ctx.scopeInfo.resolve(prop);
-              if (bindingKey) {
-                const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-                if (declNode?.type === "VariableDeclarator" && declNode.init) initNode = declNode.init;
-              }
-            }
+            let initNode = resolveInitFromScope(prop, ctx) || prop;
             if (initNode.type === "ConditionalExpression") {
               const consResolved = resolveToConstant(initNode.consequent, env, ctx);
               const altResolved = resolveToConstant(initNode.alternate, env, ctx);
@@ -48366,14 +48369,14 @@ ${rootStack}`;
     if (!sinkInfo) return;
     if (sinkInfo.navigation && isSelfRedirect(sinkInfo, rhsNode)) return;
     const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
-    const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
-    const loc = leftNode.loc?.start || {};
+    const severity = getSeverity(type);
+    const loc = getNodeLoc(leftNode);
     ctx.findings.push({
       type,
       severity,
       title: `${type}: tainted data flows to ${leftStr || propName}`,
-      sink: { expression: leftStr || propName, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-      source: rhsTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+      sink: makeSinkInfo(leftStr || propName, ctx, loc),
+      source: formatSources(rhsTaint),
       path: buildTaintPath(rhsTaint, leftStr || propName)
     });
   }
@@ -48399,18 +48402,18 @@ ${rootStack}`;
       if (!argTaint || !argTaint.tainted) continue;
       if (sinkInfo.stringOnly && callNode.arguments[argIdx]) {
         const argNode = callNode.arguments[argIdx];
-        if (argNode.type === "ArrowFunctionExpression" || argNode.type === "FunctionExpression") continue;
+        if (isFuncExpr(argNode)) continue;
       }
       if (isSelfRedirect(sinkInfo, callNode.arguments[argIdx])) continue;
       const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
-      const severity = type === "Open Redirect" ? "high" : type === "XSS" ? "critical" : "high";
-      const loc = callNode.loc?.start || {};
+      const severity = getSeverity(type);
+      const loc = getNodeLoc(callNode);
       ctx.findings.push({
         type,
         severity,
         title: `${type}: tainted data flows to ${calleeStr}()`,
-        sink: { expression: `${calleeStr}(arg${argIdx})`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-        source: argTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+        sink: makeSinkInfo(`${calleeStr}(arg${argIdx})`, ctx, loc),
+        source: formatSources(argTaint),
         path: buildTaintPath(argTaint, calleeStr)
       });
     }
@@ -48423,13 +48426,13 @@ ${rootStack}`;
       const outerKey = evaluateExpr(left.object.property, env, ctx);
       const innerKey = evaluateExpr(left.property, env, ctx);
       if (outerKey.tainted && innerKey.tainted) {
-        const loc = node.loc?.start || {};
+        const loc = getNodeLoc(node);
         ctx.findings.push({
           type: "Prototype Pollution",
           severity: "critical",
           title: "Prototype Pollution: attacker controls nested property keys",
-          sink: { expression: nodeToString(left) || "obj[key1][key2]", file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-          source: outerKey.clone().merge(innerKey).toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+          sink: makeSinkInfo(nodeToString(left) || "obj[key1][key2]", ctx, loc),
+          source: formatSources(outerKey.clone().merge(innerKey)),
           path: buildTaintPath(outerKey.clone().merge(innerKey), "obj[key1][key2]")
         });
       }
@@ -48443,15 +48446,15 @@ ${rootStack}`;
         const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
         const combinedTaint = rhsTaint.tainted ? rhsTaint : keyTaint;
         if (combinedTaint.tainted) {
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           const expr = nodeToString(left) || `obj.${objProp}.prop`;
           const title = keyTaint.tainted ? `Prototype Pollution: attacker controls property key on ${objProp}` : `Prototype Pollution: tainted data assigned to ${objProp}`;
           ctx.findings.push({
             type: "Prototype Pollution",
             severity: "critical",
             title,
-            sink: { expression: expr, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-            source: combinedTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+            sink: makeSinkInfo(expr, ctx, loc),
+            source: formatSources(combinedTaint),
             path: buildTaintPath(combinedTaint, expr)
           });
         }
@@ -48460,14 +48463,14 @@ ${rootStack}`;
     if (left.computed && left.object?.type === "MemberExpression" && !left.object.computed && left.object.property?.name === "prototype" && left.object.object?.type === "MemberExpression" && !left.object.object.computed && left.object.object.property?.name === "constructor") {
       const keyTaint = evaluateExpr(left.property, env, ctx);
       if (keyTaint.tainted) {
-        const loc = node.loc?.start || {};
+        const loc = getNodeLoc(node);
         const expr = nodeToString(left) || "obj.constructor.prototype[key]";
         ctx.findings.push({
           type: "Prototype Pollution",
           severity: "critical",
           title: "Prototype Pollution: attacker controls property key on constructor.prototype",
-          sink: { expression: expr, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-          source: keyTaint.toArray().map((l) => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+          sink: makeSinkInfo(expr, ctx, loc),
+          source: formatSources(keyTaint),
           path: buildTaintPath(keyTaint, expr)
         });
       }
@@ -48653,6 +48656,13 @@ ${rootStack}`;
     const nodeBindingMap = /* @__PURE__ */ new Map();
     const bindingScopes = /* @__PURE__ */ new Map();
     const bindingNodes = /* @__PURE__ */ new Map();
+    function mapBinding(node, scope) {
+      if (nodeBindingMap.has(node)) return;
+      const binding = scope.getBinding(node.name);
+      if (binding) {
+        nodeBindingMap.set(node, `${binding.scope.uid}:${node.name}`);
+      }
+    }
     traverse(ast, {
       // Capture all scope-creating nodes to register bindings
       Scope(path) {
@@ -48693,21 +48703,11 @@ ${rootStack}`;
       },
       // Capture identifiers in all references
       ReferencedIdentifier(path) {
-        if (nodeBindingMap.has(path.node)) return;
-        const binding = path.scope.getBinding(path.node.name);
-        if (binding) {
-          const key = `${binding.scope.uid}:${path.node.name}`;
-          nodeBindingMap.set(path.node, key);
-        }
+        mapBinding(path.node, path.scope);
       },
       // Capture identifiers in binding declarations (let x = ...)
       BindingIdentifier(path) {
-        if (nodeBindingMap.has(path.node)) return;
-        const binding = path.scope.getBinding(path.node.name);
-        if (binding) {
-          const key = `${binding.scope.uid}:${path.node.name}`;
-          nodeBindingMap.set(path.node, key);
-        }
+        mapBinding(path.node, path.scope);
       }
     });
     return new ScopeInfo(nodeBindingMap, bindingScopes, bindingNodes);

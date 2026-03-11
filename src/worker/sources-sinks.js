@@ -3,61 +3,44 @@
 
 // ── SOURCES: expressions that return attacker-controlled data ──
 
-// Member expression sources: object.property patterns
-export const MEMBER_SOURCES = {
-  // location properties
-  'location.href': 'url.location.href',
-  'location.hash': 'url.location.hash',
-  'location.search': 'url.location.search',
-  'location.pathname': 'url.location.pathname',
-  'location.host': 'url.location.host',
-  'location.hostname': 'url.location.hostname',
-  'window.location.href': 'url.location.href',
-  'window.location.hash': 'url.location.hash',
-  'window.location.search': 'url.location.search',
-  'window.location.pathname': 'url.location.pathname',
-  // document.location aliases
-  'document.location.href': 'url.location.href',
-  'document.location.hash': 'url.location.hash',
-  'document.location.search': 'url.location.search',
-  'document.location.pathname': 'url.location.pathname',
-  // document properties
-  'document.URL': 'url.document.URL',
-  'document.documentURI': 'url.document.documentURI',
-  'document.referrer': 'url.document.referrer',
-  'document.cookie': 'cookie',
-  'document.baseURI': 'url.document.baseURI',
-  'window.document.cookie': 'cookie',
-  // globalThis aliases (same as window/location)
-  'globalThis.location.href': 'url.location.href',
-  'globalThis.location.hash': 'url.location.hash',
-  'globalThis.location.search': 'url.location.search',
-  'globalThis.location.pathname': 'url.location.pathname',
-  // self aliases (workers, but also valid in window context)
-  'self.location.href': 'url.location.href',
-  'self.location.hash': 'url.location.hash',
-  'self.location.search': 'url.location.search',
-  'self.location.pathname': 'url.location.pathname',
-  // window
-  'window.name': 'window.name',
-  // Cross-window/frame sources (opener, parent, top)
-  'opener.location.href': 'url.location.href',
-  'opener.location.hash': 'url.location.hash',
-  'opener.location.search': 'url.location.search',
-  'opener.location.pathname': 'url.location.pathname',
-  'window.opener.location.href': 'url.location.href',
-  'window.opener.location.hash': 'url.location.hash',
-  'window.opener.location.search': 'url.location.search',
-  'window.opener.location.pathname': 'url.location.pathname',
-  'parent.location.href': 'url.location.href',
-  'parent.location.hash': 'url.location.hash',
-  'parent.location.search': 'url.location.search',
-  'parent.location.pathname': 'url.location.pathname',
-  'top.location.href': 'url.location.href',
-  'top.location.hash': 'url.location.hash',
-  'top.location.search': 'url.location.search',
-  'top.location.pathname': 'url.location.pathname',
+// Generate location-based sources from prefix/property combinations
+const LOCATION_PREFIXES = [
+  'location', 'window.location', 'document.location',
+  'globalThis.location', 'self.location',
+  'opener.location', 'window.opener.location',
+  'parent.location', 'top.location',
+];
+const LOCATION_PROPS = {
+  'href': 'url.location.href',
+  'hash': 'url.location.hash',
+  'search': 'url.location.search',
+  'pathname': 'url.location.pathname',
 };
+// Only bare 'location' has host/hostname
+const LOCATION_EXTRA_PROPS = {
+  'host': 'url.location.host',
+  'hostname': 'url.location.hostname',
+};
+
+export const MEMBER_SOURCES = Object.assign(
+  {},
+  // Generate all prefix.prop entries
+  ...LOCATION_PREFIXES.flatMap(prefix =>
+    Object.entries(LOCATION_PROPS).map(([prop, label]) => ({ [`${prefix}.${prop}`]: label }))
+  ),
+  // host/hostname only on bare 'location'
+  ...Object.entries(LOCATION_EXTRA_PROPS).map(([prop, label]) => ({ [`location.${prop}`]: label })),
+  // Non-location sources
+  {
+    'document.URL': 'url.document.URL',
+    'document.documentURI': 'url.document.documentURI',
+    'document.referrer': 'url.document.referrer',
+    'document.cookie': 'cookie',
+    'document.baseURI': 'url.document.baseURI',
+    'window.document.cookie': 'cookie',
+    'window.name': 'window.name',
+  },
+);
 
 // Call expression sources: function calls that return tainted data
 // { callee pattern → source label }
@@ -145,6 +128,15 @@ export const CALL_SINKS = {
   // Fetch with tainted URL (SSRF-like in browser context, but mainly for data exfil)
 };
 
+// Pre-computed method-name → entries map for O(1) lookup in checkCallSink
+const CALL_SINKS_BY_METHOD = new Map();
+for (const [pattern, info] of Object.entries(CALL_SINKS)) {
+  const parts = pattern.split('.');
+  const method = parts[parts.length - 1];
+  if (!CALL_SINKS_BY_METHOD.has(method)) CALL_SINKS_BY_METHOD.set(method, []);
+  CALL_SINKS_BY_METHOD.get(method).push({ pattern, info });
+}
+
 // ── SANITIZERS: functions that neutralize taint ──
 export const SANITIZERS = new Set([
   'DOMPurify.sanitize',
@@ -226,29 +218,27 @@ const LOCATION_ONLY_SINKS = new Set(['replace', 'assign']);
 export function checkCallSink(calleeStr, methodName) {
   // Direct match
   if (CALL_SINKS[calleeStr]) return CALL_SINKS[calleeStr];
-  // Method name match (e.g., .insertAdjacentHTML)
-  for (const [pattern, info] of Object.entries(CALL_SINKS)) {
-    const parts = pattern.split('.');
-    const method = parts[parts.length - 1];
-    if (method === methodName) {
-      // For global-only sinks, only match if called as global or on window
-      if (GLOBAL_ONLY_SINKS.has(method)) {
-        if (!calleeStr || calleeStr === method ||
-            calleeStr === `window.${method}` || calleeStr === `globalThis.${method}` ||
-            calleeStr === `self.${method}`) {
-          return info;
-        }
-        continue;
+  // Method name match via pre-computed map
+  const entries = CALL_SINKS_BY_METHOD.get(methodName);
+  if (!entries) return null;
+  for (const { info } of entries) {
+    // For global-only sinks, only match if called as global or on window
+    if (GLOBAL_ONLY_SINKS.has(methodName)) {
+      if (!calleeStr || calleeStr === methodName ||
+          calleeStr === `window.${methodName}` || calleeStr === `globalThis.${methodName}` ||
+          calleeStr === `self.${methodName}`) {
+        return info;
       }
-      // For location-only sinks, only match on location-like objects
-      if (LOCATION_ONLY_SINKS.has(method)) {
-        if (calleeStr && (calleeStr.includes('location') || calleeStr.includes('Location'))) {
-          return info;
-        }
-        continue;
-      }
-      return info;
+      continue;
     }
+    // For location-only sinks, only match on location-like objects
+    if (LOCATION_ONLY_SINKS.has(methodName)) {
+      if (calleeStr && (calleeStr.includes('location') || calleeStr.includes('Location'))) {
+        return info;
+      }
+      continue;
+    }
+    return info;
   }
   return null;
 }

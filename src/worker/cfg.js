@@ -66,27 +66,17 @@ class BuildContext {
     this.breakTargets.pop();
   }
 
-  getBreakTarget(label) {
+  _getTarget(targets, label) {
     if (label) {
-      for (let i = this.breakTargets.length - 1; i >= 0; i--) {
-        if (this.breakTargets[i].label === label) return this.breakTargets[i].block;
+      for (let i = targets.length - 1; i >= 0; i--) {
+        if (targets[i].label === label) return targets[i].block;
       }
     }
-    return this.breakTargets.length > 0
-      ? this.breakTargets[this.breakTargets.length - 1].block
-      : null;
+    return targets.length > 0 ? targets[targets.length - 1].block : null;
   }
 
-  getContinueTarget(label) {
-    if (label) {
-      for (let i = this.continueTargets.length - 1; i >= 0; i--) {
-        if (this.continueTargets[i].label === label) return this.continueTargets[i].block;
-      }
-    }
-    return this.continueTargets.length > 0
-      ? this.continueTargets[this.continueTargets.length - 1].block
-      : null;
-  }
+  getBreakTarget(label) { return this._getTarget(this.breakTargets, label); }
+  getContinueTarget(label) { return this._getTarget(this.continueTargets, label); }
 }
 
 // Build a CFG for a function body (or program body)
@@ -102,6 +92,13 @@ export function buildCFG(bodyNode) {
   if (afterBlock) afterBlock.connect(cfg.exit);
 
   return cfg;
+}
+
+function addDeclarations(declarations, kind, block) {
+  for (const decl of declarations) {
+    if (kind === 'let' || kind === 'const') decl._blockScoped = true;
+    block.addNode(decl);
+  }
 }
 
 // Fully iterative CFG builder using explicit frame stack
@@ -129,11 +126,7 @@ function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
           case 'ExpressionStatement':
             f.cur.addNode(stmt.expression); continue;
           case 'VariableDeclaration':
-            for (const decl of stmt.declarations) {
-              if (stmt.kind === 'let' || stmt.kind === 'const') decl._blockScoped = true;
-              f.cur.addNode(decl);
-            }
-            continue;
+            addDeclarations(stmt.declarations, stmt.kind, f.cur); continue;
           case 'ReturnStatement':
             f.cur.addNode(stmt); f.cur.connect(ctx.returnTarget); f.cur = null; continue;
           case 'ThrowStatement':
@@ -197,10 +190,7 @@ function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
           case 'ForStatement': {
             if (stmt.init) {
               if (stmt.init.type === 'VariableDeclaration') {
-                for (const decl of stmt.init.declarations) {
-                  if (stmt.init.kind === 'let' || stmt.init.kind === 'const') decl._blockScoped = true;
-                  f.cur.addNode(decl);
-                }
+                addDeclarations(stmt.init.declarations, stmt.init.kind, f.cur);
               } else {
                 f.cur.addNode(stmt.init);
               }

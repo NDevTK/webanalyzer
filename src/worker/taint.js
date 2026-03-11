@@ -696,6 +696,45 @@ function isNumericLiteral(node, value) {
   if (node.type === 'Literal' && typeof node.value === 'number' && node.value === value) return true;
   return false;
 }
+// ── DRY helpers for repeated patterns ──
+function isObjectProp(node) {
+  return node.type === 'ObjectProperty' || node.type === 'Property';
+}
+
+function isNumericLit(node) {
+  return node.type === 'NumericLiteral' || (node.type === 'Literal' && typeof node.value === 'number');
+}
+
+function isFuncExpr(node) {
+  return node.type === 'ArrowFunctionExpression' || node.type === 'FunctionExpression';
+}
+
+function getNodeLoc(node) {
+  return node.loc?.start || {};
+}
+
+function formatSources(taint) {
+  return taint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line }));
+}
+
+function makeSinkInfo(expression, ctx, loc) {
+  return { expression, file: ctx.file, line: loc.line || 0, col: loc.column || 0 };
+}
+
+function getSeverity(type) {
+  return type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
+}
+
+function resolveInitFromScope(identNode, ctx) {
+  if (identNode.type === 'Identifier' && ctx?.scopeInfo) {
+    const bindingKey = ctx.scopeInfo.resolve(identNode);
+    if (bindingKey) {
+      const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
+      if (declNode?.type === 'VariableDeclarator' && declNode.init) return declNode.init;
+    }
+  }
+  return null;
+}
 // Resolve an identifier to its constant string value if possible
 // Uses scope info to find the variable's binding and check if it's a string literal
 function resolveToConstant(node, _env, ctx) {
@@ -729,21 +768,13 @@ function resolveConstantLeaf(node, _env, ctx) {
   while (cur) {
     if (!cur) return undefined;
     if (isStringLiteral(cur)) return cur.value;
-    if (cur.type === 'NumericLiteral' || (cur.type === 'Literal' && typeof cur.value === 'number')) return cur.value;
+    if (isNumericLit(cur)) return cur.value;
     if (cur.type === 'Identifier') {
       if (ctx?._paramConstants?.has(cur.name)) {
         return ctx._paramConstants.get(cur.name);
       }
-      if (ctx?.scopeInfo) {
-        const bindingKey = ctx.scopeInfo.resolve(cur);
-        if (bindingKey) {
-          const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-          if (declNode?.type === 'VariableDeclarator' && declNode.init) {
-            cur = declNode.init;
-            continue;
-          }
-        }
-      }
+      const _init = resolveInitFromScope(cur, ctx);
+      if (_init) { cur = _init; continue; }
       return undefined;
     }
     return undefined;
@@ -791,7 +822,7 @@ function isConstantBoolLeaf(node, ctx) {
   while (cur) {
     if (cur.type === 'BooleanLiteral') return cur.value;
     if (cur.type === 'Literal' && typeof cur.value === 'boolean') return cur.value;
-    if (cur.type === 'NumericLiteral' || (cur.type === 'Literal' && typeof cur.value === 'number'))
+    if (isNumericLit(cur))
       return cur.value !== 0;
     if (cur.type === 'StringLiteral' || (cur.type === 'Literal' && typeof cur.value === 'string'))
       return cur.value !== '';
@@ -891,7 +922,7 @@ function processNode(node, env, ctx) {
       if (node.argument) {
         const arg = node.argument;
         // Track returned function nodes for factory pattern support
-        if (arg.type === 'ArrowFunctionExpression' || arg.type === 'FunctionExpression') {
+        if (isFuncExpr(arg)) {
           arg._closureEnv = env;
           ctx.returnedFuncNode = arg;
         }
@@ -899,7 +930,7 @@ function processNode(node, env, ctx) {
         if (arg.type === 'ObjectExpression') {
           const methods = {};
           for (const prop of arg.properties) {
-            if ((prop.type === 'ObjectProperty' || prop.type === 'Property') &&
+            if (isObjectProp(prop) &&
                 prop.key && (prop.key.type === 'Identifier' || prop.key.type === 'StringLiteral')) {
               const name = propKeyName(prop.key);
               const val = prop.value;
@@ -935,7 +966,7 @@ function processNode(node, env, ctx) {
         if (arg.type === 'ObjectExpression' && arg.properties.length > 0) {
           const propTaints = new Map();
           for (const prop of arg.properties) {
-            if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+            if (isObjectProp(prop) && prop.key) {
               const pName = propKeyName(prop.key);
               if (pName) propTaints.set(pName, evaluateExpr(prop.value, env, ctx));
             }
@@ -1104,7 +1135,7 @@ function processNode(node, env, ctx) {
             const propName = sourcePath.slice(withObj.length + 1);
             // Only inject simple property names (no nested dots)
             if (propName && !propName.includes('.')) {
-              const loc = node.loc?.start || {};
+              const loc = getNodeLoc(node);
               const taint = TaintSet.from(new TaintLabel(label, ctx.file, loc.line || 0, loc.column || 0, `with(${withObj}).${propName}`));
               env.set(propName, taint);
               env.set(`global:${propName}`, taint);
@@ -1196,7 +1227,7 @@ function storeObjectPropertyTaints(varName, objExpr, env, ctx) {
       }
       continue;
     }
-    if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+    if (isObjectProp(prop) && prop.key) {
       const propName = propKeyName(prop.key);
       if (propName) {
         const propTaint = evaluateExpr(prop.value, env, ctx);
@@ -1256,7 +1287,7 @@ function processVarDeclarator(node, env, ctx) {
     while (romStack.length > 0) {
       const {objExpr, prefix} = romStack.pop();
       for (const prop of objExpr.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+        if (isObjectProp(prop) && prop.key) {
           const propName = propKeyName(prop.key);
           const val = prop.value;
           if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
@@ -1343,7 +1374,7 @@ function processVarDeclarator(node, env, ctx) {
       // Build a map of property names → taint values from the RHS literal
       const literalProps = new Map();
       for (const prop of node.init.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+        if (isObjectProp(prop) && prop.key) {
           const pName = propKeyName(prop.key);
           if (pName) literalProps.set(pName, evaluateExpr(prop.value, env, ctx));
         }
@@ -1509,7 +1540,7 @@ function processVarDeclarator(node, env, ctx) {
         const resolvedPath = `${resolvedObj}.${prop}`;
         const sourceTaint = checkMemberSource({ type: 'MemberExpression', object: { type: 'Identifier', name: resolvedObj }, property: node.init.property, computed: false });
         if (sourceTaint) {
-          const loc = node.init.loc?.start || {};
+          const loc = getNodeLoc(node.init);
           env.set(node.id.name, TaintSet.from(new TaintLabel(sourceTaint, ctx.file, loc.line || 0, loc.column || 0, resolvedPath)));
         }
       }
@@ -1809,7 +1840,7 @@ function processAssignment(node, env, ctx) {
     const leftStr = nodeToString(node.left);
     if (leftStr) {
       for (const prop of node.right.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+        if (isObjectProp(prop) && prop.key) {
           const propName = propKeyName(prop.key);
           const val = prop.value;
           if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
@@ -1871,7 +1902,7 @@ function processAssignment(node, env, ctx) {
           const paramName = handler.params[0].type === 'Identifier' ? handler.params[0].name : null;
           if (paramName) {
             const childEnv = env.child();
-            const loc = handler.loc?.start || {};
+            const loc = getNodeLoc(handler);
             const desc = originCheck === 'weak'
               ? `${paramName}.data (weak origin check)`
               : `${paramName}.data (no origin check)`;
@@ -2123,12 +2154,9 @@ function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
       // Note: isConstantBool returns false for null (falsy), so we can't use it directly.
       // Instead, resolve identifiers through scope and check the resolved node.
       let resolvedLn = ln;
-      if (ln.type === 'Identifier' && ln.name !== 'undefined' && ctx?.scopeInfo) {
-        const bindingKey = ctx.scopeInfo.resolve(ln);
-        if (bindingKey) {
-          const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-          if (declNode?.type === 'VariableDeclarator' && declNode.init) resolvedLn = declNode.init;
-        }
+      if (ln.type === 'Identifier' && ln.name !== 'undefined') {
+        const _init = resolveInitFromScope(ln, ctx);
+        if (_init) resolvedLn = _init;
       }
       const isNonNullishConst = (resolvedLn.type === 'StringLiteral') ||
         (resolvedLn.type === 'NumericLiteral') || (resolvedLn.type === 'BooleanLiteral') ||
@@ -2302,7 +2330,7 @@ export function evaluateExpr(node, env, ctx) {
               const prop = props[i];
               if (prop.type === 'SpreadElement')
                 W.push({ kind: W_EVAL_EXPR, node: prop.argument, env: _e, ctx: _c });
-              else if (prop.type === 'ObjectProperty' || prop.type === 'Property')
+              else if (isObjectProp(prop))
                 W.push({ kind: W_EVAL_EXPR, node: prop.value, env: _e, ctx: _c });
               else
                 W.push({ kind: W_EVAL_EXPR, node: null, env: _e, ctx: _c }); // safety
@@ -2540,7 +2568,7 @@ function evaluateMemberExpr(node, env, ctx) {
       }
     }
     if (sourceLabel) {
-      const loc = cur.loc?.start || {};
+      const loc = getNodeLoc(cur);
       return TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur)));
     }
 
@@ -2549,7 +2577,7 @@ function evaluateMemberExpr(node, env, ctx) {
     if (fullStr) {
       const resolvedStr = resolveAliasedPath(fullStr, env);
       if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
-        const loc = cur.loc?.start || {};
+        const loc = getNodeLoc(cur);
         return TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr));
       }
     }
@@ -2558,7 +2586,7 @@ function evaluateMemberExpr(node, env, ctx) {
       if (alias && cur.property) {
         const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
         if (MEMBER_SOURCES[deepPath]) {
-          const loc = cur.loc?.start || {};
+          const loc = getNodeLoc(cur);
           return TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath));
         }
       }
@@ -2611,7 +2639,7 @@ function evaluateComputedMember(node, objTaint, env, ctx) {
     let litKey = null;
     if (isStringLiteral(node.property)) {
       litKey = stringLiteralValue(node.property);
-    } else if (node.property.type === 'NumericLiteral' || (node.property.type === 'Literal' && typeof node.property.value === 'number')) {
+    } else if (isNumericLit(node.property)) {
       litKey = String(node.property.value);
     } else {
       // Try to resolve identifier to constant: obj[key] where key = 'prop'
@@ -2857,13 +2885,13 @@ function evaluateCallExpr(node, env, ctx) {
         const objKey = node.callee.object.type === 'Identifier' ? resolveId(node.callee.object, ctx) : objName;
         // Script element src
         if (attrName === 'src' && objName && (ctx.scriptElements.has(objKey) || ctx.scriptElements.has(objName))) {
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           ctx.findings.push({
             type: 'Script Injection',
             severity: 'critical',
             title: 'Script Injection: tainted data flows to script element src',
-            sink: { expression: `${objName}.setAttribute('src')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-            source: srcTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+            sink: makeSinkInfo(`${objName}.setAttribute('src')`, ctx, loc),
+            source: formatSources(srcTaint),
             path: buildTaintPath(srcTaint, `${objName}.setAttribute('src')`),
           });
         }
@@ -2875,13 +2903,13 @@ function evaluateCallExpr(node, env, ctx) {
           const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
           const isCss = attrName === 'style';
           const type = isCss ? 'CSS Injection' : 'XSS';
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           ctx.findings.push({
             type,
             severity: isCss ? 'high' : (isEventHandler ? 'critical' : 'high'),
             title: `${type}: tainted data flows to setAttribute('${attrName}')`,
-            sink: { expression: `${objName || 'element'}.setAttribute('${attrName}')`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-            source: srcTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+            sink: makeSinkInfo(`${objName || 'element'}.setAttribute('${attrName}')`, ctx, loc),
+            source: formatSources(srcTaint),
             path: buildTaintPath(srcTaint, `${objName || 'element'}.setAttribute('${attrName}')`),
           });
         }
@@ -2920,13 +2948,13 @@ function evaluateCallExpr(node, env, ctx) {
   if (isCalleeMatch(node, 'Object', 'setPrototypeOf', env) && node.arguments.length >= 2) {
     const protoTaint = argTaints[1];
     if (protoTaint && protoTaint.tainted) {
-      const loc = node.loc?.start || {};
+      const loc = getNodeLoc(node);
       ctx.findings.push({
         type: 'Prototype Pollution',
         severity: 'critical',
         title: 'Prototype Pollution: tainted data passed to Object.setPrototypeOf',
-        sink: { expression: 'Object.setPrototypeOf()', file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-        source: protoTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+        sink: makeSinkInfo('Object.setPrototypeOf()', ctx, loc),
+        source: formatSources(protoTaint),
         path: buildTaintPath(protoTaint, 'Object.setPrototypeOf()'),
       });
     }
@@ -2965,7 +2993,7 @@ function evaluateCallExpr(node, env, ctx) {
       const objStr = nodeToString(objNode);
       const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
       for (const prop of descNode.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+        if (isObjectProp(prop) && prop.key) {
           const descPropName = propKeyName(prop.key);
           if (descPropName === 'value') {
             const valTaint = evaluateExpr(prop.value, env, ctx);
@@ -3035,12 +3063,12 @@ function evaluateCallExpr(node, env, ctx) {
     if (descMapNode && descMapNode.type === 'ObjectExpression') {
       const resultTaint = TaintSet.empty();
       for (const prop of descMapNode.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key && prop.value) {
+        if (isObjectProp(prop) && prop.key && prop.value) {
           const propName = propKeyName(prop.key);
           if (propName && prop.value.type === 'ObjectExpression') {
             // Extract value from property descriptor: {value: ..., writable: ...}
             for (const descProp of prop.value.properties) {
-              if ((descProp.type === 'ObjectProperty' || descProp.type === 'Property') &&
+              if (isObjectProp(descProp) &&
                   descProp.key && (descProp.key.name === 'value' || descProp.key.value === 'value')) {
                 const valTaint = evaluateExpr(descProp.value, env, ctx);
                 if (valTaint.tainted) resultTaint.merge(valTaint);
@@ -3126,7 +3154,7 @@ function evaluateCallExpr(node, env, ctx) {
           if (srcNode.type === 'ObjectExpression') {
             for (const prop of srcNode.properties) {
               if (prop.type === 'SpreadElement') continue;
-              if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+              if (isObjectProp(prop) && prop.key) {
                 const propName = propKeyName(prop.key);
                 if (propName) {
                   const propTaint = evaluateExpr(prop.value, env, ctx);
@@ -3153,7 +3181,7 @@ function evaluateCallExpr(node, env, ctx) {
   }
 
   if (calleeStr && CALL_SOURCES[calleeStr] && CALL_SOURCES[calleeStr] !== 'passthrough') {
-    const loc = node.loc?.start || {};
+    const loc = getNodeLoc(node);
     return TaintSet.from(new TaintLabel(CALL_SOURCES[calleeStr], ctx.file, loc.line || 0, loc.column || 0, calleeStr + '()'));
   }
 
@@ -3256,7 +3284,7 @@ function evaluateNewExpr(node, env, ctx) {
   if (constructorName && CONSTRUCTOR_SOURCES[constructorName]) {
     const argTaint = argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
     if (argTaint.tainted) return argTaint;
-    const loc = node.loc?.start || {};
+    const loc = getNodeLoc(node);
     return TaintSet.from(new TaintLabel(CONSTRUCTOR_SOURCES[constructorName], ctx.file, loc.line || 0, loc.column || 0, `new ${constructorName}()`));
   }
 
@@ -3279,7 +3307,7 @@ function evaluateNewExpr(node, env, ctx) {
   // new Promise(function(resolve, reject) { resolve(tainted) }) → taint propagates to .then()
   if (isGlobalRef(node.callee, 'Promise', env) && node.arguments[0]) {
     let callback = node.arguments[0];
-    if (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression') {
+    if (isFuncExpr(callback)) {
       const childEnv = env.child();
       // The first param is `resolve` — calls to resolve(x) should capture x's taint as the promise's value
       // We analyze the callback body and track what resolve() is called with
@@ -3316,7 +3344,7 @@ function evaluateNewExpr(node, env, ctx) {
     // Extract detail taint from options object
     if (optionsNode && optionsNode.type === 'ObjectExpression') {
       for (const prop of optionsNode.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+        if (isObjectProp(prop) && prop.key) {
           const pname = propKeyName(prop.key);
           if (pname === 'detail') {
             const detailTaint = evaluateExpr(prop.value, env, ctx);
@@ -3337,7 +3365,7 @@ function evaluateNewExpr(node, env, ctx) {
     const targetNode = node.arguments[0];
     if (handlerNode.type === 'ObjectExpression') {
       for (const prop of handlerNode.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property' || prop.type === 'ObjectMethod') && prop.key) {
+        if ((isObjectProp(prop) || prop.type === 'ObjectMethod') && prop.key) {
           const pname = propKeyName(prop.key);
           if (pname === 'apply') {
             // Proxy with apply trap: resolve target function for callability
@@ -3602,7 +3630,7 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       // Analyze the callback: (accumulator, element, index, array) => ...
       // The accumulator starts with initial value (argTaints[1]) and merges with array elements
       const cbReduce = node.arguments[0];
-      if (cbReduce && (cbReduce.type === 'ArrowFunctionExpression' || cbReduce.type === 'FunctionExpression')) {
+      if (cbReduce && isFuncExpr(cbReduce)) {
         const childEnv = env.child();
         // accumulator param gets initial value taint + array element taint (conservative: any iteration can feed back)
         const accTaint = objTaint.clone().merge(argTaints[1] || TaintSet.empty());
@@ -3882,11 +3910,11 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       if (node.callee?.object) {
         const storageObj = node.callee.object;
         if (isGlobalRef(storageObj, 'localStorage', env)) {
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           return TaintSet.from(new TaintLabel('storage.local', ctx.file, loc.line || 0, loc.column || 0, 'localStorage.getItem()'));
         }
         if (isGlobalRef(storageObj, 'sessionStorage', env)) {
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           return TaintSet.from(new TaintLabel('storage.session', ctx.file, loc.line || 0, loc.column || 0, 'sessionStorage.getItem()'));
         }
       }
@@ -3901,11 +3929,11 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       if (node.callee?.object) {
         const storageObj = node.callee.object;
         if (isGlobalRef(storageObj, 'localStorage', env)) {
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           return TaintSet.from(new TaintLabel('storage.local', ctx.file, loc.line || 0, loc.column || 0, 'localStorage.getItem()'));
         }
         if (isGlobalRef(storageObj, 'sessionStorage', env)) {
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           return TaintSet.from(new TaintLabel('storage.session', ctx.file, loc.line || 0, loc.column || 0, 'sessionStorage.getItem()'));
         }
       }
@@ -4006,7 +4034,7 @@ function analyzeEventListener(node, argTaints, env, ctx) {
     const paramName = callback.params[0].type === 'Identifier' ? callback.params[0].name : null;
     if (paramName) {
       const evtSource = EVENT_SOURCES[eventName];
-      const loc = callback.loc?.start || {};
+      const loc = getNodeLoc(callback);
       const label = new TaintLabel(evtSource.label, ctx.file, loc.line || 0, loc.column || 0, `${paramName}.${evtSource.property}`);
       childEnv.set(`${paramName}.${evtSource.property}`, TaintSet.from(label));
       // Also taint the param itself so member access chains work
@@ -4020,7 +4048,7 @@ function analyzeEventListener(node, argTaints, env, ctx) {
     if (originCheck !== 'strong') {
       const paramName = callback.params[0].type === 'Identifier' ? callback.params[0].name : null;
       if (paramName) {
-        const loc = callback.loc?.start || {};
+        const loc = getNodeLoc(callback);
         const desc = originCheck === 'weak'
           ? `${paramName}.data (weak origin check)`
           : `${paramName}.data (no origin check)`;
@@ -4329,7 +4357,7 @@ function analyzePromiseCallback(node, argTaints, objTaint, env, ctx) {
 
   // .finally() does not receive the resolved value; it passes through the original taint
   if (methodName === 'finally') {
-    if (callback && (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression')) {
+    if (callback && isFuncExpr(callback)) {
       const childEnv = env.child();
       // finally callback gets no arguments — analyze for side effects only
       if (callback.body.type === 'BlockStatement') analyzeInlineFunction(callback, childEnv, ctx);
@@ -4645,7 +4673,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
           const ref = ctx.funcMap.get(resolveId(branch, ctx)) || ctx.funcMap.get(branch.name);
           if (ref) { funcNode = ref; break; }
         }
-        if (branch.type === 'ArrowFunctionExpression' || branch.type === 'FunctionExpression') {
+        if (isFuncExpr(branch)) {
           funcNode = branch; break;
         }
       }
@@ -4658,7 +4686,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     const methodName = callNode.callee.property?.name;
     if (methodName) {
       for (const prop of callNode.callee.object.properties) {
-        if ((prop.type === 'ObjectProperty' || prop.type === 'Property' || prop.type === 'ObjectMethod') && prop.key) {
+        if ((isObjectProp(prop) || prop.type === 'ObjectMethod') && prop.key) {
           const pName = propKeyName(prop.key);
           if (pName === methodName) {
             funcNode = prop.type === 'ObjectMethod' ? prop : prop.value;
@@ -4764,7 +4792,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   if (funcNode._boundThisNode) {
     const objNode = funcNode._boundThisNode;
     for (const prop of objNode.properties || []) {
-      if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+      if (isObjectProp(prop) && prop.key) {
         const propName = propKeyName(prop.key);
         if (propName && prop.value) {
           const propTaint = evaluateExpr(prop.value, env, ctx);
@@ -4818,7 +4846,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       }
       if (argNode.type === 'ObjectExpression') {
         for (const prop of argNode.properties) {
-          if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+          if (isObjectProp(prop) && prop.key) {
             const pName = propKeyName(prop.key);
             const val = prop.value;
             if (pName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
@@ -4851,7 +4879,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
           } else if (argNode.type === 'ObjectExpression') {
             const literalProps = new Map();
             for (const prop of argNode.properties) {
-              if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.key) {
+              if (isObjectProp(prop) && prop.key) {
                 const pName = propKeyName(prop.key);
                 if (pName) literalProps.set(pName, evaluateExpr(prop.value, childEnv, ctx));
               }
@@ -5128,7 +5156,7 @@ function collectClosureTaint(root, env, ctx, taintOut, visited) {
         // Also check if this member expression is a taint source (e.g., location.hash)
         const sourceLabel = checkMemberSource(node);
         if (sourceLabel) {
-          const loc = node.loc?.start || {};
+          const loc = getNodeLoc(node);
           taintOut.merge(TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, str)));
           continue;
         }
@@ -5190,13 +5218,13 @@ function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
   // Check if the object is a known script element
   const objKey = leftNode.object.type === 'Identifier' ? resolveId(leftNode.object, ctx) : objName;
   if (!ctx.scriptElements.has(objKey) && !ctx.scriptElements.has(objName)) return;
-  const loc = leftNode.loc?.start || {};
+  const loc = getNodeLoc(leftNode);
   ctx.findings.push({
     type: 'Script Injection',
     severity: 'critical',
     title: `Script Injection: tainted data flows to script element ${propName}`,
-    sink: { expression: `${objName}.${propName}`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-    source: rhsTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+    sink: makeSinkInfo(`${objName}.${propName}`, ctx, loc),
+    source: formatSources(rhsTaint),
     path: buildTaintPath(rhsTaint, `${objName}.${propName}`),
   });
 }
@@ -5219,14 +5247,7 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
         } else {
           // Conservative: resolve through scope to find the init expression
           // If it's a ternary, check if either branch is a sink name
-          let initNode = prop;
-          if (prop.type === 'Identifier' && ctx?.scopeInfo) {
-            const bindingKey = ctx.scopeInfo.resolve(prop);
-            if (bindingKey) {
-              const declNode = ctx.scopeInfo.bindingNodes.get(bindingKey);
-              if (declNode?.type === 'VariableDeclarator' && declNode.init) initNode = declNode.init;
-            }
-          }
+          let initNode = resolveInitFromScope(prop, ctx) || prop;
           if (initNode.type === 'ConditionalExpression') {
             const consResolved = resolveToConstant(initNode.consequent, env, ctx);
             const altResolved = resolveToConstant(initNode.alternate, env, ctx);
@@ -5247,14 +5268,14 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
   if (sinkInfo.navigation && isSelfRedirect(sinkInfo, rhsNode)) return;
 
   const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
-  const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
-  const loc = leftNode.loc?.start || {};
+  const severity = getSeverity(type);
+  const loc = getNodeLoc(leftNode);
   ctx.findings.push({
     type,
     severity,
     title: `${type}: tainted data flows to ${leftStr || propName}`,
-    sink: { expression: leftStr || propName, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-    source: rhsTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+    sink: makeSinkInfo(leftStr || propName, ctx, loc),
+    source: formatSources(rhsTaint),
     path: buildTaintPath(rhsTaint, leftStr || propName),
   });
 }
@@ -5281,21 +5302,21 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
 
     if (sinkInfo.stringOnly && callNode.arguments[argIdx]) {
       const argNode = callNode.arguments[argIdx];
-      if (argNode.type === 'ArrowFunctionExpression' || argNode.type === 'FunctionExpression') continue;
+      if (isFuncExpr(argNode)) continue;
     }
 
     // Skip self-redirect patterns: location.replace(self.location.href)
     if (isSelfRedirect(sinkInfo, callNode.arguments[argIdx])) continue;
 
     const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
-    const severity = type === 'Open Redirect' ? 'high' : (type === 'XSS' ? 'critical' : 'high');
-    const loc = callNode.loc?.start || {};
+    const severity = getSeverity(type);
+    const loc = getNodeLoc(callNode);
     ctx.findings.push({
       type,
       severity,
       title: `${type}: tainted data flows to ${calleeStr}()`,
-      sink: { expression: `${calleeStr}(arg${argIdx})`, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-      source: argTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+      sink: makeSinkInfo(`${calleeStr}(arg${argIdx})`, ctx, loc),
+      source: formatSources(argTaint),
       path: buildTaintPath(argTaint, calleeStr),
     });
   }
@@ -5313,13 +5334,13 @@ export function checkPrototypePollution(node, env, ctx) {
     const innerKey = evaluateExpr(left.property, env, ctx);
 
     if (outerKey.tainted && innerKey.tainted) {
-      const loc = node.loc?.start || {};
+      const loc = getNodeLoc(node);
       ctx.findings.push({
         type: 'Prototype Pollution',
         severity: 'critical',
         title: 'Prototype Pollution: attacker controls nested property keys',
-        sink: { expression: nodeToString(left) || 'obj[key1][key2]', file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-        source: outerKey.clone().merge(innerKey).toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+        sink: makeSinkInfo(nodeToString(left) || 'obj[key1][key2]', ctx, loc),
+        source: formatSources(outerKey.clone().merge(innerKey)),
         path: buildTaintPath(outerKey.clone().merge(innerKey), 'obj[key1][key2]'),
       });
     }
@@ -5340,7 +5361,7 @@ export function checkPrototypePollution(node, env, ctx) {
       const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
       const combinedTaint = rhsTaint.tainted ? rhsTaint : keyTaint;
       if (combinedTaint.tainted) {
-        const loc = node.loc?.start || {};
+        const loc = getNodeLoc(node);
         const expr = nodeToString(left) || `obj.${objProp}.prop`;
         const title = keyTaint.tainted
           ? `Prototype Pollution: attacker controls property key on ${objProp}`
@@ -5349,8 +5370,8 @@ export function checkPrototypePollution(node, env, ctx) {
           type: 'Prototype Pollution',
           severity: 'critical',
           title,
-          sink: { expression: expr, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-          source: combinedTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+          sink: makeSinkInfo(expr, ctx, loc),
+          source: formatSources(combinedTaint),
           path: buildTaintPath(combinedTaint, expr),
         });
       }
@@ -5363,14 +5384,14 @@ export function checkPrototypePollution(node, env, ctx) {
       left.object.object.property?.name === 'constructor') {
     const keyTaint = evaluateExpr(left.property, env, ctx);
     if (keyTaint.tainted) {
-      const loc = node.loc?.start || {};
+      const loc = getNodeLoc(node);
       const expr = nodeToString(left) || 'obj.constructor.prototype[key]';
       ctx.findings.push({
         type: 'Prototype Pollution',
         severity: 'critical',
         title: 'Prototype Pollution: attacker controls property key on constructor.prototype',
-        sink: { expression: expr, file: ctx.file, line: loc.line || 0, col: loc.column || 0 },
-        source: keyTaint.toArray().map(l => ({ type: l.sourceType, description: l.description, file: l.file, line: l.line })),
+        sink: makeSinkInfo(expr, ctx, loc),
+        source: formatSources(keyTaint),
         path: buildTaintPath(keyTaint, expr),
       });
     }

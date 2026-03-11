@@ -14,6 +14,14 @@ export function buildScopeInfo(ast) {
   const bindingScopes = new Map();    // bindingKey → scope uid
   const bindingNodes = new Map();     // bindingKey → declaration node
 
+  function mapBinding(node, scope) {
+    if (nodeBindingMap.has(node)) return;
+    const binding = scope.getBinding(node.name);
+    if (binding) {
+      nodeBindingMap.set(node, `${binding.scope.uid}:${node.name}`);
+    }
+  }
+
   traverse(ast, {
     // Capture all scope-creating nodes to register bindings
     Scope(path) {
@@ -62,25 +70,12 @@ export function buildScopeInfo(ast) {
 
     // Capture identifiers in all references
     ReferencedIdentifier(path) {
-      if (nodeBindingMap.has(path.node)) return; // already mapped
-
-      const binding = path.scope.getBinding(path.node.name);
-      if (binding) {
-        const key = `${binding.scope.uid}:${path.node.name}`;
-        nodeBindingMap.set(path.node, key);
-      }
-      // If no binding found, it's a global — use 'global:name'
+      mapBinding(path.node, path.scope);
     },
 
     // Capture identifiers in binding declarations (let x = ...)
     BindingIdentifier(path) {
-      if (nodeBindingMap.has(path.node)) return;
-
-      const binding = path.scope.getBinding(path.node.name);
-      if (binding) {
-        const key = `${binding.scope.uid}:${path.node.name}`;
-        nodeBindingMap.set(path.node, key);
-      }
+      mapBinding(path.node, path.scope);
     },
   });
 
