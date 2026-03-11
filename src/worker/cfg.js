@@ -219,7 +219,7 @@ function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
             const exitBlock = cfg.createBlock();
             f.cur.addNode(stmt.right);
             f.cur.connect(headerBlock);
-            headerBlock.addNode({ type: '_ForInOf', left: stmt.left, right: stmt.right, loc: stmt.loc });
+            headerBlock.addNode({ type: '_ForInOf', left: stmt.left, right: stmt.right, loc: stmt.loc, _isForIn: stmt.type === 'ForInStatement' });
             headerBlock.connect(bodyBlock);
             headerBlock.connect(exitBlock);
             ctx.pushLoop(exitBlock, headerBlock, null);

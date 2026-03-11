@@ -1742,13 +1742,21 @@ function processAssignment(node, env, ctx) {
         finalTaint = leftTaint.clone().merge(rhsTaint);
       }
     } else if (node.operator === '&&=') {
-      // x &&= rhs: only assigns if x is truthy
-      // If left is a known falsy constant, skip assignment
+      // x &&= rhs: only assigns if x is truthy → result is rhs
+      // If left is a known falsy constant, skip assignment (result is left)
       const leftConst = resolveToConstant(node.left, env, ctx);
       if (leftConst !== undefined && !leftConst) {
-        // Left is falsy string ('') → skip assignment
+        // Left is falsy → short-circuit, keep left taint
         finalTaint = leftTaint.clone();
+      } else if (leftConst !== undefined && leftConst) {
+        // Left is truthy constant → result is RHS value
+        finalTaint = rhsTaint.clone();
+      } else if (leftTaint.tainted) {
+        // Left is tainted (source strings are always truthy non-empty strings)
+        // → result is RHS value
+        finalTaint = rhsTaint.clone();
       } else {
+        // Unknown → conservative merge
         finalTaint = leftTaint.clone().merge(rhsTaint);
       }
     }
@@ -3561,13 +3569,32 @@ function evaluateNewExpr(node, env, ctx) {
         if ((isObjectProp(prop) || prop.type === 'ObjectMethod') && prop.key) {
           const pname = propKeyName(prop.key);
           if (pname === 'apply') {
-            // Proxy with apply trap: resolve target function for callability
-            if (targetNode?.type === 'Identifier') {
-              const targetFunc = ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name);
-              if (targetFunc) ctx.returnedFuncNode = targetFunc;
-            }
-            if (targetNode?.type === 'FunctionExpression' || targetNode?.type === 'ArrowFunctionExpression') {
-              ctx.returnedFuncNode = targetNode;
+            // Proxy with apply trap: handler.apply(target, thisArg, argumentsList)
+            // Register the apply trap itself so calls to proxy invoke it
+            const applyFunc = prop.type === 'ObjectMethod' ? prop : prop.value;
+            if (applyFunc && (applyFunc.type === 'FunctionExpression' || applyFunc.type === 'ArrowFunctionExpression' || applyFunc.type === 'ObjectMethod')) {
+              applyFunc._isProxyApplyTrap = true;
+              applyFunc._closureEnv = env;
+              // Bind the target function to the 1st param so t() resolves inside the trap
+              if (targetNode) {
+                const targetFunc = targetNode.type === 'Identifier'
+                  ? (ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name))
+                  : (targetNode.type === 'FunctionExpression' || targetNode.type === 'ArrowFunctionExpression' ? targetNode : null);
+                if (targetFunc && applyFunc.params?.length >= 1 && applyFunc.params[0].type === 'Identifier') {
+                  applyFunc._proxyTargetParam = applyFunc.params[0].name;
+                  applyFunc._proxyTargetFunc = targetFunc;
+                }
+              }
+              ctx.returnedFuncNode = applyFunc;
+            } else {
+              // Fallback: resolve target function for callability
+              if (targetNode?.type === 'Identifier') {
+                const targetFunc = ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name);
+                if (targetFunc) ctx.returnedFuncNode = targetFunc;
+              }
+              if (targetNode?.type === 'FunctionExpression' || targetNode?.type === 'ArrowFunctionExpression') {
+                ctx.returnedFuncNode = targetNode;
+              }
             }
           }
           if (pname === 'construct') {
@@ -3610,11 +3637,20 @@ function evaluateNewExpr(node, env, ctx) {
       // Resolve apply trap
       if (!ctx.returnedFuncNode) {
         const applyFunc = ctx.funcMap.get(`${handlerName}.apply`) || ctx.funcMap.get(`${resolvedName}.apply`);
-        if (applyFunc) {
-          if (targetNode?.type === 'Identifier') {
-            const targetFunc = ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name);
-            if (targetFunc) ctx.returnedFuncNode = targetFunc;
+        if (applyFunc && (applyFunc.type === 'FunctionExpression' || applyFunc.type === 'ArrowFunctionExpression' || applyFunc.type === 'FunctionDeclaration' || applyFunc.type === 'ObjectMethod')) {
+          applyFunc._isProxyApplyTrap = true;
+          applyFunc._closureEnv = env;
+          // Bind the target function to the 1st param so target() resolves inside the trap
+          if (targetNode) {
+            const targetFunc = targetNode.type === 'Identifier'
+              ? (ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name))
+              : (targetNode.type === 'FunctionExpression' || targetNode.type === 'ArrowFunctionExpression' ? targetNode : null);
+            if (targetFunc && applyFunc.params?.length >= 1 && applyFunc.params[0].type === 'Identifier') {
+              applyFunc._proxyTargetParam = applyFunc.params[0].name;
+              applyFunc._proxyTargetFunc = targetFunc;
+            }
           }
+          ctx.returnedFuncNode = applyFunc;
         }
       }
       // Resolve get trap
@@ -4025,6 +4061,31 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
       const restArgTaints = argTaints.slice(1);
       const calleeObj = node.callee?.object;
       const protoMethod = calleeObj ? nodeToString(calleeObj) : null;
+
+      // Handle Function.prototype.call.call(targetFn, thisArg, ...args) first
+      // This is .call() called on .call itself: 1st arg is the target function
+      if (protoMethod && /\.call$/.test(protoMethod) && node.arguments?.length >= 1) {
+        const targetArg = node.arguments[0];
+        if (targetArg.type === 'Identifier') {
+          const targetName = targetArg.name;
+          const aliasedName = env.aliases?.get(targetName) || targetName;
+          const sinkArgTaints = argTaints.slice(2);
+          // Check if target is a sink (eval, setTimeout, etc.)
+          const sinkInfo = checkCallSink(aliasedName, aliasedName);
+          if (sinkInfo) {
+            const sinkCall = { ...node, callee: targetArg, arguments: node.arguments.slice(2) };
+            checkSinkCall(sinkCall, sinkInfo, sinkArgTaints, aliasedName, env, ctx);
+          }
+          // Also try interprocedural
+          const targetFunc = ctx.funcMap.get(resolveId(targetArg, ctx)) || ctx.funcMap.get(targetName);
+          if (targetFunc && targetFunc.body) {
+            const synthCall2 = { ...node, callee: targetArg, arguments: node.arguments.slice(2) };
+            return analyzeCalledFunction(synthCall2, targetName, sinkArgTaints, env, ctx);
+          }
+          return sinkArgTaints.reduce((a, t) => a.merge(t), TaintSet.empty());
+        }
+      }
+
       if (protoMethod) {
         // Extract the terminal method name by walking the AST MemberExpression chain
         // instead of string-splitting: Array.prototype.join → property 'join'
@@ -5064,8 +5125,31 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     funcNode._boundArgs = null;
   }
 
+  // Proxy apply trap: handler(target, thisArg, argumentsList)
+  // Remap call args → 3rd parameter (argumentsList array)
+  if (funcNode._isProxyApplyTrap) {
+    const originalArgTaints = argTaints;
+    argTaints = [TaintSet.empty(), TaintSet.empty()]; // target, thisArg
+    const mergedArgs = originalArgTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
+    argTaints.push(mergedArgs); // argumentsList
+    // Synthesize call arguments to match params count
+    const synthArgs = [
+      { type: 'NullLiteral' },
+      { type: 'NullLiteral' },
+      { type: 'ArrayExpression', elements: callNode.arguments || [] },
+    ];
+    callNode = { ...callNode, arguments: synthArgs };
+    // Set per-index taints for argumentsList so args[0], args[1] resolve
+    funcNode._proxyApplyArgTaints = originalArgTaints;
+  }
+
   // Store function expression arguments in funcMap so they can be called inside the body
   const innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
+
+  // Proxy apply trap: bind target function to 1st param name so t() resolves inside trap body
+  if (funcNode._isProxyApplyTrap && funcNode._proxyTargetFunc && funcNode._proxyTargetParam) {
+    innerFuncMap.set(funcNode._proxyTargetParam, funcNode._proxyTargetFunc);
+  }
 
   // Copy obj.* funcMap entries to this.* so method bodies can resolve this.prop functions
   if (_methodObjName) {
@@ -5172,6 +5256,19 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         }
       }
     }
+  }
+
+  // Proxy apply trap: set per-index taints on the argumentsList param
+  if (funcNode._isProxyApplyTrap && funcNode._proxyApplyArgTaints) {
+    const argsParam = funcNode.params.length >= 3 && funcNode.params[2].type === 'Identifier'
+      ? funcNode.params[2].name : null;
+    if (argsParam) {
+      const proxyArgTaints = funcNode._proxyApplyArgTaints;
+      for (let ai = 0; ai < proxyArgTaints.length; ai++) {
+        childEnv.set(`${argsParam}.#idx_${ai}`, proxyArgTaints[ai] || TaintSet.empty());
+      }
+    }
+    funcNode._proxyApplyArgTaints = null;
   }
 
   // Bind `arguments` object — merge all arg taints so arguments[n] resolves
@@ -5358,6 +5455,15 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
 // ── For-in/of binding ──
 function processForBinding(node, env, ctx) {
+  // For-in yields string property keys (always safe), not values
+  if (node._isForIn) {
+    if (node.left.type === 'VariableDeclaration') {
+      for (const decl of node.left.declarations) assignToPattern(decl.id, TaintSet.empty(), env, ctx);
+    } else {
+      assignToPattern(node.left, TaintSet.empty(), env, ctx);
+    }
+    return;
+  }
   let iterableTaint = evaluateExpr(node.right, env, ctx);
   // For Maps/objects with per-key taint, merge per-key entries into iterable taint
   const iterStr = nodeToString(node.right);
@@ -5467,7 +5573,31 @@ function classifyNavigationType(sinkInfo, env, rhsNode, ctx) {
     }
   }
 
+  // Check if RHS is a concatenation with a safe URL scheme prefix literal
+  // e.g., "https://safe.com/" + tainted → Open Redirect (not XSS)
+  if (rhsNode) {
+    const leftmostLiteral = getLeftmostStringLiteral(rhsNode);
+    if (leftmostLiteral !== null && /^https?:\/\//i.test(leftmostLiteral)) {
+      return 'Open Redirect';
+    }
+  }
+
   return sinkInfo.type; // default: XSS
+}
+
+// Walk leftward through BinaryExpression(+) / TemplateLiteral to find the leftmost string literal
+function getLeftmostStringLiteral(node) {
+  if (!node) return null;
+  if (node.type === 'StringLiteral' || (node.type === 'Literal' && typeof node.value === 'string')) {
+    return node.value;
+  }
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    return getLeftmostStringLiteral(node.left);
+  }
+  if (node.type === 'TemplateLiteral' && node.quasis.length > 0 && node.quasis[0].value) {
+    return node.quasis[0].value.raw || node.quasis[0].value.cooked || '';
+  }
+  return null;
 }
 
 // ── Script element sink: el.src = tainted when el is createElement('script') ──

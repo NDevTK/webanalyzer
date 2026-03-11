@@ -43393,7 +43393,7 @@ ${rootStack}`;
               const exitBlock = cfg.createBlock();
               f.cur.addNode(stmt.right);
               f.cur.connect(headerBlock);
-              headerBlock.addNode({ type: "_ForInOf", left: stmt.left, right: stmt.right, loc: stmt.loc });
+              headerBlock.addNode({ type: "_ForInOf", left: stmt.left, right: stmt.right, loc: stmt.loc, _isForIn: stmt.type === "ForInStatement" });
               headerBlock.connect(bodyBlock);
               headerBlock.connect(exitBlock);
               ctx.pushLoop(exitBlock, headerBlock, null);
@@ -45363,6 +45363,10 @@ ${rootStack}`;
         const leftConst = resolveToConstant(node.left, env, ctx);
         if (leftConst !== void 0 && !leftConst) {
           finalTaint = leftTaint.clone();
+        } else if (leftConst !== void 0 && leftConst) {
+          finalTaint = rhsTaint.clone();
+        } else if (leftTaint.tainted) {
+          finalTaint = rhsTaint.clone();
         } else {
           finalTaint = leftTaint.clone().merge(rhsTaint);
         }
@@ -47014,12 +47018,26 @@ ${rootStack}`;
           if ((isObjectProp(prop) || prop.type === "ObjectMethod") && prop.key) {
             const pname = propKeyName(prop.key);
             if (pname === "apply") {
-              if (targetNode?.type === "Identifier") {
-                const targetFunc = ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name);
-                if (targetFunc) ctx.returnedFuncNode = targetFunc;
-              }
-              if (targetNode?.type === "FunctionExpression" || targetNode?.type === "ArrowFunctionExpression") {
-                ctx.returnedFuncNode = targetNode;
+              const applyFunc = prop.type === "ObjectMethod" ? prop : prop.value;
+              if (applyFunc && (applyFunc.type === "FunctionExpression" || applyFunc.type === "ArrowFunctionExpression" || applyFunc.type === "ObjectMethod")) {
+                applyFunc._isProxyApplyTrap = true;
+                applyFunc._closureEnv = env;
+                if (targetNode) {
+                  const targetFunc = targetNode.type === "Identifier" ? ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name) : targetNode.type === "FunctionExpression" || targetNode.type === "ArrowFunctionExpression" ? targetNode : null;
+                  if (targetFunc && applyFunc.params?.length >= 1 && applyFunc.params[0].type === "Identifier") {
+                    applyFunc._proxyTargetParam = applyFunc.params[0].name;
+                    applyFunc._proxyTargetFunc = targetFunc;
+                  }
+                }
+                ctx.returnedFuncNode = applyFunc;
+              } else {
+                if (targetNode?.type === "Identifier") {
+                  const targetFunc = ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name);
+                  if (targetFunc) ctx.returnedFuncNode = targetFunc;
+                }
+                if (targetNode?.type === "FunctionExpression" || targetNode?.type === "ArrowFunctionExpression") {
+                  ctx.returnedFuncNode = targetNode;
+                }
               }
             }
             if (pname === "construct") {
@@ -47057,11 +47075,17 @@ ${rootStack}`;
         }
         if (!ctx.returnedFuncNode) {
           const applyFunc = ctx.funcMap.get(`${handlerName}.apply`) || ctx.funcMap.get(`${resolvedName}.apply`);
-          if (applyFunc) {
-            if (targetNode?.type === "Identifier") {
-              const targetFunc = ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name);
-              if (targetFunc) ctx.returnedFuncNode = targetFunc;
+          if (applyFunc && (applyFunc.type === "FunctionExpression" || applyFunc.type === "ArrowFunctionExpression" || applyFunc.type === "FunctionDeclaration" || applyFunc.type === "ObjectMethod")) {
+            applyFunc._isProxyApplyTrap = true;
+            applyFunc._closureEnv = env;
+            if (targetNode) {
+              const targetFunc = targetNode.type === "Identifier" ? ctx.funcMap.get(resolveId(targetNode, ctx)) || ctx.funcMap.get(targetNode.name) : targetNode.type === "FunctionExpression" || targetNode.type === "ArrowFunctionExpression" ? targetNode : null;
+              if (targetFunc && applyFunc.params?.length >= 1 && applyFunc.params[0].type === "Identifier") {
+                applyFunc._proxyTargetParam = applyFunc.params[0].name;
+                applyFunc._proxyTargetFunc = targetFunc;
+              }
             }
+            ctx.returnedFuncNode = applyFunc;
           }
         }
         const getFunc = ctx.funcMap.get(`${handlerName}.get`) || ctx.funcMap.get(`${resolvedName}.get`);
@@ -47401,6 +47425,25 @@ ${rootStack}`;
         const restArgTaints = argTaints.slice(1);
         const calleeObj = node.callee?.object;
         const protoMethod = calleeObj ? nodeToString(calleeObj) : null;
+        if (protoMethod && /\.call$/.test(protoMethod) && node.arguments?.length >= 1) {
+          const targetArg = node.arguments[0];
+          if (targetArg.type === "Identifier") {
+            const targetName = targetArg.name;
+            const aliasedName = env.aliases?.get(targetName) || targetName;
+            const sinkArgTaints = argTaints.slice(2);
+            const sinkInfo = checkCallSink(aliasedName, aliasedName);
+            if (sinkInfo) {
+              const sinkCall = { ...node, callee: targetArg, arguments: node.arguments.slice(2) };
+              checkSinkCall(sinkCall, sinkInfo, sinkArgTaints, aliasedName, env, ctx);
+            }
+            const targetFunc = ctx.funcMap.get(resolveId(targetArg, ctx)) || ctx.funcMap.get(targetName);
+            if (targetFunc && targetFunc.body) {
+              const synthCall2 = { ...node, callee: targetArg, arguments: node.arguments.slice(2) };
+              return analyzeCalledFunction(synthCall2, targetName, sinkArgTaints, env, ctx);
+            }
+            return sinkArgTaints.reduce((a, t) => a.merge(t), TaintSet.empty());
+          }
+        }
         if (protoMethod) {
           let method;
           if (calleeObj.type === "MemberExpression" || calleeObj.type === "OptionalMemberExpression") {
@@ -48238,7 +48281,23 @@ ${rootStack}`;
       callNode = { ...callNode, arguments: [...boundArgNodes, ...callNode.arguments || []] };
       funcNode._boundArgs = null;
     }
+    if (funcNode._isProxyApplyTrap) {
+      const originalArgTaints = argTaints;
+      argTaints = [TaintSet.empty(), TaintSet.empty()];
+      const mergedArgs = originalArgTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
+      argTaints.push(mergedArgs);
+      const synthArgs = [
+        { type: "NullLiteral" },
+        { type: "NullLiteral" },
+        { type: "ArrayExpression", elements: callNode.arguments || [] }
+      ];
+      callNode = { ...callNode, arguments: synthArgs };
+      funcNode._proxyApplyArgTaints = originalArgTaints;
+    }
     const innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
+    if (funcNode._isProxyApplyTrap && funcNode._proxyTargetFunc && funcNode._proxyTargetParam) {
+      innerFuncMap.set(funcNode._proxyTargetParam, funcNode._proxyTargetFunc);
+    }
     if (_methodObjName) {
       const objPrefix = `${_methodObjName}.`;
       for (const [key, val] of ctx.funcMap) {
@@ -48342,6 +48401,16 @@ ${rootStack}`;
           }
         }
       }
+    }
+    if (funcNode._isProxyApplyTrap && funcNode._proxyApplyArgTaints) {
+      const argsParam = funcNode.params.length >= 3 && funcNode.params[2].type === "Identifier" ? funcNode.params[2].name : null;
+      if (argsParam) {
+        const proxyArgTaints = funcNode._proxyApplyArgTaints;
+        for (let ai = 0; ai < proxyArgTaints.length; ai++) {
+          childEnv.set(`${argsParam}.#idx_${ai}`, proxyArgTaints[ai] || TaintSet.empty());
+        }
+      }
+      funcNode._proxyApplyArgTaints = null;
     }
     const argsMerged = TaintSet.empty();
     for (const t of argTaints) argsMerged.merge(t);
@@ -48482,6 +48551,14 @@ ${rootStack}`;
     return _runIPLoop([frame]);
   }
   function processForBinding(node, env, ctx) {
+    if (node._isForIn) {
+      if (node.left.type === "VariableDeclaration") {
+        for (const decl of node.left.declarations) assignToPattern(decl.id, TaintSet.empty(), env, ctx);
+      } else {
+        assignToPattern(node.left, TaintSet.empty(), env, ctx);
+      }
+      return;
+    }
     let iterableTaint = evaluateExpr(node.right, env, ctx);
     const iterStr = nodeToString(node.right);
     if (iterStr) {
@@ -48573,7 +48650,26 @@ ${rootStack}`;
         if (env.schemeCheckedVars.has(`global:${rhsNode.name}`)) return "Open Redirect";
       }
     }
+    if (rhsNode) {
+      const leftmostLiteral = getLeftmostStringLiteral(rhsNode);
+      if (leftmostLiteral !== null && /^https?:\/\//i.test(leftmostLiteral)) {
+        return "Open Redirect";
+      }
+    }
     return sinkInfo.type;
+  }
+  function getLeftmostStringLiteral(node) {
+    if (!node) return null;
+    if (node.type === "StringLiteral" || node.type === "Literal" && typeof node.value === "string") {
+      return node.value;
+    }
+    if (node.type === "BinaryExpression" && node.operator === "+") {
+      return getLeftmostStringLiteral(node.left);
+    }
+    if (node.type === "TemplateLiteral" && node.quasis.length > 0 && node.quasis[0].value) {
+      return node.quasis[0].value.raw || node.quasis[0].value.cooked || "";
+    }
+    return null;
   }
   function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
     if (!rhsTaint.tainted) return;
