@@ -2922,17 +2922,26 @@ function evaluateCallExpr(node, env, ctx) {
   if ((isCalleeIdentifier(node, 'setTimeout', env) || isCalleeIdentifier(node, 'setInterval', env) ||
        isCalleeIdentifier(node, 'queueMicrotask', env) || isCalleeIdentifier(node, 'requestAnimationFrame', env)) && node.arguments[0]) {
     let callback = node.arguments[0];
+    const origCallbackName = callback.type === 'Identifier' ? callback.name : null;
     if (callback.type === 'Identifier') {
       const refKey = resolveId(callback, ctx);
       callback = ctx.funcMap.get(refKey) || ctx.funcMap.get(callback.name) || callback;
     }
     if (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression' ||
         callback.type === 'FunctionDeclaration') {
-      const childEnv = (callback._closureEnv || env).child();
-      if (callback.body.type === 'BlockStatement') {
-        analyzeInlineFunction(callback, childEnv, ctx);
+      // Guard against infinite recursion: skip if this callback is already being analyzed
+      // (e.g., function retry() { setTimeout(retry, 100) })
+      const cbKey = origCallbackName ? `timer:${origCallbackName}` : (callback.loc ? `timer:${callback.loc.start.line}:${callback.loc.start.column}` : null);
+      if (cbKey && ctx.analyzedCalls.has(cbKey)) {
+        // already analyzed — skip to avoid infinite loop
       } else {
-        evaluateExpr(callback.body, childEnv, ctx);
+        if (cbKey) ctx.analyzedCalls.set(cbKey, TaintSet.empty());
+        const childEnv = (callback._closureEnv || env).child();
+        if (callback.body.type === 'BlockStatement') {
+          analyzeInlineFunction(callback, childEnv, ctx);
+        } else {
+          evaluateExpr(callback.body, childEnv, ctx);
+        }
       }
     }
   }
