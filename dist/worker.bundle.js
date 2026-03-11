@@ -47019,14 +47019,16 @@ ${rootStack}`;
         return cbTaint;
       }
       case "findIndex":
+        analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
+        return TaintSet.empty();
       case "indexOf":
       case "lastIndexOf":
-        analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
         return TaintSet.empty();
       case "some":
       case "every":
-      case "includes":
         analyzeArrayCallback(node, argTaints, objTaint, env, ctx);
+        return TaintSet.empty();
+      case "includes":
         return TaintSet.empty();
       case "reduce":
       case "reduceRight": {
