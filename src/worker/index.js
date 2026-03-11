@@ -256,7 +256,8 @@ async function runCrossFileAnalysis(tabId) {
     const importEnv = resolveImportTaint(page, url, imports);
 
     // Only re-analyze if import taint has changed
-    const hasNewTaint = [...importEnv.bindings.values()].some(t => t.tainted);
+    let hasNewTaint = false;
+    for (const [, t] of importEnv.entries()) { if (t.tainted) { hasNewTaint = true; break; } }
     if (!hasNewTaint) continue;
 
     const funcMap = new Map(page.globalFuncMap);

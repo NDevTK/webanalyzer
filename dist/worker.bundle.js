@@ -43868,25 +43868,29 @@ ${rootStack}`;
       return `${this.sourceType}@${this.file}:${this.line}:${this.col}`;
     }
   };
+  var _EMPTY_MAP = Object.freeze(/* @__PURE__ */ new Map());
   var TaintSet = class _TaintSet {
     constructor(labels) {
-      this.labels = labels || /* @__PURE__ */ new Map();
+      this.labels = labels || null;
     }
     get tainted() {
-      return this.labels.size > 0;
+      return this.labels !== null && this.labels.size > 0;
     }
     get size() {
-      return this.labels.size;
+      return this.labels !== null ? this.labels.size : 0;
     }
     add(label) {
+      if (this.labels === null) this.labels = /* @__PURE__ */ new Map();
       this.labels.set(label.id, label);
     }
     merge(other) {
-      if (!other) return this;
+      if (!other || other.labels === null || other.labels.size === 0) return this;
+      if (this.labels === null) this.labels = /* @__PURE__ */ new Map();
       for (const [id, label] of other.labels) this.labels.set(id, label);
       return this;
     }
     clone() {
+      if (this.labels === null || this.labels.size === 0) return new _TaintSet();
       return new _TaintSet(new Map(this.labels));
     }
     static empty() {
@@ -43898,20 +43902,81 @@ ${rootStack}`;
       return ts;
     }
     equals(other) {
-      if (!other) return this.labels.size === 0;
-      if (this.labels.size !== other.labels.size) return false;
+      const thisSize = this.labels !== null ? this.labels.size : 0;
+      const otherSize = other && other.labels !== null ? other.labels.size : 0;
+      if (thisSize !== otherSize) return false;
+      if (thisSize === 0) return true;
       for (const id of this.labels.keys()) {
         if (!other.labels.has(id)) return false;
       }
       return true;
     }
     toArray() {
-      return [...this.labels.values()];
+      return this.labels !== null ? [...this.labels.values()] : [];
+    }
+  };
+  var FuncMap = class _FuncMap {
+    constructor(base) {
+      this._base = base || null;
+      this._own = /* @__PURE__ */ new Map();
+    }
+    get(key) {
+      if (this._own.has(key)) return this._own.get(key);
+      return this._base !== null ? this._base.get(key) : void 0;
+    }
+    has(key) {
+      return this._own.has(key) || this._base !== null && this._base.has(key);
+    }
+    set(key, val) {
+      this._own.set(key, val);
+    }
+    get size() {
+      if (this._base === null) return this._own.size;
+      if (this._own.size === 0) return this._base.size;
+      let count = this._base.size;
+      for (const k of this._own.keys()) {
+        if (!this._base.has(k)) count++;
+      }
+      return count;
+    }
+    // Create a child sharing this map as read-only base. O(own.size), not O(total).
+    // Does NOT modify the parent — parent's _own stays intact for newEntries().
+    fork() {
+      const child = new _FuncMap();
+      if (this._own.size === 0) {
+        child._base = this._base;
+      } else if (this._base === null || this._base.size === 0) {
+        child._base = this._own;
+      } else {
+        const merged = new Map(this._base);
+        for (const [k, v] of this._own) merged.set(k, v);
+        child._base = merged;
+      }
+      return child;
+    }
+    // Iterate all entries (own takes precedence over base)
+    [Symbol.iterator]() {
+      if (this._base === null || this._base.size === 0) return this._own[Symbol.iterator]();
+      if (this._own.size === 0) return this._base[Symbol.iterator]();
+      const merged = new Map(this._base);
+      for (const [k, v] of this._own) merged.set(k, v);
+      return merged[Symbol.iterator]();
+    }
+    // Only entries added/overwritten in this layer (not inherited from base)
+    newEntries() {
+      return this._own;
+    }
+    // Wrap a plain Map as a FuncMap (for initial funcMap from harness/analyzer)
+    static from(map) {
+      const fm = new _FuncMap();
+      fm._own = map;
+      return fm;
     }
   };
   var TaintEnv = class _TaintEnv {
     constructor(parent) {
-      this.bindings = /* @__PURE__ */ new Map();
+      this._base = null;
+      this._own = /* @__PURE__ */ new Map();
       this.parent = parent || null;
       this.schemeCheckedVars = /* @__PURE__ */ new Set();
       this.urlConstructorOrigins = /* @__PURE__ */ new Map();
@@ -43920,18 +43985,20 @@ ${rootStack}`;
     get(key) {
       let cur = this;
       while (cur) {
-        if (cur.bindings.has(key)) return cur.bindings.get(key);
+        if (cur._own.has(key)) return cur._own.get(key);
+        if (cur._base !== null && cur._base.has(key)) return cur._base.get(key);
         cur = cur.parent;
       }
       return TaintSet.empty();
     }
     set(key, taintSet) {
-      this.bindings.set(key, taintSet);
+      this._own.set(key, taintSet);
     }
     has(key) {
       let cur = this;
       while (cur) {
-        if (cur.bindings.has(key)) return true;
+        if (cur._own.has(key)) return true;
+        if (cur._base !== null && cur._base.has(key)) return true;
         cur = cur.parent;
       }
       return false;
@@ -43939,21 +44006,64 @@ ${rootStack}`;
     child() {
       return new _TaintEnv(this);
     }
+    // Flatten _own overlay into _base, returning the merged snapshot.
+    // O(0) when _own is empty (most common after clone), O(_own.size) otherwise.
+    _flatten() {
+      if (this._own.size === 0) return this._base;
+      if (this._base === null || this._base.size === 0) return this._own;
+      const merged = new Map(this._base);
+      for (const [k, v] of this._own) merged.set(k, v);
+      return merged;
+    }
+    // COW clone: O(1) when _own is empty (common case: env cloned without modification).
+    // TaintSets in _base are shared — mergeFrom() clones before mutating.
     clone() {
       const env = new _TaintEnv(this.parent);
-      for (const [k, v] of this.bindings) env.bindings.set(k, v.clone());
+      const snapshot = this._flatten();
+      this._base = snapshot;
+      this._own = /* @__PURE__ */ new Map();
+      env._base = snapshot;
       env.schemeCheckedVars = new Set(this.schemeCheckedVars);
       env.urlConstructorOrigins = new Map(this.urlConstructorOrigins);
       env.aliases = new Map(this.aliases);
       return env;
     }
+    // Iterate all bindings (_own overlay takes precedence over _base).
+    // Returns a Map directly for fast iteration (avoids generator overhead).
+    entries() {
+      if (this._base === null || this._base.size === 0) return this._own;
+      if (this._own.size === 0) return this._base;
+      const merged = new Map(this._base);
+      for (const [k, v] of this._own) merged.set(k, v);
+      return merged;
+    }
+    get bindingSize() {
+      if (this._base === null || this._base.size === 0) return this._own.size;
+      if (this._own.size === 0) return this._base.size;
+      let count = this._base.size;
+      for (const k of this._own.keys()) {
+        if (!this._base.has(k)) count++;
+      }
+      return count;
+    }
     mergeFrom(other) {
       let changed = false;
-      for (const [key, taint] of other.bindings) {
-        const existing = this.bindings.get(key);
-        if (!existing) {
-          this.bindings.set(key, taint.clone());
-          changed = true;
+      for (const [key, taint] of other.entries()) {
+        let existing = this._own.get(key);
+        if (existing === void 0) {
+          const baseVal = this._base !== null ? this._base.get(key) : void 0;
+          if (baseVal === void 0) {
+            this._own.set(key, taint.clone());
+            changed = true;
+          } else {
+            const before = baseVal.size;
+            existing = baseVal.clone();
+            existing.merge(taint);
+            if (existing.size !== before) {
+              this._own.set(key, existing);
+              changed = true;
+            }
+          }
         } else {
           const before = existing.size;
           existing.merge(taint);
@@ -43982,15 +44092,15 @@ ${rootStack}`;
     // Replace bindings from other (overwrites instead of merging).
     // Used for sequential cross-file analysis where later scripts overwrite globals.
     replaceFrom(other) {
-      for (const [key, taint] of other.bindings) {
-        this.bindings.set(key, taint.clone());
+      for (const [key, taint] of other.entries()) {
+        this._own.set(key, taint.clone());
       }
     }
     equals(other) {
-      if (!other) return this.bindings.size === 0;
-      if (this.bindings.size !== other.bindings.size) return false;
-      for (const [key, taint] of this.bindings) {
-        const otherTaint = other.bindings.get(key);
+      if (!other) return this.bindingSize === 0;
+      if (this.bindingSize !== other.bindingSize) return false;
+      for (const [key, taint] of this.entries()) {
+        const otherTaint = other.get(key);
         if (!otherTaint || !taint.equals(otherTaint)) return false;
       }
       return true;
@@ -44000,7 +44110,7 @@ ${rootStack}`;
       const results = /* @__PURE__ */ new Map();
       let env = this;
       while (env) {
-        for (const [key, taint] of env.bindings) {
+        for (const [key, taint] of env.entries()) {
           if (key.startsWith(prefix) && taint.tainted && !results.has(key)) {
             results.set(key, taint);
           }
@@ -44013,7 +44123,7 @@ ${rootStack}`;
   var AnalysisContext = class {
     constructor(file, funcMap, findings, globalEnv, scopeInfo, analyzedCalls) {
       this.file = file;
-      this.funcMap = funcMap;
+      this.funcMap = funcMap instanceof FuncMap ? funcMap : FuncMap.from(funcMap);
       this.findings = findings;
       this.globalEnv = globalEnv;
       this.scopeInfo = scopeInfo;
@@ -44041,6 +44151,7 @@ ${rootStack}`;
   }
   function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker) {
     const findings = [];
+    const _originalFuncMap = funcMap instanceof Map ? funcMap : null;
     const ctx = new AnalysisContext(file, funcMap, findings, globalEnv || new TaintEnv(), scopeInfo);
     ctx.isWorker = !!isWorker;
     const blockEnvs = /* @__PURE__ */ new Map();
@@ -44082,6 +44193,11 @@ ${rootStack}`;
     for (const block of cfg.exit.predecessors) {
       const state = blockEnvs.get(block.id);
       if (state) env.mergeFrom(state);
+    }
+    if (_originalFuncMap && ctx.funcMap.newEntries) {
+      for (const [k, v] of ctx.funcMap.newEntries()) {
+        _originalFuncMap.set(k, v);
+      }
     }
     return findings;
   }
@@ -44153,7 +44269,7 @@ ${rootStack}`;
           env.set(typeofArg, TaintSet.empty());
           env.set(`global:${typeofArg}`, TaintSet.empty());
           const suffix = `:${typeofArg}`;
-          for (const [key] of env.bindings) {
+          for (const [key] of env.entries()) {
             if (key.endsWith(suffix)) env.set(key, TaintSet.empty());
           }
         }
@@ -44633,7 +44749,7 @@ ${rootStack}`;
           if (node.argument.type === "Identifier") {
             const thrownName = node.argument.name;
             const props = /* @__PURE__ */ new Map();
-            for (const [key, taint] of env.bindings) {
+            for (const [key, taint] of env.entries()) {
               if (key.startsWith(`${thrownName}.`) && taint.tainted) {
                 props.set(key.slice(thrownName.length), taint.clone());
               }
@@ -45446,7 +45562,7 @@ ${rootStack}`;
   }
   function propagateThisToInstance(instanceName, env, ctx) {
     const toSet = [];
-    for (const [key, taint] of env.bindings) {
+    for (const [key, taint] of env.entries()) {
       if (key.startsWith("this.")) {
         const propName = key.slice(5);
         if (propName) toSet.push([`${instanceName}.${propName}`, taint]);
@@ -46783,7 +46899,7 @@ ${rootStack}`;
           const body = funcNode.body.type === "BlockStatement" ? funcNode.body : { type: "BlockStatement", body: [{ type: "ReturnStatement", argument: funcNode.body }] };
           const retTaint = analyzeInlineFunction({ ...funcNode, body }, childEnv, ctx, env);
           const thisTaint = TaintSet.empty();
-          for (const [key, taint] of childEnv.bindings) {
+          for (const [key, taint] of childEnv.entries()) {
             if (key.startsWith("this.") && key.length > 5) {
               env.set(key, taint);
               if (taint.tainted) thisTaint.merge(taint);
@@ -47520,7 +47636,8 @@ ${rootStack}`;
     if (innerCtx.returnedMethods) callerCtx.returnedMethods = innerCtx.returnedMethods;
     if (innerCtx.returnElementTaints) callerCtx.returnElementTaints = innerCtx.returnElementTaints;
     if (innerCtx.returnPropertyTaints) callerCtx.returnPropertyTaints = innerCtx.returnPropertyTaints;
-    for (const [key, val] of innerCtx.funcMap) {
+    const newFuncEntries = innerCtx.funcMap.newEntries ? innerCtx.funcMap.newEntries() : innerCtx.funcMap;
+    for (const [key, val] of newFuncEntries) {
       if (callerCtx.funcMap.has(key)) continue;
       if (key.length > 2 && key[key.length - 1] === "]" && key[key.length - 2] === "[") {
         callerCtx.funcMap.set(key, val);
@@ -47542,7 +47659,7 @@ ${rootStack}`;
     const innerCfg = buildCFG(funcNode.body);
     const innerCtx = new AnalysisContext(
       ctx.file,
-      new Map(ctx.funcMap),
+      ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap),
       ctx.findings,
       ctx.globalEnv,
       ctx.scopeInfo,
@@ -47566,7 +47683,7 @@ ${rootStack}`;
     if (callerEnv) {
       const _childEnv = env;
       frame.postProcess = (result) => {
-        for (const [key, taint] of _childEnv.bindings) {
+        for (const [key, taint] of _childEnv.entries()) {
           if (key.startsWith("this.") && key.length > 5) {
             callerEnv.set(key, taint);
           }
@@ -47859,7 +47976,7 @@ ${rootStack}`;
       callNode = { ...callNode, arguments: [...boundArgNodes, ...callNode.arguments || []] };
       funcNode._boundArgs = null;
     }
-    const innerFuncMap = new Map(ctx.funcMap);
+    const innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
     if (_methodObjName) {
       const objPrefix = `${_methodObjName}.`;
       for (const [key, val] of ctx.funcMap) {
@@ -47992,7 +48109,7 @@ ${rootStack}`;
     const innerCfg = buildCFG(body);
     const innerCtx = new AnalysisContext(
       ctx.file,
-      new Map(innerFuncMap),
+      innerFuncMap.fork ? innerFuncMap.fork() : new FuncMap(innerFuncMap),
       ctx.findings,
       ctx.globalEnv,
       ctx.scopeInfo,
@@ -48007,11 +48124,12 @@ ${rootStack}`;
     const postProcess = (result) => {
       _callerCtx._paramConstants = _savedParamConstants;
       _callerCtx.funcMap = _savedFuncMap;
-      for (const [key, val] of _innerFuncMap) {
+      const _newFuncEntries = _innerFuncMap.newEntries ? _innerFuncMap.newEntries() : _innerFuncMap;
+      for (const [key, val] of _newFuncEntries) {
         if (!_savedFuncMap.has(key)) _savedFuncMap.set(key, val);
       }
       if (_callNode.callee?.type === "Super") {
-        for (const [key, taint] of _childEnv.bindings) {
+        for (const [key, taint] of _childEnv.entries()) {
           if (key.startsWith("this.") && taint.tainted) {
             _callerEnv.set(key, taint);
           }
@@ -48019,7 +48137,7 @@ ${rootStack}`;
       }
       if (_callNode.callee?.type === "MemberExpression" || _callNode.callee?.type === "OptionalMemberExpression") {
         const objName = nodeToString(_callNode.callee.object);
-        for (const [key, taint] of _childEnv.bindings) {
+        for (const [key, taint] of _childEnv.entries()) {
           if (key.startsWith("this.") && taint.tainted) {
             const propName = key.slice(5);
             if (objName) _callerEnv.set(`${objName}.${propName}`, taint);
@@ -48027,7 +48145,8 @@ ${rootStack}`;
           }
         }
         if (objName) {
-          for (const [key, val] of _innerFuncMap) {
+          const _newFuncEntries2 = _innerFuncMap.newEntries ? _innerFuncMap.newEntries() : _innerFuncMap;
+          for (const [key, val] of _newFuncEntries2) {
             if (key.startsWith("this.")) {
               const propName = key.slice(5);
               _savedFuncMap.set(`${objName}.${propName}`, val);
@@ -48036,19 +48155,19 @@ ${rootStack}`;
         }
       }
       if (_funcNode._closureEnv) {
-        for (const [key, taint] of _childEnv.bindings) {
+        for (const [key, taint] of _childEnv.entries()) {
           if (taint.tainted && !key.startsWith("this.") && !_paramNames.has(key) && key !== "this") {
             _funcNode._closureEnv.set(key, taint);
           }
         }
       }
-      for (const [key, taint] of _childEnv.bindings) {
+      for (const [key, taint] of _childEnv.entries()) {
         if (key.startsWith("this.") || key === "this" || key.startsWith("global:") || _paramNames.has(key) || key.indexOf(".") !== -1) continue;
         if (_callerEnv.has(key)) {
           _callerEnv.set(key, taint);
         }
       }
-      for (const [key, taint] of _childEnv.bindings) {
+      for (const [key, taint] of _childEnv.entries()) {
         if (taint.tainted && key.indexOf(".") !== -1 && key.slice(0, 5) !== "this." && key.slice(0, 7) !== "global:" && !(key[0] >= "0" && key[0] <= "9")) {
           _callerEnv.set(key, taint);
         }
@@ -48060,7 +48179,7 @@ ${rootStack}`;
         const argNode = _callNode.arguments[i];
         const argStr = nodeToString(argNode);
         if (!argStr || argStr === pName) continue;
-        for (const [key, taint] of _childEnv.bindings) {
+        for (const [key, taint] of _childEnv.entries()) {
           if (key.startsWith(pName + ".")) {
             const suffix = key.slice(pName.length);
             _callerEnv.set(`${argStr}${suffix}`, taint);
@@ -48834,7 +48953,13 @@ ${rootStack}`;
       }
       const imports = page.imports.get(url) || extractImports(ast);
       const importEnv = resolveImportTaint(page, url, imports);
-      const hasNewTaint = [...importEnv.bindings.values()].some((t) => t.tainted);
+      let hasNewTaint = false;
+      for (const [, t] of importEnv.entries()) {
+        if (t.tainted) {
+          hasNewTaint = true;
+          break;
+        }
+      }
       if (!hasNewTaint) continue;
       const funcMap = new Map(page.globalFuncMap);
       const env = importEnv;

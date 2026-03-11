@@ -26,23 +26,33 @@ export class TaintLabel {
 }
 
 // ── Taint set: a set of labels attached to a value ──
+// Uses lazy Map allocation: labels is null when empty, avoiding Map overhead
+// for the vast majority of TaintSets that are never tainted.
+const _EMPTY_MAP = Object.freeze(new Map());
 export class TaintSet {
   constructor(labels) {
-    this.labels = labels || new Map();
+    this.labels = labels || null;
   }
 
-  get tainted() { return this.labels.size > 0; }
-  get size() { return this.labels.size; }
+  get tainted() { return this.labels !== null && this.labels.size > 0; }
+  get size() { return this.labels !== null ? this.labels.size : 0; }
 
-  add(label) { this.labels.set(label.id, label); }
+  add(label) {
+    if (this.labels === null) this.labels = new Map();
+    this.labels.set(label.id, label);
+  }
 
   merge(other) {
-    if (!other) return this;
+    if (!other || other.labels === null || other.labels.size === 0) return this;
+    if (this.labels === null) this.labels = new Map();
     for (const [id, label] of other.labels) this.labels.set(id, label);
     return this;
   }
 
-  clone() { return new TaintSet(new Map(this.labels)); }
+  clone() {
+    if (this.labels === null || this.labels.size === 0) return new TaintSet();
+    return new TaintSet(new Map(this.labels));
+  }
   static empty() { return new TaintSet(); }
 
   static from(label) {
@@ -52,22 +62,96 @@ export class TaintSet {
   }
 
   equals(other) {
-    if (!other) return this.labels.size === 0;
-    if (this.labels.size !== other.labels.size) return false;
+    const thisSize = this.labels !== null ? this.labels.size : 0;
+    const otherSize = other && other.labels !== null ? other.labels.size : 0;
+    if (thisSize !== otherSize) return false;
+    if (thisSize === 0) return true;
     for (const id of this.labels.keys()) {
       if (!other.labels.has(id)) return false;
     }
     return true;
   }
 
-  toArray() { return [...this.labels.values()]; }
+  toArray() { return this.labels !== null ? [...this.labels.values()] : []; }
+}
+
+// ── COW function map: layered Map with O(1) fork and O(delta) iteration ──
+// Stores function/method AST nodes keyed by binding name. Fork creates a child
+// sharing the parent as a read-only base; writes go to an overlay. newEntries()
+// returns only the overlay for efficient propagation in _finalizeFrame/postProcess.
+class FuncMap {
+  constructor(base) {
+    this._base = base || null;  // shared read-only parent snapshot
+    this._own = new Map();      // overlay: new/overwritten entries
+  }
+
+  get(key) {
+    if (this._own.has(key)) return this._own.get(key);
+    return this._base !== null ? this._base.get(key) : undefined;
+  }
+
+  has(key) {
+    return this._own.has(key) || (this._base !== null && this._base.has(key));
+  }
+
+  set(key, val) { this._own.set(key, val); }
+
+  get size() {
+    if (this._base === null) return this._own.size;
+    if (this._own.size === 0) return this._base.size;
+    let count = this._base.size;
+    for (const k of this._own.keys()) {
+      if (!this._base.has(k)) count++;
+    }
+    return count;
+  }
+
+  // Create a child sharing this map as read-only base. O(own.size), not O(total).
+  // Does NOT modify the parent — parent's _own stays intact for newEntries().
+  fork() {
+    const child = new FuncMap();
+    if (this._own.size === 0) {
+      child._base = this._base;
+    } else if (this._base === null || this._base.size === 0) {
+      child._base = this._own;  // child reads from parent's own
+    } else {
+      // Merge own on top of base for child's snapshot
+      const merged = new Map(this._base);
+      for (const [k, v] of this._own) merged.set(k, v);
+      child._base = merged;
+    }
+    return child;
+  }
+
+  // Iterate all entries (own takes precedence over base)
+  [Symbol.iterator]() {
+    if (this._base === null || this._base.size === 0) return this._own[Symbol.iterator]();
+    if (this._own.size === 0) return this._base[Symbol.iterator]();
+    const merged = new Map(this._base);
+    for (const [k, v] of this._own) merged.set(k, v);
+    return merged[Symbol.iterator]();
+  }
+
+  // Only entries added/overwritten in this layer (not inherited from base)
+  newEntries() { return this._own; }
+
+  // Wrap a plain Map as a FuncMap (for initial funcMap from harness/analyzer)
+  static from(map) {
+    const fm = new FuncMap();
+    fm._own = map;
+    return fm;
+  }
 }
 
 // ── Taint environment: maps binding keys to taint sets ──
-// Keys are scope-resolved (e.g. "3:myVar") for locals, or dot-paths for properties
+// Keys are scope-resolved (e.g. "3:myVar") for locals, or dot-paths for properties.
+// Uses copy-on-write: clone() is O(1) when no modifications exist, sharing a
+// read-only _base snapshot. Writes go to _own overlay; _base TaintSets are cloned
+// before mutation to avoid corrupting shared state.
 export class TaintEnv {
   constructor(parent) {
-    this.bindings = new Map();
+    this._base = null;       // shared read-only snapshot (Map<string, TaintSet> | null)
+    this._own = new Map();   // writable overlay for modifications
     this.parent = parent || null;
     // Path-sensitive: variables confirmed to have http/https URL scheme on this path
     this.schemeCheckedVars = new Set();
@@ -80,18 +164,20 @@ export class TaintEnv {
   get(key) {
     let cur = this;
     while (cur) {
-      if (cur.bindings.has(key)) return cur.bindings.get(key);
+      if (cur._own.has(key)) return cur._own.get(key);
+      if (cur._base !== null && cur._base.has(key)) return cur._base.get(key);
       cur = cur.parent;
     }
     return TaintSet.empty();
   }
 
-  set(key, taintSet) { this.bindings.set(key, taintSet); }
+  set(key, taintSet) { this._own.set(key, taintSet); }
 
   has(key) {
     let cur = this;
     while (cur) {
-      if (cur.bindings.has(key)) return true;
+      if (cur._own.has(key)) return true;
+      if (cur._base !== null && cur._base.has(key)) return true;
       cur = cur.parent;
     }
     return false;
@@ -99,22 +185,72 @@ export class TaintEnv {
 
   child() { return new TaintEnv(this); }
 
+  // Flatten _own overlay into _base, returning the merged snapshot.
+  // O(0) when _own is empty (most common after clone), O(_own.size) otherwise.
+  _flatten() {
+    if (this._own.size === 0) return this._base;
+    if (this._base === null || this._base.size === 0) return this._own;
+    const merged = new Map(this._base);
+    for (const [k, v] of this._own) merged.set(k, v);
+    return merged;
+  }
+
+  // COW clone: O(1) when _own is empty (common case: env cloned without modification).
+  // TaintSets in _base are shared — mergeFrom() clones before mutating.
   clone() {
     const env = new TaintEnv(this.parent);
-    for (const [k, v] of this.bindings) env.bindings.set(k, v.clone());
+    const snapshot = this._flatten();
+    // Both this and clone share the snapshot as read-only base
+    this._base = snapshot;
+    this._own = new Map();
+    env._base = snapshot;
     env.schemeCheckedVars = new Set(this.schemeCheckedVars);
     env.urlConstructorOrigins = new Map(this.urlConstructorOrigins);
     env.aliases = new Map(this.aliases);
     return env;
   }
 
+  // Iterate all bindings (_own overlay takes precedence over _base).
+  // Returns a Map directly for fast iteration (avoids generator overhead).
+  entries() {
+    if (this._base === null || this._base.size === 0) return this._own;
+    if (this._own.size === 0) return this._base;
+    // Both exist — materialize merged view (overlay takes precedence)
+    const merged = new Map(this._base);
+    for (const [k, v] of this._own) merged.set(k, v);
+    return merged;
+  }
+
+  get bindingSize() {
+    if (this._base === null || this._base.size === 0) return this._own.size;
+    if (this._own.size === 0) return this._base.size;
+    let count = this._base.size;
+    for (const k of this._own.keys()) {
+      if (!this._base.has(k)) count++;
+    }
+    return count;
+  }
+
   mergeFrom(other) {
     let changed = false;
-    for (const [key, taint] of other.bindings) {
-      const existing = this.bindings.get(key);
-      if (!existing) {
-        this.bindings.set(key, taint.clone());
-        changed = true;
+    for (const [key, taint] of other.entries()) {
+      let existing = this._own.get(key);
+      if (existing === undefined) {
+        const baseVal = this._base !== null ? this._base.get(key) : undefined;
+        if (baseVal === undefined) {
+          // New key — clone the incoming TaintSet
+          this._own.set(key, taint.clone());
+          changed = true;
+        } else {
+          // Exists in shared _base — clone before mutating (COW)
+          const before = baseVal.size;
+          existing = baseVal.clone();
+          existing.merge(taint);
+          if (existing.size !== before) {
+            this._own.set(key, existing);
+            changed = true;
+          }
+        }
       } else {
         const before = existing.size;
         existing.merge(taint);
@@ -148,16 +284,16 @@ export class TaintEnv {
   // Replace bindings from other (overwrites instead of merging).
   // Used for sequential cross-file analysis where later scripts overwrite globals.
   replaceFrom(other) {
-    for (const [key, taint] of other.bindings) {
-      this.bindings.set(key, taint.clone());
+    for (const [key, taint] of other.entries()) {
+      this._own.set(key, taint.clone());
     }
   }
 
   equals(other) {
-    if (!other) return this.bindings.size === 0;
-    if (this.bindings.size !== other.bindings.size) return false;
-    for (const [key, taint] of this.bindings) {
-      const otherTaint = other.bindings.get(key);
+    if (!other) return this.bindingSize === 0;
+    if (this.bindingSize !== other.bindingSize) return false;
+    for (const [key, taint] of this.entries()) {
+      const otherTaint = other.get(key);
       if (!otherTaint || !taint.equals(otherTaint)) return false;
     }
     return true;
@@ -168,7 +304,7 @@ export class TaintEnv {
     const results = new Map();
     let env = this;
     while (env) {
-      for (const [key, taint] of env.bindings) {
+      for (const [key, taint] of env.entries()) {
         if (key.startsWith(prefix) && taint.tainted && !results.has(key)) {
           results.set(key, taint);
         }
@@ -183,7 +319,7 @@ export class TaintEnv {
 class AnalysisContext {
   constructor(file, funcMap, findings, globalEnv, scopeInfo, analyzedCalls) {
     this.file = file;
-    this.funcMap = funcMap;       // bindingKey|name → AST node
+    this.funcMap = funcMap instanceof FuncMap ? funcMap : FuncMap.from(funcMap);  // bindingKey|name → AST node
     this.findings = findings;
     this.globalEnv = globalEnv;
     this.scopeInfo = scopeInfo;   // ScopeInfo from @babel/traverse (may be null)
@@ -217,6 +353,7 @@ function resolveId(node, ctx) {
 // ── Main entry: analyze a CFG with initial taint environment ──
 export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker) {
   const findings = [];
+  const _originalFuncMap = funcMap instanceof Map ? funcMap : null;
   const ctx = new AnalysisContext(file, funcMap, findings, globalEnv || new TaintEnv(), scopeInfo);
   ctx.isWorker = !!isWorker;
 
@@ -263,6 +400,14 @@ export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWork
   for (const block of cfg.exit.predecessors) {
     const state = blockEnvs.get(block.id);
     if (state) env.mergeFrom(state);
+  }
+
+  // Sync COW funcMap entries back to the original plain Map (if provided)
+  // so callers (test harness, analyzeMultiple) see discovered functions
+  if (_originalFuncMap && ctx.funcMap.newEntries) {
+    for (const [k, v] of ctx.funcMap.newEntries()) {
+      _originalFuncMap.set(k, v);
+    }
   }
 
   return findings;
@@ -358,7 +503,7 @@ function applyBranchCondition(testNode, polarity, env) {
         env.set(`global:${typeofArg}`, TaintSet.empty());
         // Also clear scoped bindings (e.g., "0:data" from CFG scope resolution)
         const suffix = `:${typeofArg}`;
-        for (const [key] of env.bindings) {
+        for (const [key] of env.entries()) {
           if (key.endsWith(suffix)) env.set(key, TaintSet.empty());
         }
       }
@@ -912,7 +1057,7 @@ function processNode(node, env, ctx) {
         if (node.argument.type === 'Identifier') {
           const thrownName = node.argument.name;
           const props = new Map();
-          for (const [key, taint] of env.bindings) {
+          for (const [key, taint] of env.entries()) {
             if (key.startsWith(`${thrownName}.`) && taint.tainted) {
               props.set(key.slice(thrownName.length), taint.clone());
             }
@@ -1857,7 +2002,7 @@ function registerReturnedFunctions(target, ctx) {
 // After `var w = new Widget(tainted)`, copies this.html → w.html
 function propagateThisToInstance(instanceName, env, ctx) {
   const toSet = [];
-  for (const [key, taint] of env.bindings) {
+  for (const [key, taint] of env.entries()) {
     if (key.startsWith('this.')) {
       const propName = key.slice(5); // "this.html" → "html"
       if (propName) toSet.push([`${instanceName}.${propName}`, taint]);
@@ -3311,7 +3456,7 @@ function evaluateNewExpr(node, env, ctx) {
         // (also handled by postProcess in callerEnv mode for frame-based path)
         // Includes clean bindings so sanitized properties are tracked accurately
         const thisTaint = TaintSet.empty();
-        for (const [key, taint] of childEnv.bindings) {
+        for (const [key, taint] of childEnv.entries()) {
           if (key.startsWith('this.') && key.length > 5) {
             env.set(key, taint);
             if (taint.tainted) thisTaint.merge(taint);
@@ -4235,8 +4380,9 @@ function _finalizeFrame(frame) {
   if (innerCtx.returnPropertyTaints) callerCtx.returnPropertyTaints = innerCtx.returnPropertyTaints;
 
   // Propagate funcMap entries: array callbacks, this.*, global objects
-  // Skip entries already in caller (most entries) for O(delta) instead of O(N)
-  for (const [key, val] of innerCtx.funcMap) {
+  // COW: only iterate new entries (overlay), not the entire inherited map
+  const newFuncEntries = innerCtx.funcMap.newEntries ? innerCtx.funcMap.newEntries() : innerCtx.funcMap;
+  for (const [key, val] of newFuncEntries) {
     if (callerCtx.funcMap.has(key)) continue;
     if (key.length > 2 && key[key.length - 1] === ']' && key[key.length - 2] === '[') {
       callerCtx.funcMap.set(key, val);
@@ -4262,7 +4408,7 @@ function _finalizeFrame(frame) {
 function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
   const innerCfg = buildCFG(funcNode.body);
   const innerCtx = new AnalysisContext(
-    ctx.file, new Map(ctx.funcMap), ctx.findings,
+    ctx.file, ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap), ctx.findings,
     ctx.globalEnv, ctx.scopeInfo, ctx.analyzedCalls
   );
   innerCtx.classBodyMap = ctx.classBodyMap;
@@ -4287,7 +4433,7 @@ function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
   if (callerEnv) {
     const _childEnv = env;
     frame.postProcess = (result) => {
-      for (const [key, taint] of _childEnv.bindings) {
+      for (const [key, taint] of _childEnv.entries()) {
         if (key.startsWith('this.') && key.length > 5) {
           callerEnv.set(key, taint);
         }
@@ -4632,7 +4778,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   }
 
   // Store function expression arguments in funcMap so they can be called inside the body
-  const innerFuncMap = new Map(ctx.funcMap);
+  const innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
 
   // Copy obj.* funcMap entries to this.* so method bodies can resolve this.prop functions
   if (_methodObjName) {
@@ -4779,7 +4925,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   // Build the CFG and inner context for the function body
   const innerCfg = buildCFG(body);
   const innerCtx = new AnalysisContext(
-    ctx.file, new Map(innerFuncMap), ctx.findings,
+    ctx.file, innerFuncMap.fork ? innerFuncMap.fork() : new FuncMap(innerFuncMap), ctx.findings,
     ctx.globalEnv, ctx.scopeInfo, ctx.analyzedCalls
   );
   innerCtx.classBodyMap = ctx.classBodyMap;
@@ -4799,14 +4945,15 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     _callerCtx._paramConstants = _savedParamConstants;
     _callerCtx.funcMap = _savedFuncMap;
 
-    // Propagate new funcMap entries discovered during the call
-    for (const [key, val] of _innerFuncMap) {
+    // Propagate new funcMap entries discovered during the call (COW: only overlay)
+    const _newFuncEntries = _innerFuncMap.newEntries ? _innerFuncMap.newEntries() : _innerFuncMap;
+    for (const [key, val] of _newFuncEntries) {
       if (!_savedFuncMap.has(key)) _savedFuncMap.set(key, val);
     }
 
     // super() call: propagate this.* from parent constructor
     if (_callNode.callee?.type === 'Super') {
-      for (const [key, taint] of _childEnv.bindings) {
+      for (const [key, taint] of _childEnv.entries()) {
         if (key.startsWith('this.') && taint.tainted) {
           _callerEnv.set(key, taint);
         }
@@ -4816,7 +4963,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     // Propagate this.* side effects back to the receiver object
     if (_callNode.callee?.type === 'MemberExpression' || _callNode.callee?.type === 'OptionalMemberExpression') {
       const objName = nodeToString(_callNode.callee.object);
-      for (const [key, taint] of _childEnv.bindings) {
+      for (const [key, taint] of _childEnv.entries()) {
         if (key.startsWith('this.') && taint.tainted) {
           const propName = key.slice(5);
           if (objName) _callerEnv.set(`${objName}.${propName}`, taint);
@@ -4824,7 +4971,8 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
         }
       }
       if (objName) {
-        for (const [key, val] of _innerFuncMap) {
+        const _newFuncEntries2 = _innerFuncMap.newEntries ? _innerFuncMap.newEntries() : _innerFuncMap;
+        for (const [key, val] of _newFuncEntries2) {
           if (key.startsWith('this.')) {
             const propName = key.slice(5);
             _savedFuncMap.set(`${objName}.${propName}`, val);
@@ -4835,7 +4983,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
     // Propagate closure variable mutations back to the closure env
     if (_funcNode._closureEnv) {
-      for (const [key, taint] of _childEnv.bindings) {
+      for (const [key, taint] of _childEnv.entries()) {
         if (taint.tainted && !key.startsWith('this.') && !_paramNames.has(key) && key !== 'this') {
           _funcNode._closureEnv.set(key, taint);
         }
@@ -4843,7 +4991,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     }
 
     // Propagate closure variable mutations back to the caller's env
-    for (const [key, taint] of _childEnv.bindings) {
+    for (const [key, taint] of _childEnv.entries()) {
       if (key.startsWith('this.') || key === 'this' || key.startsWith('global:') ||
           _paramNames.has(key) || key.indexOf('.') !== -1) continue;
       if (_callerEnv.has(key)) {
@@ -4852,7 +5000,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     }
 
     // Propagate global-scoped side effects
-    for (const [key, taint] of _childEnv.bindings) {
+    for (const [key, taint] of _childEnv.entries()) {
       if (taint.tainted && key.indexOf('.') !== -1 &&
           key.slice(0, 5) !== 'this.' && key.slice(0, 7) !== 'global:' &&
           !(key[0] >= '0' && key[0] <= '9')) {
@@ -4868,7 +5016,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       const argNode = _callNode.arguments[i];
       const argStr = nodeToString(argNode);
       if (!argStr || argStr === pName) continue;
-      for (const [key, taint] of _childEnv.bindings) {
+      for (const [key, taint] of _childEnv.entries()) {
         if (key.startsWith(pName + '.')) {
           const suffix = key.slice(pName.length);
           _callerEnv.set(`${argStr}${suffix}`, taint);
