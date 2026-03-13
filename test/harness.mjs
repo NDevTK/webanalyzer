@@ -3,7 +3,7 @@
 
 import { parse } from '@babel/parser';
 import { buildCFG } from '../src/worker/cfg.js';
-import { analyzeCFG, TaintEnv, TaintSet, TaintLabel, checkPrototypePollution, generatePoC } from '../src/worker/taint.js';
+import { analyzeCFG, TaintEnv, TaintSet, TaintLabel, generatePoC } from '../src/worker/taint.js';
 import { buildScopeInfo } from '../src/worker/scope.js';
 import { extractGlobalDeclarations } from '../src/worker/module-graph.js';
 import { nodeToString } from '../src/worker/sources-sinks.js';
@@ -13,6 +13,7 @@ const BABEL_PLUGINS = [
   'nullishCoalescingOperator', 'classProperties', 'decorators-legacy',
   'objectRestSpread', 'topLevelAwait', 'classPrivateProperties',
   'classPrivateMethods', 'asyncGenerators', 'optionalCatchBinding',
+  ['optionalChainingAssign', { version: '2023-07' }],
 ];
 
 const WALK_SKIP_KEYS = new Set(['loc', 'start', 'end', 'leadingComments', 'trailingComments', 'innerComments', '_closureEnv']);
@@ -38,11 +39,7 @@ export function analyze(source, { file = 'test.js', isModule = false, globalEnv 
   const cfg = buildCFG(ast.program);
   const findings = analyzeCFG(cfg, env, file, funcMap, globalEnv || new TaintEnv(), scopeInfo);
 
-  // Also scan for prototype pollution
-  const ppCtx = { file, funcMap, findings, globalEnv: env, scopeInfo, returnTaint: TaintSet.empty(), analyzedCalls: new Set(), protoMethodMap: new Map(), classBodyMap: new Map(), superClassMap: new Map() };
-  walkAST(ast.program, (node) => {
-    if (node.type === 'AssignmentExpression') checkPrototypePollution(node, env, ppCtx);
-  });
+  // Also scan for prototype pollution (skip — already detected during analyzeCFG via processAssignment)
 
   // Generate PoCs for all findings (same as worker/index.js postFindings)
   for (const f of findings) {

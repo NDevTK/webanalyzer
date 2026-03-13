@@ -86,6 +86,8 @@ export const ASSIGNMENT_SINKS = {
   'innerHTML': { type: 'XSS', argIndex: 'rhs' },
   'outerHTML': { type: 'XSS', argIndex: 'rhs' },
   'srcdoc': { type: 'XSS', argIndex: 'rhs' },
+  // Element href: a.href, base.href, link.href — javascript: URI on click/load
+  'href': { type: 'XSS', argIndex: 'rhs', navigation: true },
   // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
   'location.href': { type: 'XSS', argIndex: 'rhs', navigation: true },
   'window.location.href': { type: 'XSS', argIndex: 'rhs', navigation: true },
@@ -226,7 +228,7 @@ export function checkCallSink(calleeStr, methodName) {
     if (GLOBAL_ONLY_SINKS.has(methodName)) {
       if (!calleeStr || calleeStr === methodName ||
           calleeStr === `window.${methodName}` || calleeStr === `globalThis.${methodName}` ||
-          calleeStr === `self.${methodName}`) {
+          calleeStr === `self.${methodName}` || calleeStr === `this.${methodName}`) {
         return info;
       }
       continue;

@@ -21,6 +21,7 @@ export class TaintLabel {
     this.description = description;
     this.transforms = transforms || _NO_TRANSFORMS;
     this.sourceKey = sourceKey || null; // actual param/key name from the source call
+    this.stateSteps = null; // array of {action, handler, variable, delay} for multi-step PoCs
   }
 
   get id() {
@@ -31,6 +32,15 @@ export class TaintLabel {
     const l = new TaintLabel(this.sourceType, this.file, this.line, this.col, this.description,
       this.transforms === _NO_TRANSFORMS ? [op] : [...this.transforms, op]);
     l.sourceKey = this.sourceKey;
+    l.stateSteps = this.stateSteps;
+    return l;
+  }
+
+  addStateStep(step) {
+    const l = new TaintLabel(this.sourceType, this.file, this.line, this.col, this.description,
+      this.transforms === _NO_TRANSFORMS ? [] : [...this.transforms]);
+    l.sourceKey = this.sourceKey;
+    l.stateSteps = this.stateSteps ? [...this.stateSteps, step] : [step];
     return l;
   }
 }
@@ -89,6 +99,17 @@ export class TaintSet {
     if (this.labels === null || this.labels.size === 0) return this;
     const newLabels = new Map();
     for (const [id, label] of this.labels) newLabels.set(id, label.withTransform(op));
+    return new TaintSet(newLabels);
+  }
+
+  // Create a new TaintSet with a state step appended to all labels
+  withStateStep(step) {
+    if (this.labels === null || this.labels.size === 0) return this;
+    const newLabels = new Map();
+    for (const [id, label] of this.labels) {
+      const nl = label.addStateStep(step);
+      newLabels.set(nl.id, nl);
+    }
     return new TaintSet(newLabels);
   }
 }
@@ -349,13 +370,24 @@ class AnalysisContext {
     this.returnedFuncNode = null;  // tracks function nodes returned from calls
     this.returnedMethods = null;   // tracks { name → funcNode } for returned objects
     this.scriptElements = new Set(); // tracks variables holding createElement('script') results
+    this.elementTypes = new Map(); // tracks variable name → element tag name from createElement
     this.thrownTaint = TaintSet.empty(); // tracks taint from ThrowStatement for catch param
     this.generatorTaint = new Map(); // maps generator function key → TaintSet from yield expressions
     this.eventListeners = new Map(); // eventName → [{callback, env}] for custom event dispatch tracking
     this.classBodyMap = new Map(); // className → classBody array
     this.superClassMap = new Map(); // className → parentClassName
     this.protoMethodMap = new Map(); // "ClassName" → [{methodName, funcNode}]
+    this._findingKeys = new Set(); // dedup key set for findings (prevents duplicates from back-edge re-iteration)
   }
+}
+
+// Push a finding with deduplication (prevents duplicates from event handler back-edge re-iteration)
+function pushFinding(ctx, finding) {
+  const key = `${finding.type}:${finding.sink?.expression}:${finding.sink?.file}:${finding.sink?.line}:${finding.sink?.col}`;
+  if (!ctx._findingKeys) ctx._findingKeys = new Set();
+  if (ctx._findingKeys.has(key)) return;
+  ctx._findingKeys.add(key);
+  ctx.findings.push(finding);
 }
 
 // ── Extract property key name as a string (handles NumericLiteral → "2") ──
@@ -399,8 +431,8 @@ export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWork
 
     for (const succ of block.successors) {
       // Constant-fold: skip unreachable branches (e.g., if(false) consequent)
-      if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
-        const val = isConstantBool(succ.branchCondition);
+      if (succ.branchCondition && isConstantBool(succ.branchCondition, ctx) !== null) {
+        const val = isConstantBool(succ.branchCondition, ctx);
         if (val === false && succ.branchPolarity === true) continue;
         if (val === true && succ.branchPolarity === false) continue;
       }
@@ -443,6 +475,38 @@ function processBlock(block, env, ctx) {
   if (block.branchCondition) {
     applyBranchCondition(block.branchCondition, block.branchPolarity, env);
   }
+  // Track current branch condition for multi-step PoC annotation
+  const prevBranch = ctx._currentBranchCondition;
+  if (block.branchCondition) {
+    ctx._currentBranchCondition = { node: block.branchCondition, polarity: block.branchPolarity };
+  } else if (block.nodes.length > 0 && block.nodes[0].type === '_Test' && block.nodes[0].test) {
+    // Switch-case block: _Test node has the case value, discriminant is in the switch entry.
+    // Synthesize a BinaryExpression condition: discriminant === caseValue
+    const testNode = block.nodes[0].test;
+    // Find the switch discriminant from predecessor block's last node
+    let switchDiscriminant = null;
+    for (const pred of block.predecessors) {
+      if (pred.nodes.length > 0 && pred.successors.length > 1) {
+        // Switch entry block has the discriminant as its last node and fans out to case blocks
+        const lastNode = pred.nodes[pred.nodes.length - 1];
+        if (lastNode.type !== '_Test') {
+          switchDiscriminant = lastNode;
+          break;
+        }
+      }
+    }
+    if (switchDiscriminant && (testNode.type === 'StringLiteral' || testNode.type === 'NumericLiteral' ||
+        (testNode.type === 'Literal' && (typeof testNode.value === 'string' || typeof testNode.value === 'number')))) {
+      ctx._currentBranchCondition = {
+        node: { type: 'BinaryExpression', operator: '===', left: switchDiscriminant, right: testNode },
+        polarity: true,
+      };
+    } else {
+      ctx._currentBranchCondition = null;
+    }
+  } else {
+    ctx._currentBranchCondition = null;
+  }
   const startIdx = ctx._resumeNodeIdx || 0;
   ctx._resumeNodeIdx = 0;
   for (let i = startIdx; i < block.nodes.length; i++) {
@@ -454,6 +518,7 @@ function processBlock(block, env, ctx) {
       break;
     }
   }
+  ctx._currentBranchCondition = prevBranch;
   return env;
 }
 
@@ -534,6 +599,51 @@ function applyBranchCondition(testNode, polarity, env) {
       }
     }
   }
+}
+
+// Extract condition discriminant and value from a branch condition AST node.
+// e.g. e.data.type === 'init' → { discriminant: 'e.data.type', propName: 'type', value: 'init' }
+// Returns null if the condition isn't a simple equality check we can use for multi-step PoCs.
+function extractConditionInfo(testNode, polarity) {
+  let node = testNode;
+  let pos = polarity;
+  // Unwrap negation: !(expr) flips polarity
+  while (node.type === 'UnaryExpression' && node.operator === '!') {
+    pos = !pos;
+    node = node.argument;
+  }
+  if (node.type === 'BinaryExpression') {
+    const op = node.operator;
+    // Handle === / == / !== / !=
+    const isEq = op === '===' || op === '==';
+    const isNeq = op === '!==' || op === '!=';
+    if (!isEq && !isNeq) return null;
+    // !== with positive polarity means the value must NOT equal → skip
+    // !== with negative polarity (inside negated branch) means it MUST equal
+    const mustEqual = isEq ? pos : !pos;
+    if (!mustEqual) return null;
+
+    let memberSide, literalSide;
+    if (isLiteral(node.right) && !isLiteral(node.left)) {
+      memberSide = node.left; literalSide = node.right;
+    } else if (isLiteral(node.left) && !isLiteral(node.right)) {
+      memberSide = node.right; literalSide = node.left;
+    } else return null;
+
+    const discriminant = nodeToString(memberSide);
+    if (!discriminant) return null;
+    // Extract the leaf property name (last part after '.')
+    const parts = discriminant.split('.');
+    const propName = parts[parts.length - 1];
+    const value = literalSide.value;
+    return { discriminant, propName, value };
+  }
+  return null;
+}
+
+function isLiteral(node) {
+  return node.type === 'StringLiteral' || node.type === 'NumericLiteral' ||
+    (node.type === 'Literal' && (typeof node.value === 'string' || typeof node.value === 'number'));
 }
 
 // Returns the variable name if `node` (with given polarity) represents a URL scheme check.
@@ -736,7 +846,37 @@ function formatSources(taint) {
     type: l.sourceType, description: l.description, file: l.file, line: l.line,
     transforms: l.transforms.length > 0 ? l.transforms : undefined,
     sourceKey: l.sourceKey || undefined,
+    stateSteps: l.stateSteps || undefined,
   }));
+}
+
+// Add sink stateStep to taint labels that already have store steps, for multi-step PoC generation
+function annotateSinkSteps(taint, ctx) {
+  if (!taint.tainted) return taint;
+  // Check if any label has store steps
+  const hasStore = taint.toArray().some(l => l.stateSteps && l.stateSteps.some(s => s.action === 'store'));
+  if (!hasStore) return taint;
+
+  // Add sink condition if inside a branch
+  if (ctx._currentBranchCondition) {
+    const cond = extractConditionInfo(ctx._currentBranchCondition.node, ctx._currentBranchCondition.polarity);
+    if (cond) {
+      return taint.withStateStep({
+        action: 'sink',
+        condition: cond,
+        handler: ctx._handlerContext?.type || null,
+      });
+    }
+  }
+  // Add timer sink step if inside a timer callback
+  if (ctx._handlerContext?.type === 'timer') {
+    return taint.withStateStep({
+      action: 'sink',
+      handler: 'timer',
+      delay: ctx._handlerContext.delay || 0,
+    });
+  }
+  return taint;
 }
 
 function makeSinkInfo(expression, ctx, loc) {
@@ -791,6 +931,8 @@ function resolveConstantLeaf(node, _env, ctx) {
     if (!cur) return undefined;
     if (isStringLiteral(cur)) return cur.value;
     if (isNumericLit(cur)) return cur.value;
+    if (cur.type === 'BooleanLiteral' || (cur.type === 'Literal' && typeof cur.value === 'boolean')) return cur.value;
+    if (cur.type === 'NullLiteral' || (cur.type === 'Literal' && cur.value === null)) return null;
     if (cur.type === 'Identifier') {
       if (ctx?._paramConstants?.has(cur.name)) {
         return ctx._paramConstants.get(cur.name);
@@ -1066,9 +1208,23 @@ function processNode(node, env, ctx) {
           }
         }
         // For classes without explicit constructor, store a synthetic entry
+        // If there's a superclass, inject implicit super(...args) call (JS semantics)
         if (!hasConstructor) {
-          const synth = { type: 'ClassMethod', key: { name: 'constructor' }, params: [],
-            body: { type: 'BlockStatement', body: [] } };
+          const synthBody = [];
+          if (superName) {
+            // Implicit super() call: constructor(...args) { super(...args); }
+            synthBody.push({
+              type: 'ExpressionStatement',
+              expression: {
+                type: 'CallExpression',
+                callee: { type: 'Super' },
+                arguments: [],
+              },
+            });
+          }
+          const synth = { type: 'ClassMethod', key: { name: 'constructor' },
+            params: [{ type: 'RestElement', argument: { type: 'Identifier', name: '_args' } }],
+            body: { type: 'BlockStatement', body: synthBody } };
           if (superName) {
             synth._superClass = superName;
             ctx.superClassMap.set(className, superName);
@@ -1089,13 +1245,12 @@ function processNode(node, env, ctx) {
 
     case '_CatchParam':
       // Assign taint from ThrowStatement to the catch parameter
-      // Catch params are block-scoped — don't pollute global:name
+      // Catch params are block-scoped — always shadow outer scope variables
       if (node.param) {
         const savedBlockScoped = ctx._blockScopedDecl;
         ctx._blockScopedDecl = true;
-        if (ctx.thrownTaint.tainted || ctx._thrownProperties) {
-          assignToPattern(node.param, ctx.thrownTaint.tainted ? ctx.thrownTaint.clone() : TaintSet.empty(), env, ctx);
-        }
+        // Always assign to catch param (even empty taint) to shadow outer vars
+        assignToPattern(node.param, ctx.thrownTaint.tainted ? ctx.thrownTaint.clone() : TaintSet.empty(), env, ctx);
         // Propagate property-level taint from thrown object (e.g. err.html = tainted)
         if (ctx._thrownProperties && node.param.type === 'Identifier') {
           const catchName = node.param.name;
@@ -1250,7 +1405,13 @@ function storeObjectPropertyTaints(varName, objExpr, env, ctx) {
       continue;
     }
     if (isObjectProp(prop) && prop.key) {
-      const propName = propKeyName(prop.key);
+      let propName;
+      // Resolve computed property keys: { [varName]: tainted }
+      if (prop.computed) {
+        const resolved = resolveToConstant(prop.key, env, ctx);
+        if (typeof resolved === 'string') propName = resolved;
+      }
+      if (!propName) propName = propKeyName(prop.key);
       if (propName) {
         const propTaint = evaluateExpr(prop.value, env, ctx);
         env.set(`${varName}.${propName}`, propTaint);
@@ -1259,23 +1420,28 @@ function storeObjectPropertyTaints(varName, objExpr, env, ctx) {
   }
 }
 
-// ── Check if a node is document.createElement('script') ──
+// ── Check if a node is document.createElement(tagName) and return the tag ──
 // Uses AST structure walk instead of string comparison to handle aliases
-function isCreateScriptElement(node, env) {
-  if (node.type !== 'CallExpression') return false;
+function getCreateElementTag(node, env) {
+  if (node.type !== 'CallExpression') return null;
   const callee = node.callee;
-  if (!callee || callee.type !== 'MemberExpression' || callee.computed) return false;
-  if (callee.property?.name !== 'createElement') return false;
+  if (!callee || callee.type !== 'MemberExpression' || callee.computed) return null;
+  if (callee.property?.name !== 'createElement') return null;
   // Verify the object is `document` (or an alias to it)
   const obj = callee.object;
   if (obj.type === 'Identifier') {
     if (obj.name !== 'document') {
       const alias = env?.aliases?.get(obj.name);
-      if (alias !== 'document') return false;
+      if (alias !== 'document') return null;
     }
-  } else return false;
+  } else return null;
   const arg = node.arguments[0];
-  return arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === 'script';
+  if (arg && isStringLiteral(arg)) return stringLiteralValue(arg).toLowerCase();
+  return null;
+}
+// Backward compat wrapper
+function isCreateScriptElement(node, env) {
+  return getCreateElementTag(node, env) === 'script';
 }
 
 // ── Variable declaration ──
@@ -1310,7 +1476,13 @@ function processVarDeclarator(node, env, ctx) {
       const {objExpr, prefix} = romStack.pop();
       for (const prop of objExpr.properties) {
         if (isObjectProp(prop) && prop.key) {
-          const propName = propKeyName(prop.key);
+          let propName;
+          // Resolve computed property keys: { [varName]: function(){} } where varName = "render"
+          if (prop.computed) {
+            const resolved = resolveToConstant(prop.key, env, ctx);
+            if (typeof resolved === 'string') propName = resolved;
+          }
+          if (!propName) propName = propKeyName(prop.key);
           const val = prop.value;
           if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
             val._closureEnv = env;
@@ -1332,7 +1504,13 @@ function processVarDeclarator(node, env, ctx) {
           }
         }
         if (prop.type === 'ObjectMethod' && prop.key) {
-          const propName = propKeyName(prop.key);
+          let propName;
+          // Resolve computed ObjectMethod keys: { [varName]() {} }
+          if (prop.computed) {
+            const resolved = resolveToConstant(prop.key, env, ctx);
+            if (typeof resolved === 'string') propName = resolved;
+          }
+          if (!propName) propName = propKeyName(prop.key);
           if (propName) {
             prop._closureEnv = env;
             // Register getters/setters with special prefix so they can be invoked on property access/assignment
@@ -1378,10 +1556,18 @@ function processVarDeclarator(node, env, ctx) {
     }
   }
 
-  // Track document.createElement('script') results
-  if (node.id.type === 'Identifier' && isCreateScriptElement(node.init, env)) {
-    ctx.scriptElements.add(resolveId(node.id, ctx));
-    ctx.scriptElements.add(node.id.name);
+  // Track document.createElement element types
+  if (node.id.type === 'Identifier') {
+    const tag = getCreateElementTag(node.init, env);
+    if (tag) {
+      const key = resolveId(node.id, ctx);
+      ctx.elementTypes.set(key, tag);
+      ctx.elementTypes.set(node.id.name, tag);
+      if (tag === 'script') {
+        ctx.scriptElements.add(key);
+        ctx.scriptElements.add(node.id.name);
+      }
+    }
   }
 
   const taint = evaluateExpr(node.init, env, ctx);
@@ -1671,16 +1857,35 @@ function processAssignment(node, env, ctx) {
   ctx.returnedFuncNode = null;
   ctx.returnedMethods = null;
 
-  // Track document.createElement('script') in assignments
-  if (node.operator === '=' && node.left.type === 'Identifier' && isCreateScriptElement(node.right, env)) {
-    ctx.scriptElements.add(resolveId(node.left, ctx));
-    ctx.scriptElements.add(node.left.name);
+  // Track document.createElement element types in assignments
+  if (node.operator === '=' && node.left.type === 'Identifier') {
+    const tag = getCreateElementTag(node.right, env);
+    if (tag) {
+      const key = resolveId(node.left, ctx);
+      ctx.elementTypes.set(key, tag);
+      ctx.elementTypes.set(node.left.name, tag);
+      if (tag === 'script') {
+        ctx.scriptElements.add(key);
+        ctx.scriptElements.add(node.left.name);
+      }
+    }
   }
 
   const rhsTaint = evaluateExpr(node.right, env, ctx);
   checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
-  checkScriptElementSink(node.left, rhsTaint, env, ctx);
-  checkPrototypePollution(node, env, ctx);
+  checkElementPropertySink(node.left, rhsTaint, node.right, env, ctx);
+  // Pre-compute key taint for PP check (avoid evaluateExpr inside check function)
+  {
+    const left = node.left;
+    if (left.type === 'MemberExpression') {
+      const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
+      let outerKeyTaint = TaintSet.empty();
+      if (left.computed && left.object.type === 'MemberExpression' && left.object.computed) {
+        outerKeyTaint = evaluateExpr(left.object.property, env, ctx);
+      }
+      checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, outerKeyTaint);
+    }
+  }
 
   // Invoke setter if one is registered: obj.prop = value → setter:obj.prop(value)
   if (node.operator === '=' && node.left.type === 'MemberExpression') {
@@ -1721,8 +1926,8 @@ function processAssignment(node, env, ctx) {
         else {
           // Check if the left variable was initialized to a non-nullish constant
           const leftConst = resolveToConstant(node.left, env, ctx);
-          if (leftConst !== undefined) {
-            // Left is a known string constant → non-nullish → short-circuits
+          if (leftConst !== undefined && leftConst !== null) {
+            // Left is a known non-nullish constant → short-circuits
             finalTaint = leftTaint.clone();
           } else {
             finalTaint = leftTaint.clone().merge(rhsTaint);
@@ -1736,8 +1941,8 @@ function processAssignment(node, env, ctx) {
       if (leftConst !== undefined && leftConst) {
         finalTaint = leftTaint.clone();
       } else if (leftTaint.tainted) {
-        // Left is tainted (truthy in runtime), but conservatively merge both
-        finalTaint = leftTaint.clone().merge(rhsTaint);
+        // Left is tainted (source strings are always truthy) → short-circuit, keep left
+        finalTaint = leftTaint.clone();
       } else {
         finalTaint = leftTaint.clone().merge(rhsTaint);
       }
@@ -1786,6 +1991,19 @@ function processAssignment(node, env, ctx) {
       assignToPattern(pat, i < elemTaints.length ? elemTaints[i] : TaintSet.empty(), env, ctx);
     }
   } else {
+    // Annotate store stateStep for multi-step PoC when taint is stored under a branch condition inside a handler
+    if (ctx._handlerContext && ctx._currentBranchCondition && finalTaint.tainted &&
+        node.left.type === 'MemberExpression') {
+      const cond = extractConditionInfo(ctx._currentBranchCondition.node, ctx._currentBranchCondition.polarity);
+      if (cond) {
+        finalTaint = finalTaint.withStateStep({
+          action: 'store',
+          variable: nodeToString(node.left) || '',
+          condition: cond,
+          handler: ctx._handlerContext.type,
+        });
+      }
+    }
     assignToPattern(node.left, finalTaint, env, ctx);
   }
   registerReturnedFunctions(node.left, ctx);
@@ -1971,12 +2189,12 @@ function processAssignment(node, env, ctx) {
       if (rhsTaint.tainted) {
         const propName = node.left.property.name;
         const loc = getNodeLoc(node);
-        ctx.findings.push({
+        pushFinding(ctx, {
           type: 'XSS',
           severity: 'high',
           title: `XSS: tainted data assigned to event handler property .${propName}`,
           sink: makeSinkInfo(`.${propName}`, ctx, loc),
-          source: formatSources(rhsTaint),
+          source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
           path: buildTaintPath(rhsTaint, `.${propName}`),
         });
       }
@@ -2012,10 +2230,58 @@ function processAssignment(node, env, ctx) {
             const label = new TaintLabel('postMessage.data', ctx.file, loc.line || 0, loc.column || 0, desc);
             assignToPattern(handler.params[0], TaintSet.from(label), childEnv, ctx);
             childEnv.set(`${paramName}.data`, TaintSet.from(label));
+            const prevHandler = ctx._handlerContext;
+            ctx._handlerContext = { type: 'message', param: paramName };
+            handler._isEventHandler = true;
+            if (!handler._closureEnv) handler._closureEnv = env;
             if (handler.body.type === 'BlockStatement') {
               analyzeInlineFunction(handler, childEnv, ctx);
             } else {
               evaluateExpr(handler.body, childEnv, ctx);
+            }
+            ctx._handlerContext = prevHandler;
+          }
+        }
+      }
+    }
+  }
+
+  // window.onhashchange = function(e) { ... }
+  // Analyze the handler body with tainted event param, same as addEventListener('hashchange', fn)
+  if (node.operator === '=') {
+    const isOnhashchange = (node.left.type === 'Identifier' && node.left.name === 'onhashchange') ||
+      (node.left.type === 'MemberExpression' && !node.left.computed &&
+       node.left.property?.name === 'onhashchange' &&
+       node.left.object?.type === 'Identifier' &&
+       (node.left.object.name === 'window' || node.left.object.name === 'self' || node.left.object.name === 'globalThis'));
+    if (isOnhashchange) {
+      let handler = node.right;
+      if (handler.type === 'Identifier') {
+        const refKey = resolveId(handler, ctx);
+        handler = ctx.funcMap.get(refKey) || ctx.funcMap.get(handler.name) || handler;
+      }
+      if (handler.type === 'ArrowFunctionExpression' || handler.type === 'FunctionExpression' ||
+          handler.type === 'FunctionDeclaration') {
+        if (handler.params[0]) {
+          const paramName = handler.params[0].type === 'Identifier' ? handler.params[0].name : null;
+          if (paramName) {
+            const evtSource = EVENT_SOURCES['hashchange'];
+            if (evtSource) {
+              const childEnv = env.child();
+              const loc = getNodeLoc(handler);
+              const label = new TaintLabel(evtSource.label, ctx.file, loc.line || 0, loc.column || 0, `${paramName}.${evtSource.property}`);
+              childEnv.set(`${paramName}.${evtSource.property}`, TaintSet.from(label));
+              assignToPattern(handler.params[0], TaintSet.from(label), childEnv, ctx);
+              const prevHandler = ctx._handlerContext;
+              ctx._handlerContext = { type: 'hashchange', param: paramName };
+              handler._isEventHandler = true;
+              if (!handler._closureEnv) handler._closureEnv = env;
+              if (handler.body.type === 'BlockStatement') {
+                analyzeInlineFunction(handler, childEnv, ctx);
+              } else {
+                evaluateExpr(handler.body, childEnv, ctx);
+              }
+              ctx._handlerContext = prevHandler;
             }
           }
         }
@@ -2069,7 +2335,18 @@ function assignToPattern(rootPattern, rootTaint, env, ctx) {
                 env.set(`${objStr}.#idx_${resolved}`, taint);
               }
             } else {
-              if (taint.tainted) env.set(objStr, env.get(objStr).clone().merge(taint));
+              // Computed key couldn't be resolved → taint the base object
+              if (taint.tainted) {
+                env.set(objStr, env.get(objStr).clone().merge(taint));
+                // Also taint scope-resolved keys so outer lookups find it
+                if (pattern.object.type === 'Identifier') {
+                  const scopeKey = resolveId(pattern.object, ctx);
+                  if (scopeKey !== objStr) {
+                    env.set(scopeKey, env.get(scopeKey).clone().merge(taint));
+                  }
+                  env.set(`global:${pattern.object.name}`, env.get(`global:${pattern.object.name}`).clone().merge(taint));
+                }
+              }
             }
           }
         }
@@ -2202,6 +2479,11 @@ const C_LOGICAL_NEXT = 9;    // Pop right operand result, merge with accum, cont
 const C_COND_TEST = 10;      // Pop test taint (discarded), dispatch on constness
 const C_COND_BRANCH = 11;    // Pop branch taint, merge with accum, continue to alternate
 const C_COND_FINAL = 12;     // Pop final alternate taint, merge with accum, push result
+const C_TAGGED_TEMPLATE = 13; // Pop N expression taints, run tagged template logic
+const C_MEMBER_EXPR = 14;     // Pop sub-expression taint(s), apply member chain logic
+const C_CALL_ARGS = 15;       // Pop N arg taints, run call expression body
+const C_NEW_ARGS = 16;        // Pop N arg taints, run new expression body
+const C_BUILTIN_OBJ = 17;     // Pop callee object taint, run handleBuiltinMethod
 
 // ── Stepper helpers for compound expressions (push work items, no JS recursion) ──
 
@@ -2231,13 +2513,21 @@ function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
     if (op === '&&') {
       const constLeft = isConstantBool(ln, ctx);
       if (constLeft === false) { V.push(TaintSet.empty()); return; }
+      if (constLeft === true || accum.tainted) {
+        // Left is known truthy (constant true OR tainted source string = always truthy)
+        // Result is RHS only — push RHS with empty accum so merge doesn't carry LHS
+        W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum: TaintSet.empty(), parts, index, ln: right, env, ctx });
+        W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+        return;
+      }
       W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum, parts, index, ln: right, env, ctx });
       W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
       return;
     } else if (op === '||') {
       const constLeft = isConstantBool(ln, ctx);
-      if (constLeft === true) {
-        // short-circuit: left is truthy → entire chain result is the left value
+      if (constLeft === true || accum.tainted) {
+        // short-circuit: left is truthy (constant true OR tainted source = always truthy)
+        // → entire chain result is the left value
         V.push(accum);
         return;
       }
@@ -2339,22 +2629,222 @@ export function evaluateExpr(node, env, ctx) {
             _n._closureEnv = _e;
             V.push(TaintSet.empty());
             break;
-          // ── Stage 6: MemberExpression ──
+          // ── Stage 6: MemberExpression (iterative chain walk) ──
           case 'MemberExpression':
-          case 'OptionalMemberExpression':
-            V.push(evaluateMemberExpr(_n, _e, _c));
+          case 'OptionalMemberExpression': {
+            // arguments.callee — always safe
+            const _mFullPath = nodeToString(_n);
+            if (_mFullPath && (_mFullPath === 'arguments.callee' || _mFullPath.startsWith('arguments.callee.'))) {
+              V.push(TaintSet.empty());
+              break;
+            }
+            let _mCur = _n;
+            const _mOuterProps = [];
+            let _mResolved = false;
+
+            while (_mCur.type === 'MemberExpression' || _mCur.type === 'OptionalMemberExpression') {
+              let _mSourceLabel = checkMemberSource(_mCur);
+              if (!_mSourceLabel && _mCur.computed && _mCur.property) {
+                const _mResConst = resolveToConstant(_mCur.property, _e, _c);
+                if (typeof _mResConst === 'string') {
+                  const _mObjStr = nodeToString(_mCur.object);
+                  if (_mObjStr) {
+                    const _mSynthPath = `${_mObjStr}.${_mResConst}`;
+                    if (MEMBER_SOURCES[_mSynthPath]) _mSourceLabel = MEMBER_SOURCES[_mSynthPath];
+                  }
+                }
+              }
+              if (_mSourceLabel) {
+                const _mLoc = getNodeLoc(_mCur);
+                V.push(_applyOuterProps(TaintSet.from(new TaintLabel(_mSourceLabel, _c.file, _mLoc.line || 0, _mLoc.column || 0, nodeToString(_mCur))), _mOuterProps));
+                _mResolved = true;
+                break;
+              }
+
+              const _mFullStr = nodeToString(_mCur);
+              if (_mFullStr) {
+                const _mResolvedStr = resolveAliasedPath(_mFullStr, _e);
+                if (_mResolvedStr !== _mFullStr && MEMBER_SOURCES[_mResolvedStr]) {
+                  const _mLoc = getNodeLoc(_mCur);
+                  V.push(_applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[_mResolvedStr], _c.file, _mLoc.line || 0, _mLoc.column || 0, _mResolvedStr)), _mOuterProps));
+                  _mResolved = true;
+                  break;
+                }
+              }
+              if (!_mCur.computed && _mCur.object?.type === 'Identifier') {
+                const _mAlias = _e.aliases.get(_mCur.object.name);
+                if (_mAlias && _mCur.property) {
+                  const _mDeepPath = `${_mAlias}.${_mCur.property.name || _mCur.property.value}`;
+                  if (MEMBER_SOURCES[_mDeepPath]) {
+                    const _mLoc = getNodeLoc(_mCur);
+                    V.push(_applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[_mDeepPath], _c.file, _mLoc.line || 0, _mLoc.column || 0, _mDeepPath)), _mOuterProps));
+                    _mResolved = true;
+                    break;
+                  }
+                }
+              }
+
+              const _mFP = _mFullStr;
+              if (_mFP) {
+                if (_e.has(_mFP)) { V.push(_applyOuterProps(_e.get(_mFP).clone(), _mOuterProps)); _mResolved = true; break; }
+              }
+              if (!_mCur.computed && _mCur.object?.type === 'Identifier' && _mCur.property) {
+                const _mResolvedObjKey = resolveId(_mCur.object, _c);
+                const _mMemberProp = _mCur.property.name || _mCur.property.value;
+                if (_mMemberProp) {
+                  const _mScopedPath = `${_mResolvedObjKey}.${_mMemberProp}`;
+                  if (_e.has(_mScopedPath)) { V.push(_applyOuterProps(_e.get(_mScopedPath).clone(), _mOuterProps)); _mResolved = true; break; }
+                }
+              }
+              if (_mFP) {
+                const _mGetterFunc = _c.funcMap.get(`getter:${_mFP}`);
+                if (_mGetterFunc && _mGetterFunc.body) {
+                  const _mChildEnv = (_mGetterFunc._closureEnv || _e).child();
+                  const _mGetterTaint = analyzeInlineFunction(_mGetterFunc, _mChildEnv, _c);
+                  if (_mGetterTaint.tainted) { V.push(_applyOuterProps(_mGetterTaint, _mOuterProps)); _mResolved = true; break; }
+                }
+              }
+
+              const _mPropName = !_mCur.computed && _mCur.property ? (_mCur.property.name || _mCur.property.value) : null;
+              if (_mPropName && (NUMERIC_PROPS.has(_mPropName) || _mPropName === 'constructor' || _mPropName === 'prototype')) {
+                V.push(TaintSet.empty());
+                _mResolved = true;
+                break;
+              }
+
+              // Computed access: push continuation to evaluate object + property via W/V
+              if (_mCur.computed) {
+                W.push({ kind: W_CONTINUATION, label: C_MEMBER_EXPR, subtype: 'computed', node: _mCur, outerProps: _mOuterProps.slice(), env: _e, ctx: _c });
+                W.push({ kind: W_EVAL_EXPR, node: _mCur.property, env: _e, ctx: _c });
+                W.push({ kind: W_EVAL_EXPR, node: _mCur.object, env: _e, ctx: _c });
+                _mResolved = true;
+                break;
+              }
+
+              if (_mPropName) _mOuterProps.push(_mPropName);
+              _mCur = _mCur.object;
+            }
+
+            if (!_mResolved) {
+              // Root non-MemberExpression — evaluate via W/V
+              W.push({ kind: W_CONTINUATION, label: C_MEMBER_EXPR, subtype: 'root', outerProps: _mOuterProps.slice(), env: _e, ctx: _c });
+              W.push({ kind: W_EVAL_EXPR, node: _mCur, env: _e, ctx: _c });
+            }
             break;
-          // ── Stage 7: CallExpression / NewExpression ──
+          }
+          // ── Stage 7: CallExpression (iterative arg + callee evaluation) ──
           case 'CallExpression':
-          case 'OptionalCallExpression':
-            V.push(evaluateCallExpr(_n, _e, _c));
+          case 'OptionalCallExpression': {
+            // Handle import() with 'Import' callee type (Babel legacy)
+            if (_n.callee.type === 'Import' && _n.arguments.length > 0) {
+              W.push({ kind: W_CONTINUATION, label: C_IMPORT_EXPR, node: _n, ctx: _c });
+              W.push({ kind: W_EVAL_EXPR, node: _n.arguments[0], env: _e, ctx: _c });
+              break;
+            }
+
+            // Pre-compute calleeStr & methodName (no evaluateExpr needed)
+            let _cCalleeStr = nodeToString(_n.callee);
+            let _cMethodName = '';
+            if (_n.callee.type === 'MemberExpression' || _n.callee.type === 'OptionalMemberExpression') {
+              if (_n.callee.computed) {
+                const resolved = resolveToConstant(_n.callee.property, _e, _c);
+                if (resolved) _cMethodName = resolved;
+              } else {
+                _cMethodName = _n.callee.property?.name || '';
+              }
+            }
+            if (_cCalleeStr && _n.callee.type === 'Identifier') {
+              const alias = _e.aliases.get(_cCalleeStr);
+              if (alias) _cCalleeStr = alias;
+            }
+            if (_cCalleeStr && (_n.callee.type === 'MemberExpression' || _n.callee.type === 'OptionalMemberExpression')) {
+              const memberAlias = _e.aliases.get(_cCalleeStr);
+              if (memberAlias) _cCalleeStr = memberAlias;
+            }
+            if (!_cCalleeStr && _n.callee.type === 'SequenceExpression') {
+              const last = _n.callee.expressions[_n.callee.expressions.length - 1];
+              if (last) { const lastStr = nodeToString(last); if (lastStr) _cCalleeStr = lastStr; }
+            }
+            if (!_cCalleeStr && _n.callee.type === 'LogicalExpression') {
+              const leftStr = nodeToString(_n.callee.left);
+              const rightStr = nodeToString(_n.callee.right);
+              const leftConst = resolveToConstant(_n.callee.left, _e, _c);
+              if (_n.callee.operator === '??') {
+                if (leftConst === null || leftConst === undefined) _cCalleeStr = rightStr;
+                else if (leftConst !== undefined) _cCalleeStr = leftStr;
+                else _cCalleeStr = rightStr || leftStr;
+              } else if (_n.callee.operator === '||') {
+                if (leftConst !== undefined && !leftConst) _cCalleeStr = rightStr;
+                else if (leftConst !== undefined && leftConst) _cCalleeStr = leftStr;
+                else _cCalleeStr = rightStr || leftStr;
+              } else if (_n.callee.operator === '&&') {
+                if (leftConst !== undefined && leftConst) _cCalleeStr = rightStr;
+                else if (leftConst !== undefined && !leftConst) _cCalleeStr = leftStr;
+                else _cCalleeStr = rightStr || leftStr;
+              }
+              if (_cCalleeStr) {
+                const parts = _cCalleeStr.split('.');
+                _cMethodName = parts[parts.length - 1];
+              }
+            }
+
+            // Determine if callee needs W/V evaluation for side effects
+            const _cNeedCalleeEval = _n.callee.type === 'CallExpression' ||
+                                     _n.callee.type === 'OptionalCallExpression' ||
+                                     _n.callee.type === 'NewExpression' ||
+                                     _n.callee.type === 'ConditionalExpression';
+            // Determine if callee.object needs W/V evaluation (for handleBuiltinMethod objTaint)
+            const _cHasObjEval = !!(_n.callee?.object &&
+              (_n.callee.type === 'MemberExpression' || _n.callee.type === 'OptionalMemberExpression'));
+
+            // Push continuation (processed last)
+            // V pop order: args (N), then objTaint (if hasObjEval), then calleeResult (if hasCalleeEval)
+            W.push({ kind: W_CONTINUATION, label: C_CALL_ARGS,
+                     node: _n, calleeStr: _cCalleeStr, methodName: _cMethodName,
+                     argCount: _n.arguments.length,
+                     hasCalleeEval: _cNeedCalleeEval,
+                     hasObjEval: _cHasObjEval,
+                     env: _e, ctx: _c });
+            // Push args in reverse (last pushed = first evaluated)
+            for (let i = _n.arguments.length - 1; i >= 0; i--) {
+              W.push({ kind: W_EVAL_EXPR, node: _n.arguments[i], env: _e, ctx: _c });
+            }
+            // Push callee.object eval (processed before args, after callee)
+            if (_cHasObjEval) {
+              W.push({ kind: W_EVAL_EXPR, node: _n.callee.object, env: _e, ctx: _c });
+            }
+            // Push callee eval if needed (processed first, before everything)
+            if (_cNeedCalleeEval) {
+              W.push({ kind: W_EVAL_EXPR, node: _n.callee, env: _e, ctx: _c });
+            }
             break;
-          case 'NewExpression':
-            V.push(evaluateNewExpr(_n, _e, _c));
+          }
+          case 'NewExpression': {
+            // Pre-compute constructorName (no evaluateExpr needed)
+            let _nCtorName = nodeToString(_n.callee);
+            if (_nCtorName && _n.callee.type === 'Identifier') {
+              const alias = _e.aliases.get(_nCtorName);
+              if (alias) _nCtorName = alias;
+            }
+            // Push continuation + args via W/V
+            W.push({ kind: W_CONTINUATION, label: C_NEW_ARGS,
+                     node: _n, constructorName: _nCtorName,
+                     argCount: _n.arguments.length,
+                     env: _e, ctx: _c });
+            for (let i = _n.arguments.length - 1; i >= 0; i--) {
+              W.push({ kind: W_EVAL_EXPR, node: _n.arguments[i], env: _e, ctx: _c });
+            }
             break;
-          case 'TaggedTemplateExpression':
-            V.push(evaluateTaggedTemplate(_n, _e, _c));
+          }
+          case 'TaggedTemplateExpression': {
+            const exprs = _n.quasi.expressions;
+            W.push({ kind: W_CONTINUATION, label: C_TAGGED_TEMPLATE, count: exprs.length, node: _n, env: _e, ctx: _c });
+            for (let i = exprs.length - 1; i >= 0; i--) {
+              W.push({ kind: W_EVAL_EXPR, node: exprs[i], env: _e, ctx: _c });
+            }
+            if (exprs.length === 0) V.push(TaintSet.empty()); // sentinel for 0-expr case
             break;
+          }
           // ── Stage 5: AssignmentExpression ──
           case 'AssignmentExpression':
             processAssignment(_n, _e, _c);
@@ -2486,7 +2976,7 @@ export function evaluateExpr(node, env, ctx) {
             const specifierTaint = V.pop();
             if (specifierTaint.tainted) {
               const loc = getNodeLoc(item.node);
-              item.ctx.findings.push({
+              pushFinding(item.ctx, {
                 type: 'Script Injection',
                 severity: 'critical',
                 title: 'Script Injection: tainted data flows to dynamic import()',
@@ -2573,7 +3063,7 @@ export function evaluateExpr(node, env, ctx) {
           case C_COND_TEST: {
             V.pop(); // discard test taint (evaluated for side effects)
             const cn = item.cn;
-            const constCond = isConstantBool(cn.test);
+            const constCond = isConstantBool(cn.test, item.ctx);
             if (constCond === true) {
               // Definite true: evaluate consequent as final result
               W.push({ kind: W_CONTINUATION, label: C_COND_FINAL, accum: TaintSet.empty(), ctx: item.ctx, node: cn.consequent });
@@ -2615,6 +3105,47 @@ export function evaluateExpr(node, env, ctx) {
             V.push(result);
             break;
           }
+          case C_TAGGED_TEMPLATE: {
+            const exprTaints = [];
+            if (item.count === 0) {
+              V.pop(); // pop sentinel
+            } else {
+              for (let i = 0; i < item.count; i++) exprTaints.push(V.pop());
+              exprTaints.reverse();
+            }
+            V.push(_evaluateTaggedTemplateBody(item.node, exprTaints, item.env, item.ctx));
+            break;
+          }
+          case C_MEMBER_EXPR: {
+            if (item.subtype === 'root') {
+              const rootTaint = V.pop();
+              V.push(_applyOuterProps(rootTaint, item.outerProps));
+            } else if (item.subtype === 'computed') {
+              // W push order: continuation, property, object → object eval first, property second
+              // V pop order: keyTaint (top, last pushed), objTaint (below)
+              const keyTaint = V.pop();
+              const objTaint = V.pop();
+              V.push(_applyOuterProps(_evaluateComputedMemberBody(item.node, objTaint, keyTaint, item.env, item.ctx), item.outerProps));
+            }
+            break;
+          }
+          case C_CALL_ARGS: {
+            // Pop arg taints: last pushed = on top, so pop in reverse then reverse array
+            const argTaints = [];
+            for (let i = 0; i < item.argCount; i++) argTaints.push(V.pop());
+            argTaints.reverse();
+            const objTaint = item.hasObjEval ? V.pop() : TaintSet.empty();
+            if (item.hasCalleeEval) V.pop(); // discard callee result (side effects already done)
+            V.push(_evaluateCallExprBody(item.node, item.calleeStr, item.methodName, argTaints, objTaint, item.env, item.ctx));
+            break;
+          }
+          case C_NEW_ARGS: {
+            const argTaints = [];
+            for (let i = 0; i < item.argCount; i++) argTaints.push(V.pop());
+            argTaints.reverse();
+            V.push(_evaluateNewExprBody(item.node, item.constructorName, argTaints, item.env, item.ctx));
+            break;
+          }
         }
         break;
       }
@@ -2624,9 +3155,8 @@ export function evaluateExpr(node, env, ctx) {
   return V.pop() || TaintSet.empty();
 }
 
-// ── Member expression ──
-function evaluateTaggedTemplate(node, env, ctx) {
-  const exprTaints = node.quasi.expressions.map(e => evaluateExpr(e, env, ctx));
+// ── Tagged template body (called from C_TAGGED_TEMPLATE continuation) ──
+function _evaluateTaggedTemplateBody(node, exprTaints, env, ctx) {
   const stringsArg = TaintSet.empty();
   const allArgTaints = [stringsArg, ...exprTaints];
   const tagCallee = node.tag;
@@ -2637,10 +3167,13 @@ function evaluateTaggedTemplate(node, env, ctx) {
     const tagStr = nodeToString(tagCallee);
     if (tagStr) funcNode = ctx.funcMap.get(tagStr);
   }
+  // Check sanitizer BEFORE attempting function analysis or fallback merge
+  const tagCalleeStr = nodeToString(tagCallee);
+  const tagMethodName = tagCallee.type === 'MemberExpression' ? (tagCallee.property?.name || '') : '';
+  if (isSanitizer(tagCalleeStr, tagMethodName)) return TaintSet.empty();
+
   if (funcNode && funcNode.body) {
     const synthCall = { type: 'CallExpression', callee: tagCallee, arguments: [{ type: 'ArrayExpression', elements: [] }, ...node.quasi.expressions] };
-    const tagCalleeStr = nodeToString(tagCallee);
-    if (isSanitizer(tagCalleeStr, '')) return TaintSet.empty();
     return analyzeCalledFunction(synthCall, tagCalleeStr, allArgTaints, env, ctx);
   }
   const t = TaintSet.empty();
@@ -2648,111 +3181,18 @@ function evaluateTaggedTemplate(node, env, ctx) {
   return t;
 }
 
-function evaluateMemberExpr(node, env, ctx) {
-  // arguments.callee refers to the function itself, not argument values — always safe
-  const fullPath = nodeToString(node);
-  if (fullPath && (fullPath === 'arguments.callee' || fullPath.startsWith('arguments.callee.'))) {
-    return TaintSet.empty();
+// Standalone helper: apply accumulated outer-property transforms to a taint result
+function _applyOuterProps(taint, outerProps) {
+  if (!taint.tainted || outerProps.length === 0) return taint;
+  let result = taint;
+  for (let i = outerProps.length - 1; i >= 0; i--) {
+    result = result.withTransform({ op: 'property', args: [outerProps[i]] });
   }
-
-  // Iterative evaluation for MemberExpression chains to avoid stack overflow on minified code.
-  // Walk the chain, checking sources/env/getters at each level. Only recurse for computed access.
-  // Track properties accessed at outer levels so we can add transforms when the source is found deeper.
-  let cur = node;
-  const outerProps = []; // properties accessed at levels above where the source/env-hit is found
-
-  // Helper: apply accumulated outer-property transforms to a taint result
-  const applyOuterProps = (taint) => {
-    if (!taint.tainted || outerProps.length === 0) return taint;
-    let result = taint;
-    for (let i = outerProps.length - 1; i >= 0; i--) {
-      result = result.withTransform({ op: 'property', args: [outerProps[i]] });
-    }
-    return result;
-  };
-
-  while (cur.type === 'MemberExpression' || cur.type === 'OptionalMemberExpression') {
-    let sourceLabel = checkMemberSource(cur);
-    // For computed members with resolvable keys: location[prop] where prop = "hash"
-    if (!sourceLabel && cur.computed && cur.property) {
-      const resolved = resolveToConstant(cur.property, env, ctx);
-      if (typeof resolved === 'string') {
-        const objStr = nodeToString(cur.object);
-        if (objStr) {
-          const synthPath = `${objStr}.${resolved}`;
-          if (MEMBER_SOURCES[synthPath]) sourceLabel = MEMBER_SOURCES[synthPath];
-        }
-      }
-    }
-    if (sourceLabel) {
-      const loc = getNodeLoc(cur);
-      return applyOuterProps(TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur))));
-    }
-
-    // Resolve aliases: replace root identifier with its alias and re-check as source
-    const fullStr = nodeToString(cur);
-    if (fullStr) {
-      const resolvedStr = resolveAliasedPath(fullStr, env);
-      if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
-        const loc = getNodeLoc(cur);
-        return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr)));
-      }
-    }
-    if (!cur.computed && cur.object?.type === 'Identifier') {
-      const alias = env.aliases.get(cur.object.name);
-      if (alias && cur.property) {
-        const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
-        if (MEMBER_SOURCES[deepPath]) {
-          const loc = getNodeLoc(cur);
-          return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath)));
-        }
-      }
-    }
-
-    const fullPath = fullStr;
-    if (fullPath) {
-      if (env.has(fullPath)) return applyOuterProps(env.get(fullPath).clone());
-    }
-    // Scope-resolved lookup
-    if (!cur.computed && cur.object?.type === 'Identifier' && cur.property) {
-      const resolvedObjKey = resolveId(cur.object, ctx);
-      const memberProp = cur.property.name || cur.property.value;
-      if (memberProp) {
-        const scopedPath = `${resolvedObjKey}.${memberProp}`;
-        if (env.has(scopedPath)) return applyOuterProps(env.get(scopedPath).clone());
-      }
-    }
-    if (fullPath) {
-      const getterFunc = ctx.funcMap.get(`getter:${fullPath}`);
-      if (getterFunc && getterFunc.body) {
-        const childEnv = (getterFunc._closureEnv || env).child();
-        const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
-        if (getterTaint.tainted) return applyOuterProps(getterTaint);
-      }
-    }
-
-    const propName = !cur.computed && cur.property ? (cur.property.name || cur.property.value) : null;
-    if (propName && (NUMERIC_PROPS.has(propName) || propName === 'constructor' || propName === 'prototype')) {
-      return TaintSet.empty();
-    }
-
-    // Computed access: evaluate object + key, handle property lookups, then return
-    if (cur.computed) {
-      const objTaint = evaluateExpr(cur.object, env, ctx);
-      return applyOuterProps(evaluateComputedMember(cur, objTaint, env, ctx));
-    }
-
-    // Non-computed: record the property and continue walking up the chain
-    if (propName) outerProps.push(propName);
-    cur = cur.object;
-  }
-  // Reached the root (non-MemberExpression node)
-  const rootTaint = evaluateExpr(cur, env, ctx);
-  return applyOuterProps(rootTaint);
+  return result;
 }
 
-function evaluateComputedMember(node, objTaint, env, ctx) {
-    const keyTaint = evaluateExpr(node.property, env, ctx);
+// Body of computed member evaluation — keyTaint is pre-computed by W/V stack
+function _evaluateComputedMemberBody(node, objTaint, keyTaint, env, ctx) {
     // For computed access with a constant key (obj['key'], arr[0], obj[constVar]),
     // do per-property lookup — precise, not overapproximated
     let litKey = null;
@@ -2930,78 +3370,33 @@ const NUMERIC_PROPS = new Set([
 ]);
 
 // ── Call expression ──
-function evaluateCallExpr(node, env, ctx) {
-  let calleeStr = nodeToString(node.callee);
-  let methodName = '';
-  if (node.callee.type === 'MemberExpression' || node.callee.type === 'OptionalMemberExpression') {
-    if (node.callee.computed) {
-      // Computed property: obj[method]() — resolve the property to a constant string
-      const resolved = resolveToConstant(node.callee.property, env, ctx);
-      if (resolved) methodName = resolved;
-    } else {
-      methodName = node.callee.property?.name || '';
-    }
-  }
-
-  // Resolve aliases for identifier callees: var e = eval; e(x) → eval(x)
-  if (calleeStr && node.callee.type === 'Identifier') {
-    const alias = env.aliases.get(calleeStr);
-    if (alias) calleeStr = alias;
-  }
-  // Resolve MemberExpression callee aliases: obj.fn = eval; obj.fn(x) → eval(x)
-  if (calleeStr && (node.callee.type === 'MemberExpression' || node.callee.type === 'OptionalMemberExpression')) {
-    const memberAlias = env.aliases.get(calleeStr);
-    if (memberAlias) calleeStr = memberAlias;
-  }
-
-  // Indirect eval: (0, eval)(x) — the callee is a SequenceExpression whose last element is eval
-  if (!calleeStr && node.callee.type === 'SequenceExpression') {
-    const last = node.callee.expressions[node.callee.expressions.length - 1];
-    if (last) {
-      const lastStr = nodeToString(last);
-      if (lastStr) calleeStr = lastStr;
-    }
-  }
-
-  // Babel parses import(x) as CallExpression with callee.type === 'Import'
-  if (node.callee.type === 'Import' && node.arguments.length > 0) {
-    const specifierTaint = evaluateExpr(node.arguments[0], env, ctx);
-    if (specifierTaint.tainted) {
-      const loc = node.loc?.start || { line: 0, column: 0 };
-      ctx.findings.push({
-        type: 'Script Injection',
-        severity: 'critical',
-        title: 'Script Injection: tainted data flows to dynamic import()',
-        sink: makeSinkInfo('import()', ctx, loc),
-        source: formatSources(specifierTaint),
-        path: buildTaintPath(specifierTaint, 'import()'),
-      });
-    }
-    return TaintSet.empty();
-  }
-
-  // For factory()() patterns: evaluate the callee CallExpression first
-  // so ctx.returnedFuncNode is set before analyzeCalledFunction runs
-  if (node.callee.type === 'CallExpression' || node.callee.type === 'OptionalCallExpression') {
-    evaluateExpr(node.callee, env, ctx);
-  }
-  // For new Function(code)() patterns: evaluate the NewExpression callee
-  // so the sink check inside evaluateNewExpr fires
-  if (node.callee.type === 'NewExpression') {
-    evaluateExpr(node.callee, env, ctx);
-  }
-  // For (cond ? fn1 : fn2)(args) patterns: evaluate the conditional callee
-  // so ctx.returnedFuncNode is set to the selected function reference
-  if (node.callee.type === 'ConditionalExpression') {
-    evaluateExpr(node.callee, env, ctx);
-  }
-
-  const argTaints = node.arguments.map(arg => evaluateExpr(arg, env, ctx));
+// Body of call expression evaluation — calleeStr, methodName, argTaints, objTaint pre-computed by W/V
+function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint, env, ctx) {
 
   if (isSanitizer(calleeStr, methodName)) return TaintSet.empty();
 
   const sinkInfo = checkCallSink(calleeStr, methodName);
   if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
+
+  // .constructor.constructor(code) — resolves to Function(code), equivalent to eval
+  // Works with any base: x.constructor.constructor, "".constructor.constructor, [].constructor.constructor
+  if (methodName === 'constructor') {
+    const callee = node.callee;
+    let isDoubleConstructor = false;
+    if (calleeStr && calleeStr.endsWith('.constructor.constructor')) {
+      isDoubleConstructor = true;
+    } else if (callee.type === 'MemberExpression' && !callee.computed &&
+               callee.property?.name === 'constructor' &&
+               callee.object?.type === 'MemberExpression' && !callee.object.computed &&
+               callee.object.property?.name === 'constructor') {
+      // AST check: callee is X.constructor.constructor where X can be any expression (literal, etc.)
+      isDoubleConstructor = true;
+    }
+    if (isDoubleConstructor) {
+      const allArgIndices = argTaints.map((_, i) => i);
+      checkSinkCall(node, { type: 'XSS', taintedArgs: allArgIndices }, argTaints, 'Function()', env, ctx);
+    }
+  }
 
   // Script element: el.setAttribute('src', tainted)
   if (methodName === 'setAttribute' && node.arguments.length >= 2) {
@@ -3018,7 +3413,7 @@ function evaluateCallExpr(node, env, ctx) {
     if (attrNameTaint && attrNameTaint.tainted && node.callee?.object) {
       const objName = nodeToString(node.callee.object);
       const loc = getNodeLoc(node);
-      ctx.findings.push({
+      pushFinding(ctx, {
         type: 'XSS',
         severity: 'high',
         title: 'XSS: attacker-controlled attribute name in setAttribute',
@@ -3035,7 +3430,7 @@ function evaluateCallExpr(node, env, ctx) {
         // Script element src
         if (attrName === 'src' && objName && (ctx.scriptElements.has(objKey) || ctx.scriptElements.has(objName))) {
           const loc = getNodeLoc(node);
-          ctx.findings.push({
+          pushFinding(ctx, {
             type: 'Script Injection',
             severity: 'critical',
             title: 'Script Injection: tainted data flows to script element src',
@@ -3053,7 +3448,7 @@ function evaluateCallExpr(node, env, ctx) {
           const isCss = attrName === 'style';
           const type = isCss ? 'CSS Injection' : 'XSS';
           const loc = getNodeLoc(node);
-          ctx.findings.push({
+          pushFinding(ctx, {
             type,
             severity: isCss ? 'high' : (isEventHandler ? 'critical' : 'high'),
             title: `${type}: tainted data flows to setAttribute('${attrName}')`,
@@ -3078,11 +3473,15 @@ function evaluateCallExpr(node, env, ctx) {
     if (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression' ||
         callback.type === 'FunctionDeclaration') {
       const childEnv = (callback._closureEnv || env).child();
+      const prevHandler = ctx._handlerContext;
+      const timerDelay = node.arguments[1] ? resolveToConstant(node.arguments[1], env, ctx) : null;
+      ctx._handlerContext = { type: 'timer', delay: typeof timerDelay === 'number' ? timerDelay : 0 };
       if (callback.body.type === 'BlockStatement') {
         analyzeInlineFunction(callback, childEnv, ctx);
       } else {
         evaluateExpr(callback.body, childEnv, ctx);
       }
+      ctx._handlerContext = prevHandler;
     }
   }
 
@@ -3098,7 +3497,7 @@ function evaluateCallExpr(node, env, ctx) {
     const protoTaint = argTaints[1];
     if (protoTaint && protoTaint.tainted) {
       const loc = getNodeLoc(node);
-      ctx.findings.push({
+      pushFinding(ctx, {
         type: 'Prototype Pollution',
         severity: 'critical',
         title: 'Prototype Pollution: tainted data passed to Object.setPrototypeOf',
@@ -3122,8 +3521,16 @@ function evaluateCallExpr(node, env, ctx) {
     const objStr = nodeToString(objNode);
     if (objStr && isStringLiteral(propNode)) {
       const propName = stringLiteralValue(propNode);
+      const fullPath = `${objStr}.${propName}`;
+      // Check if this resolves to a known taint source (e.g., Reflect.get(location, "hash"))
+      const sourceLabel = MEMBER_SOURCES[fullPath];
+      if (sourceLabel) {
+        const taint = new TaintSet();
+        taint.add(new TaintLabel(sourceLabel, ctx.file, node.loc?.start?.line || 0, fullPath));
+        return taint;
+      }
       // Per-property lookup: if the specific property binding exists, use it (even if empty)
-      if (env.has(`${objStr}.${propName}`)) return env.get(`${objStr}.${propName}`).clone();
+      if (env.has(fullPath)) return env.get(fullPath).clone();
       if (objNode.type === 'Identifier') {
         const key = resolveId(objNode, ctx);
         if (env.has(`${key}.${propName}`)) return env.get(`${key}.${propName}`).clone();
@@ -3138,6 +3545,20 @@ function evaluateCallExpr(node, env, ctx) {
     const objNode = node.arguments[0];
     const propNode = node.arguments[1];
     const descNode = node.arguments[2];
+    // Detect tainted key as Prototype Pollution: Object.defineProperty(obj, taintedKey, ...)
+    const propKeyTaint = evaluateExpr(propNode, env, ctx);
+    if (propKeyTaint.tainted) {
+      const loc = getNodeLoc(node);
+      const objStr = nodeToString(objNode) || 'obj';
+      pushFinding(ctx, {
+        type: 'Prototype Pollution',
+        severity: 'critical',
+        title: `Prototype Pollution: attacker controls property key in Object.defineProperty`,
+        sink: makeSinkInfo(`Object.defineProperty(${objStr}, taintedKey)`, ctx, loc),
+        source: formatSources(propKeyTaint),
+        path: buildTaintPath(propKeyTaint, `Object.defineProperty(${objStr}, taintedKey)`),
+      });
+    }
     if (objNode && propNode && descNode && descNode.type === 'ObjectExpression') {
       const objStr = nodeToString(objNode);
       const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
@@ -3151,6 +3572,18 @@ function evaluateCallExpr(node, env, ctx) {
               if (objNode.type === 'Identifier') {
                 const key = resolveId(objNode, ctx);
                 env.set(`${key}.${propName}`, valTaint);
+              }
+              // Detect Object.defineProperty(obj, '__proto__', {value: tainted}) as Prototype Pollution
+              if (propName === '__proto__' || propName === 'prototype') {
+                const loc = getNodeLoc(node);
+                pushFinding(ctx, {
+                  type: 'Prototype Pollution',
+                  severity: 'critical',
+                  title: `Prototype Pollution: tainted data set via Object.defineProperty on ${propName}`,
+                  sink: makeSinkInfo(`Object.defineProperty(${objStr}, "${propName}")`, ctx, loc),
+                  source: formatSources(valTaint),
+                  path: buildTaintPath(valTaint, `Object.defineProperty(${objStr}, "${propName}")`),
+                });
               }
             }
           }
@@ -3269,10 +3702,51 @@ function evaluateCallExpr(node, env, ctx) {
   if (isCalleeMatch(node, 'Reflect', 'construct', env) && node.arguments.length >= 2) {
     const targetNode = node.arguments[0];
     const argsNode = node.arguments[1];
-    // Synthesize a NewExpression and delegate to evaluateNewExpr
+    // Synthesize a NewExpression and delegate to _evaluateNewExprBody
     const synthArgs = argsNode.type === 'ArrayExpression' ? argsNode.elements.filter(Boolean) : [];
     const synthNew = { ...node, type: 'NewExpression', callee: targetNode, arguments: synthArgs };
-    return evaluateNewExpr(synthNew, env, ctx);
+    let rCtorName = nodeToString(targetNode);
+    if (rCtorName && targetNode.type === 'Identifier') {
+      const alias = env.aliases.get(rCtorName);
+      if (alias) rCtorName = alias;
+    }
+    const rArgTaints = synthArgs.map(a => evaluateExpr(a, env, ctx));
+    return _evaluateNewExprBody(synthNew, rCtorName, rArgTaints, env, ctx);
+  }
+
+  // Reflect.set(obj, prop, value) — detect __proto__ as Prototype Pollution
+  if (isCalleeMatch(node, 'Reflect', 'set', env) && node.arguments.length >= 3) {
+    const propNode = node.arguments[1];
+    const valTaint = argTaints[2] || TaintSet.empty();
+    const propResolved = resolveToConstant(propNode, env, ctx);
+    if (typeof propResolved === 'string' && (propResolved === '__proto__' || propResolved === 'prototype')) {
+      if (valTaint.tainted) {
+        const loc = getNodeLoc(node);
+        const objStr = nodeToString(node.arguments[0]) || 'obj';
+        pushFinding(ctx, {
+          type: 'Prototype Pollution',
+          severity: 'critical',
+          title: `Prototype Pollution: tainted data set via Reflect.set on ${propResolved}`,
+          sink: makeSinkInfo(`Reflect.set(${objStr}, "${propResolved}")`, ctx, loc),
+          source: formatSources(valTaint),
+          path: buildTaintPath(valTaint, `Reflect.set(${objStr}, "${propResolved}")`),
+        });
+      }
+    }
+    // Tainted property key is also PP
+    const propTaint = argTaints[1] || TaintSet.empty();
+    if (propTaint.tainted) {
+      const loc = getNodeLoc(node);
+      const objStr = nodeToString(node.arguments[0]) || 'obj';
+      pushFinding(ctx, {
+        type: 'Prototype Pollution',
+        severity: 'critical',
+        title: 'Prototype Pollution: attacker controls property key in Reflect.set',
+        sink: makeSinkInfo(`Reflect.set(${objStr}, taintedKey)`, ctx, loc),
+        source: formatSources(propTaint),
+        path: buildTaintPath(propTaint, `Reflect.set(${objStr}, taintedKey)`),
+      });
+    }
   }
 
   // Object.freeze/seal/preventExtensions — return the same object, propagate taint
@@ -3281,8 +3755,26 @@ function evaluateCallExpr(node, env, ctx) {
   }
 
   // Object.values/keys/entries — propagate taint from object properties
-  // Object.keys returns property names (strings) — not tainted by values
-  if (isCalleeMatch(node, 'Object', 'keys', env)) return TaintSet.empty();
+  // Object.keys: keys of a known-structure object (object literal, variable assigned
+  // from literal) are safe string literals. But when the object was produced by a
+  // fully-tainted expression (JSON.parse, function return, etc.), attacker may control
+  // property names, so propagate taint.
+  if (isCalleeMatch(node, 'Object', 'keys', env)) {
+    const argNode = node.arguments[0];
+    if (argNode) {
+      // If the argument is an object literal, keys are compile-time known → safe
+      if (argNode.type === 'ObjectExpression') return TaintSet.empty();
+      // If it's a variable, check if its initializer is an object literal
+      if (argNode.type === 'Identifier') {
+        const initNode = resolveInitFromScope(argNode, ctx);
+        if (initNode && initNode.type === 'ObjectExpression') return TaintSet.empty();
+      }
+    }
+    // Otherwise, if the object itself is tainted, keys may be attacker-controlled
+    const argTaint = argTaints[0] || TaintSet.empty();
+    if (argTaint.tainted) return argTaint.clone();
+    return TaintSet.empty();
+  }
 
   if (isCalleeMatch(node, 'Object', 'values', env) || isCalleeMatch(node, 'Object', 'entries', env)) {
     const argTaint = argTaints[0] || TaintSet.empty();
@@ -3339,6 +3831,27 @@ function evaluateCallExpr(node, env, ctx) {
               propTaints.set(propName, taint);
             }
           }
+          // Also check if source has safe overrides for properties already in propTaints or target
+          // This handles Object.assign(taintedTarget, safeSource) where safeSource.prop overrides taintedTarget.prop
+          const keysToCheck = new Set([...propTaints.keys()]);
+          if (targetStr) {
+            for (const [key] of env.getTaintedWithPrefix(`${targetStr}.`)) {
+              const propName = key.slice(targetStr.length + 1);
+              if (propName && !propName.startsWith('#')) keysToCheck.add(propName);
+            }
+            if (targetKey) {
+              for (const [key] of env.getTaintedWithPrefix(`${targetKey}.`)) {
+                const propName = key.slice(targetKey.length + 1);
+                if (propName && !propName.startsWith('#')) keysToCheck.add(propName);
+              }
+            }
+          }
+          for (const propName of keysToCheck) {
+            const srcPropTaint = env.get(`${srcStr}.${propName}`);
+            if (!srcPropTaint.tainted && env.has(`${srcStr}.${propName}`)) {
+              propTaints.set(propName, srcPropTaint);
+            }
+          }
         }
       }
     }
@@ -3391,7 +3904,7 @@ function evaluateCallExpr(node, env, ctx) {
     }
   }
 
-  const propagated = handleBuiltinMethod(methodName, node, argTaints, env, ctx);
+  const propagated = handleBuiltinMethod(methodName, node, argTaints, objTaint, env, ctx);
   if (propagated !== null) return propagated;
 
   // Chained method on returned object: factory().method()
@@ -3443,14 +3956,8 @@ function walkCallsToResolve(root, resolveName, env, ctx, taintOut) {
 }
 
 // ── New expression ──
-function evaluateNewExpr(node, env, ctx) {
-  let constructorName = nodeToString(node.callee);
-  // Resolve aliases: var F = Function; new F(code) → new Function(code)
-  if (constructorName && node.callee.type === 'Identifier') {
-    const alias = env.aliases.get(constructorName);
-    if (alias) constructorName = alias;
-  }
-  const argTaints = node.arguments.map(arg => evaluateExpr(arg, env, ctx));
+// Body of new expression evaluation — constructorName, argTaints pre-computed by W/V
+function _evaluateNewExprBody(node, constructorName, argTaints, env, ctx) {
 
   // Handle ClassExpression as callee: new (class { constructor() {...} })()
   if (node.callee.type === 'ClassExpression' && node.callee.body?.body) {
@@ -3744,8 +4251,7 @@ function evaluateNewExpr(node, env, ctx) {
 }
 
 // ── Built-in method taint propagation ──
-function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
-  const objTaint = node.callee?.object ? evaluateExpr(node.callee.object, env, ctx) : TaintSet.empty();
+function handleBuiltinMethod(methodName, node, argTaints, objTaint, env, ctx) {
 
   switch (methodName) {
     case 'slice': case 'substring': case 'substr': case 'trim': case 'trimStart':
@@ -4097,11 +4603,11 @@ function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
         } else {
           method = null;
         }
-        // Try builtin method first
+        // Try builtin method first — thisArgTaint serves as objTaint for re-dispatched call
         const result = handleBuiltinMethod(method, {
           ...node,
           callee: { ...node.callee, object: node.arguments?.[0] || node.callee.object },
-        }, restArgTaints, env, ctx);
+        }, restArgTaints, thisArgTaint, env, ctx);
         if (result !== null) return thisArgTaint.clone().merge(result);
         // Try interprocedural: fn.call(thisArg, arg1, ...) → analyze fn with args
         const funcRef = calleeObj.type === 'Identifier'
@@ -4358,10 +4864,18 @@ function analyzeEventListener(node, argTaints, env, ctx) {
     ctx.eventListeners.get(eventName).push({ callback, env });
   }
 
+  const prevHandler = ctx._handlerContext;
+  ctx._handlerContext = { type: eventName || 'event', param: callback.params[0]?.name || null };
+  callback._isEventHandler = true;
+  if (!callback._closureEnv) callback._closureEnv = env;
+  let result;
   if (callback.body.type === 'BlockStatement') {
-    return analyzeInlineFunction(callback, childEnv, ctx);
+    result = analyzeInlineFunction(callback, childEnv, ctx);
+  } else {
+    result = evaluateExpr(callback.body, childEnv, ctx);
   }
-  return evaluateExpr(callback.body, childEnv, ctx);
+  ctx._handlerContext = prevHandler;
+  return result;
 }
 
 // Check if an AST node accesses .origin via MemberExpression (not string-based)
@@ -4637,10 +5151,31 @@ function analyzeArrayCallback(node, argTaints, objTaint, env, ctx) {
   if (callback.params[0]) assignToPattern(callback.params[0], objTaint, childEnv, ctx);
   if (callback.params[1]) assignToPattern(callback.params[1], TaintSet.empty(), childEnv, ctx);
 
+  // Set closure env so closure mutation propagation works (line ~5570)
+  // This allows forEach/map callbacks to propagate outer variable mutations
+  if (!callback._closureEnv) callback._closureEnv = env;
+
+  let result;
   if (callback.body.type === 'BlockStatement') {
-    return analyzeInlineFunction(callback, childEnv, ctx);
+    result = analyzeInlineFunction(callback, childEnv, ctx);
+  } else {
+    result = evaluateExpr(callback.body, childEnv, ctx);
   }
-  return evaluateExpr(callback.body, childEnv, ctx);
+
+  // Propagate closure mutations from callback back to outer env
+  // This handles patterns like: arr.forEach(function(x) { outerVar = x; })
+  for (const [key, taint] of childEnv.entries()) {
+    // Skip callback params and internal keys
+    if (callback.params[0]?.type === 'Identifier' && key === callback.params[0].name) continue;
+    if (callback.params[1]?.type === 'Identifier' && key === callback.params[1].name) continue;
+    if (key.startsWith('this.') || key === 'this') continue;
+    // Propagate tainted entries to outer env (for captured variables and property writes)
+    if (taint.tainted) {
+      env.set(key, env.get(key).clone().merge(taint));
+    }
+  }
+
+  return result;
 }
 
 // ── Promise callback ──
@@ -4744,6 +5279,11 @@ function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
   if (aifKey && ctx._aifStack.has(aifKey)) return TaintSet.empty();
   if (aifKey) ctx._aifStack.add(aifKey);
   const innerCfg = buildCFG(funcNode.body);
+  // Event handlers can be invoked multiple times — add a back-edge from exit to entry
+  // so the worklist's fixed-point iteration models state accumulation across invocations.
+  if (funcNode._isEventHandler && innerCfg.exit && innerCfg.entry) {
+    innerCfg.exit.connect(innerCfg.entry);
+  }
   const innerCtx = new AnalysisContext(
     ctx.file, ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap), ctx.findings,
     ctx.globalEnv, ctx.scopeInfo, ctx.analyzedCalls
@@ -4754,6 +5294,7 @@ function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
   innerCtx.protoMethodMap = ctx.protoMethodMap;
   if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
   if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
+  if (ctx._handlerContext) innerCtx._handlerContext = ctx._handlerContext;
 
   const frame = {
     cfg: innerCfg,
@@ -4795,12 +5336,41 @@ function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
     frame._inlineCacheKey = cacheKey;
     frame._parentInlineResults = ctx._inlineResults;
     // Clean up re-entrancy guard when frame eventually completes (via postProcess)
+    // Also propagate closure variable mutations back to _closureEnv
     const _origPostProcess = frame.postProcess;
     const _aifCleanupKey = aifKey;
     const _aifCleanupStack = ctx._aifStack;
+    const _closureEnv = funcNode._closureEnv;
+    const _frameEnv = env;
+    const _funcParams = funcNode.params || [];
     frame.postProcess = (result) => {
       if (_origPostProcess) _origPostProcess(result);
       if (_aifCleanupKey) _aifCleanupStack.delete(_aifCleanupKey);
+      // Propagate tainted closure mutations back to outer env
+      if (_closureEnv) {
+        const paramNames = new Set();
+        for (const p of _funcParams) {
+          if (p.type === 'Identifier') paramNames.add(p.name);
+          else if (p.type === 'RestElement' && p.argument?.type === 'Identifier') paramNames.add(p.argument.name);
+        }
+        for (const [key, taint] of _frameEnv.entries()) {
+          if (paramNames.has(key)) continue;
+          if (key.startsWith('this.') || key === 'this') continue;
+          if (taint.tainted) {
+            _closureEnv.set(key, _closureEnv.get(key).clone().merge(taint));
+            // Also propagate to scope-resolved variants the outer env may use
+            // e.g., bare "params" → also set "0:params", "global:params", "params.X" etc.
+            if (!key.includes(':') && !key.includes('.')) {
+              // Try to find existing scope keys for this bare name
+              for (const [existingKey] of _closureEnv.entries()) {
+                if (existingKey.endsWith(':' + key) || (existingKey.startsWith(key + '.') && existingKey.length > key.length + 1)) {
+                  _closureEnv.set(existingKey, _closureEnv.get(existingKey).clone().merge(taint));
+                }
+              }
+            }
+          }
+        }
+      }
     };
     ctx._ipStack.push(frame);
     ctx._ipSuspended = true;
@@ -4809,6 +5379,29 @@ function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
 
   const _result = _runIPLoop([frame]);
   if (aifKey) ctx._aifStack.delete(aifKey);
+  // Propagate closure mutations back to outer env (for non-IP-stack path)
+  const _closureEnv = funcNode._closureEnv;
+  if (_closureEnv) {
+    const paramNames = new Set();
+    for (const p of (funcNode.params || [])) {
+      if (p.type === 'Identifier') paramNames.add(p.name);
+      else if (p.type === 'RestElement' && p.argument?.type === 'Identifier') paramNames.add(p.argument.name);
+    }
+    for (const [key, taint] of env.entries()) {
+      if (paramNames.has(key)) continue;
+      if (key.startsWith('this.') || key === 'this') continue;
+      if (taint.tainted) {
+        _closureEnv.set(key, _closureEnv.get(key).clone().merge(taint));
+        if (!key.includes(':') && !key.includes('.')) {
+          for (const [existingKey] of _closureEnv.entries()) {
+            if (existingKey.endsWith(':' + key) || (existingKey.startsWith(key + '.') && existingKey.length > key.length + 1)) {
+              _closureEnv.set(existingKey, _closureEnv.get(existingKey).clone().merge(taint));
+            }
+          }
+        }
+      }
+    }
+  }
   return _result;
 }
 
@@ -5317,6 +5910,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   innerCtx.protoMethodMap = ctx.protoMethodMap;
   if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
   if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
+  if (ctx._handlerContext) innerCtx._handlerContext = ctx._handlerContext;
 
   // Capture all state needed for post-processing in a closure
   const _callNode = callNode, _callSig = callSig, _childEnv = childEnv,
@@ -5455,12 +6049,38 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
 // ── For-in/of binding ──
 function processForBinding(node, env, ctx) {
-  // For-in yields string property keys (always safe), not values
+  // For-in yields string property keys — safe for known-structure objects,
+  // but tainted when the iterable itself is attacker-controlled (e.g., JSON.parse(tainted))
   if (node._isForIn) {
+    let keyTaint = TaintSet.empty();
+    // Only taint keys when the object was produced by an attacker-controlled expression
+    // that controls object structure (JSON.parse, postMessage data, etc.).
+    // Object literals with tainted values have known keys — those keys are safe.
+    // Detect by checking taint labels: if any label has a transform from JSON.parse
+    // or comes from a source that controls structure, the keys are attacker-controlled.
+    const iterableTaint = evaluateExpr(node.right, env, ctx);
+    if (iterableTaint.tainted) {
+      const labels = iterableTaint.toArray();
+      const controlsStructure = labels.some(l => {
+        // JSON.parse output gives attacker key control
+        if (l.transforms && l.transforms.some(t => t.op === 'JSON.parse')) return true;
+        // postMessage data gives attacker full object control
+        if (l.description && l.description.includes('postMessage')) return true;
+        if (l.type && l.type.includes('postMessage')) return true;
+        // Generic passthrough from attacker-controlled source
+        if (l.type && l.type.includes('storage')) return true;
+        // window.name, document.cookie — could contain JSON
+        if (l.type === 'window.name' || l.type === 'cookie') return true;
+        return false;
+      });
+      if (controlsStructure) {
+        keyTaint = iterableTaint;
+      }
+    }
     if (node.left.type === 'VariableDeclaration') {
-      for (const decl of node.left.declarations) assignToPattern(decl.id, TaintSet.empty(), env, ctx);
+      for (const decl of node.left.declarations) assignToPattern(decl.id, keyTaint, env, ctx);
     } else {
-      assignToPattern(node.left, TaintSet.empty(), env, ctx);
+      assignToPattern(node.left, keyTaint, env, ctx);
     }
     return;
   }
@@ -5576,7 +6196,13 @@ function classifyNavigationType(sinkInfo, env, rhsNode, ctx) {
   // Check if RHS is a concatenation with a safe URL scheme prefix literal
   // e.g., "https://safe.com/" + tainted → Open Redirect (not XSS)
   if (rhsNode) {
-    const leftmostLiteral = getLeftmostStringLiteral(rhsNode);
+    let exprToCheck = rhsNode;
+    // Resolve Identifier to its initializer expression for prefix checking
+    if (exprToCheck.type === 'Identifier' && ctx) {
+      const init = resolveInitFromScope(exprToCheck, ctx);
+      if (init) exprToCheck = init;
+    }
+    const leftmostLiteral = getLeftmostStringLiteral(exprToCheck);
     if (leftmostLiteral !== null && /^https?:\/\//i.test(leftmostLiteral)) {
       return 'Open Redirect';
     }
@@ -5600,26 +6226,77 @@ function getLeftmostStringLiteral(node) {
   return null;
 }
 
-// ── Script element sink: el.src = tainted when el is createElement('script') ──
-function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
+// ── Element-type-aware property sink: el.src/textContent/text/data = tainted ──
+// Different element types have different security implications for .src:
+//   script.src → Script Injection (loads and executes JS)
+//   iframe.src → XSS with navigation (javascript: URI, about:, loads arbitrary content)
+//   embed.src / object.data → XSS with navigation (plugin content, javascript: URI)
+//   img.src, video.src, audio.src → safe (media elements, no code execution)
+// Elements with navigation: true get scheme-check classification (XSS vs Open Redirect)
+const NAVIGABLE_ELEMENTS = new Set(['iframe', 'embed', 'object', 'frame']);
+
+function checkElementPropertySink(leftNode, rhsTaint, rhsNode, env, ctx) {
   if (!rhsTaint.tainted) return;
   if (leftNode.type !== 'MemberExpression' && leftNode.type !== 'OptionalMemberExpression') return;
   const propName = leftNode.property?.name;
-  if (propName !== 'src' && propName !== 'textContent' && propName !== 'text') return;
+  if (!propName) return;
   const objName = nodeToString(leftNode.object);
   if (!objName) return;
-  // Check if the object is a known script element
   const objKey = leftNode.object.type === 'Identifier' ? resolveId(leftNode.object, ctx) : objName;
-  if (!ctx.scriptElements.has(objKey) && !ctx.scriptElements.has(objName)) return;
+  const tag = ctx.elementTypes.get(objKey) || ctx.elementTypes.get(objName);
+  if (!tag) return;
+
   const loc = getNodeLoc(leftNode);
-  ctx.findings.push({
-    type: 'Script Injection',
-    severity: 'critical',
-    title: `Script Injection: tainted data flows to script element ${propName}`,
-    sink: makeSinkInfo(`${objName}.${propName}`, ctx, loc),
-    source: formatSources(rhsTaint),
-    path: buildTaintPath(rhsTaint, `${objName}.${propName}`),
-  });
+  const sinkExpr = `${objName}.${propName}`;
+
+  // script element: .src → Script Injection, .textContent/.text → Script Injection
+  if (tag === 'script') {
+    if (propName === 'src' || propName === 'textContent' || propName === 'text') {
+      pushFinding(ctx, {
+        type: 'Script Injection',
+        severity: 'critical',
+        title: `Script Injection: tainted data flows to script element ${propName}`,
+        sink: makeSinkInfo(sinkExpr, ctx, loc),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+        path: buildTaintPath(rhsTaint, sinkExpr),
+      });
+    }
+    return;
+  }
+
+  // iframe/embed/object/frame: .src (or .data for object) → navigation sink (XSS or Open Redirect)
+  if (NAVIGABLE_ELEMENTS.has(tag)) {
+    if (propName === 'src' || (tag === 'object' && propName === 'data')) {
+      const sinkInfo = { navigation: true, type: 'XSS' };
+      const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
+      pushFinding(ctx, {
+        type,
+        severity: getSeverity(type),
+        title: `${type}: tainted data flows to ${tag} element ${propName}`,
+        sink: makeSinkInfo(sinkExpr, ctx, loc),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+        path: buildTaintPath(rhsTaint, sinkExpr),
+      });
+    }
+    return;
+  }
+
+  // a, area: .href → navigation sink (javascript: URI on click)
+  if ((tag === 'a' || tag === 'area') && propName === 'href') {
+    const sinkInfo = { navigation: true, type: 'XSS' };
+    const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
+    pushFinding(ctx, {
+      type,
+      severity: getSeverity(type),
+      title: `${type}: tainted data flows to ${tag} element ${propName}`,
+      sink: makeSinkInfo(sinkExpr, ctx, loc),
+      source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+      path: buildTaintPath(rhsTaint, sinkExpr),
+    });
+    return;
+  }
+
+  // All other elements: .src is safe (img, video, audio, source, etc.)
 }
 
 function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
@@ -5627,7 +6304,7 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
 
   const leftStr = nodeToString(leftNode);
   let propName = null;
-  if (leftNode.type === 'MemberExpression') {
+  if (leftNode.type === 'MemberExpression' || leftNode.type === 'OptionalMemberExpression') {
     if (leftNode.computed) {
       // Computed: obj['innerHTML'] or obj[prop] where prop = 'innerHTML'
       const prop = leftNode.property;
@@ -5657,18 +6334,28 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
   const sinkInfo = checkAssignmentSink(leftStr, propName);
   if (!sinkInfo) return;
 
+  // Skip 'href' when element type is tracked — checkElementPropertySink handles it precisely
+  if (propName === 'href' && (leftNode.type === 'MemberExpression' || leftNode.type === 'OptionalMemberExpression') && !leftStr?.includes('location')) {
+    const objName = nodeToString(leftNode.object);
+    if (objName) {
+      const objKey = leftNode.object?.type === 'Identifier' ? resolveId(leftNode.object, ctx) : objName;
+      const tag = ctx.elementTypes.get(objKey) || ctx.elementTypes.get(objName);
+      if (tag) return; // already handled by checkElementPropertySink
+    }
+  }
+
   // Skip self-redirect: top.location.href = self.location.href
   if (sinkInfo.navigation && isSelfRedirect(sinkInfo, rhsNode)) return;
 
   const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
   const severity = getSeverity(type);
   const loc = getNodeLoc(leftNode);
-  ctx.findings.push({
+  pushFinding(ctx, {
     type,
     severity,
     title: `${type}: tainted data flows to ${leftStr || propName}`,
     sink: makeSinkInfo(leftStr || propName, ctx, loc),
-    source: formatSources(rhsTaint),
+    source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
     path: buildTaintPath(rhsTaint, leftStr || propName),
   });
 }
@@ -5704,37 +6391,37 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
     const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
     const severity = getSeverity(type);
     const loc = getNodeLoc(callNode);
-    ctx.findings.push({
+    pushFinding(ctx, {
       type,
       severity,
       title: `${type}: tainted data flows to ${calleeStr}()`,
       sink: makeSinkInfo(`${calleeStr}(arg${argIdx})`, ctx, loc),
-      source: formatSources(argTaint),
+      source: formatSources(annotateSinkSteps(argTaint, ctx)),
       path: buildTaintPath(argTaint, calleeStr),
     });
   }
 }
 
 // ── Prototype pollution ──
-export function checkPrototypePollution(node, env, ctx) {
+// All taint values are pre-computed by the caller (processAssignment) in the iterative engine.
+// rhsTaint: taint of the RHS value, keyTaint: taint of the innermost computed key,
+// outerKeyTaint: taint of the outer computed key in obj[k1][k2] patterns.
+export function checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, outerKeyTaint) {
   if (node.type !== 'AssignmentExpression') return;
   const left = node.left;
   if (left.type !== 'MemberExpression') return;
 
   // Pattern 1: obj[key1][key2] = tainted (both keys tainted)
   if (left.computed && left.object.type === 'MemberExpression' && left.object.computed) {
-    const outerKey = evaluateExpr(left.object.property, env, ctx);
-    const innerKey = evaluateExpr(left.property, env, ctx);
-
-    if (outerKey.tainted && innerKey.tainted) {
+    if (outerKeyTaint.tainted && keyTaint.tainted) {
       const loc = getNodeLoc(node);
-      ctx.findings.push({
+      pushFinding(ctx, {
         type: 'Prototype Pollution',
         severity: 'critical',
         title: 'Prototype Pollution: attacker controls nested property keys',
         sink: makeSinkInfo(nodeToString(left) || 'obj[key1][key2]', ctx, loc),
-        source: formatSources(outerKey.clone().merge(innerKey)),
-        path: buildTaintPath(outerKey.clone().merge(innerKey), 'obj[key1][key2]'),
+        source: formatSources(outerKeyTaint.clone().merge(keyTaint)),
+        path: buildTaintPath(outerKeyTaint.clone().merge(keyTaint), 'obj[key1][key2]'),
       });
     }
   }
@@ -5749,9 +6436,6 @@ export function checkPrototypePollution(node, env, ctx) {
       const assignedProp = !left.computed && left.property?.name;
       if (assignedProp === 'constructor') return;
 
-      const rhsTaint = evaluateExpr(node.right, env, ctx);
-      // Check tainted value OR tainted key
-      const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
       const combinedTaint = rhsTaint.tainted ? rhsTaint : keyTaint;
       if (combinedTaint.tainted) {
         const loc = getNodeLoc(node);
@@ -5759,7 +6443,7 @@ export function checkPrototypePollution(node, env, ctx) {
         const title = keyTaint.tainted
           ? `Prototype Pollution: attacker controls property key on ${objProp}`
           : `Prototype Pollution: tainted data assigned to ${objProp}`;
-        ctx.findings.push({
+        pushFinding(ctx, {
           type: 'Prototype Pollution',
           severity: 'critical',
           title,
@@ -5775,17 +6459,50 @@ export function checkPrototypePollution(node, env, ctx) {
       left.object.property?.name === 'prototype' &&
       left.object.object?.type === 'MemberExpression' && !left.object.object.computed &&
       left.object.object.property?.name === 'constructor') {
-    const keyTaint = evaluateExpr(left.property, env, ctx);
     if (keyTaint.tainted) {
       const loc = getNodeLoc(node);
       const expr = nodeToString(left) || 'obj.constructor.prototype[key]';
-      ctx.findings.push({
+      pushFinding(ctx, {
         type: 'Prototype Pollution',
         severity: 'critical',
         title: 'Prototype Pollution: attacker controls property key on constructor.prototype',
         sink: makeSinkInfo(expr, ctx, loc),
         source: formatSources(keyTaint),
         path: buildTaintPath(keyTaint, expr),
+      });
+    }
+  }
+
+  // Pattern 4: obj.__proto__ = tainted (direct prototype replacement)
+  if (!left.computed && left.property?.name === '__proto__') {
+    if (rhsTaint.tainted) {
+      const loc = getNodeLoc(node);
+      const expr = nodeToString(left) || 'obj.__proto__';
+      pushFinding(ctx, {
+        type: 'Prototype Pollution',
+        severity: 'critical',
+        title: 'Prototype Pollution: tainted data assigned to __proto__',
+        sink: makeSinkInfo(expr, ctx, loc),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+        path: buildTaintPath(rhsTaint, expr),
+      });
+    }
+  }
+
+  // Pattern 5: obj[taintedKey] = taintedValue — attacker controls both key and value
+  // Can set __proto__ to attacker data. Only flag when value is also tainted to avoid FPs
+  // on patterns like `obj[taintedKey] = "safe literal"`.
+  if (left.computed && !(left.object.type === 'MemberExpression' && left.object.computed)) {
+    if (keyTaint.tainted && rhsTaint.tainted) {
+      const loc = getNodeLoc(node);
+      const objStr = nodeToString(left.object) || 'obj';
+      pushFinding(ctx, {
+        type: 'Prototype Pollution',
+        severity: 'high',
+        title: 'Prototype Pollution: attacker controls property key and value in assignment',
+        sink: makeSinkInfo(`${objStr}[taintedKey]`, ctx, loc),
+        source: formatSources(keyTaint.clone().merge(rhsTaint)),
+        path: buildTaintPath(keyTaint, `${objStr}[taintedKey]`),
       });
     }
   }
@@ -6038,6 +6755,64 @@ function wrapDelivery(sourceType, value, pageUrl, sourceKey, propertyChain) {
   }
 }
 
+// Build a multi-step PoC vector from stateSteps on the source label.
+// Emits working JavaScript with sequential postMessage calls or timer waits.
+function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
+  const page = 'https://victim.com/page';
+  const storeSteps = stateSteps.filter(s => s.action === 'store');
+  const sinkSteps = stateSteps.filter(s => s.action === 'sink');
+  if (storeSteps.length === 0) return null;
+
+  const isPostMessage = sourceType.startsWith('postMessage');
+  if (!isPostMessage) return null;
+
+  const lines = [];
+  lines.push(`// Multi-step PoC — ${storeSteps.length + sinkSteps.length} message(s) required`);
+  lines.push(`var w = window.open(${JSON.stringify(page)});`);
+
+  let delay = 1000;
+
+  for (let i = 0; i < storeSteps.length; i++) {
+    const store = storeSteps[i];
+    const msgObj = {};
+    // Set the condition discriminant (e.g., type: 'init')
+    if (store.condition) {
+      msgObj[store.condition.propName] = store.condition.value;
+    }
+    // Add the payload under the property chain (skip 'data' as it's the postMessage root)
+    const dataProps = propertyChain.filter(p => p !== 'data');
+    if (dataProps.length > 0) {
+      msgObj[dataProps[dataProps.length - 1]] = rawInput;
+    } else if (!store.condition) {
+      // No condition and no property chain — payload is the message data directly
+      msgObj._raw = rawInput;
+    }
+    const msgData = msgObj._raw !== undefined ? JSON.stringify(msgObj._raw) : JSON.stringify(msgObj);
+    lines.push(`// Step ${i + 1}: store payload via ${store.condition ? `${store.condition.discriminant} === ${JSON.stringify(store.condition.value)}` : 'handler'}`);
+    lines.push(`setTimeout(() => w.postMessage(${msgData}, '*'), ${delay});`);
+    delay += 1000;
+  }
+
+  for (let i = 0; i < sinkSteps.length; i++) {
+    const sink = sinkSteps[i];
+    if (sink.handler === 'timer') {
+      const timerDelay = sink.delay || 0;
+      lines.push(`// Step ${storeSteps.length + i + 1}: wait ${timerDelay}ms for timer callback to fire and trigger sink`);
+    } else if (sink.condition) {
+      const triggerObj = {};
+      triggerObj[sink.condition.propName] = sink.condition.value;
+      lines.push(`// Step ${storeSteps.length + i + 1}: trigger sink via ${sink.condition.discriminant} === ${JSON.stringify(sink.condition.value)}`);
+      lines.push(`setTimeout(() => w.postMessage(${JSON.stringify(triggerObj)}, '*'), ${delay});`);
+      delay += 1000;
+    }
+  }
+
+  return {
+    vector: lines.join('\n'),
+    description: `Send ${storeSteps.length + sinkSteps.filter(s => s.handler !== 'timer').length} sequential postMessage(s) to trigger ${storeSteps.length > 0 ? 'multi-step ' : ''}exploit`,
+  };
+}
+
 // Generate a PoC for a finding using its source labels' transforms and the sink
 // Sources where the delivery prefix IS the first character of the value
 // (e.g., location.hash returns "#foo", so slice(1) strips the "#" which is the URL fragment delimiter)
@@ -6096,6 +6871,22 @@ export function generatePoC(finding) {
   let effectiveSourceType = primarySource.type;
   if (getParamName && (primarySource.type === 'url.location.search' || primarySource.type === 'url.location.href')) {
     effectiveSourceType = 'url.searchParam';
+  }
+
+  // Multi-step PoC: if stateSteps show different conditions on same handler
+  const stateSteps = primarySource.stateSteps;
+  if (stateSteps && stateSteps.length > 0) {
+    const multiStep = buildMultiStepVector(stateSteps, propertyChain, rawInput, effectiveSourceType);
+    if (multiStep) {
+      return {
+        payload,
+        input: rawInput,
+        vector: multiStep.vector,
+        description: multiStep.description,
+        steps,
+        transforms,
+      };
+    }
   }
 
   const delivery = wrapDelivery(effectiveSourceType, rawInput, null, primarySource.sourceKey || getParamName, propertyChain);

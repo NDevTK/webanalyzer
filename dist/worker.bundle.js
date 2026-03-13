@@ -43694,6 +43694,8 @@ ${rootStack}`;
     "innerHTML": { type: "XSS", argIndex: "rhs" },
     "outerHTML": { type: "XSS", argIndex: "rhs" },
     "srcdoc": { type: "XSS", argIndex: "rhs" },
+    // Element href: a.href, base.href, link.href — javascript: URI on click/load
+    "href": { type: "XSS", argIndex: "rhs", navigation: true },
     // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
     "location.href": { type: "XSS", argIndex: "rhs", navigation: true },
     "window.location.href": { type: "XSS", argIndex: "rhs", navigation: true },
@@ -43812,7 +43814,7 @@ ${rootStack}`;
     if (!entries) return null;
     for (const { info } of entries) {
       if (GLOBAL_ONLY_SINKS.has(methodName)) {
-        if (!calleeStr || calleeStr === methodName || calleeStr === `window.${methodName}` || calleeStr === `globalThis.${methodName}` || calleeStr === `self.${methodName}`) {
+        if (!calleeStr || calleeStr === methodName || calleeStr === `window.${methodName}` || calleeStr === `globalThis.${methodName}` || calleeStr === `self.${methodName}` || calleeStr === `this.${methodName}`) {
           return info;
         }
         continue;
@@ -44143,6 +44145,7 @@ ${rootStack}`;
       this.returnedFuncNode = null;
       this.returnedMethods = null;
       this.scriptElements = /* @__PURE__ */ new Set();
+      this.elementTypes = /* @__PURE__ */ new Map();
       this.thrownTaint = TaintSet.empty();
       this.generatorTaint = /* @__PURE__ */ new Map();
       this.eventListeners = /* @__PURE__ */ new Map();
@@ -44179,8 +44182,8 @@ ${rootStack}`;
       if (!entryEnv) continue;
       const exitEnv = processBlock(block, entryEnv.clone(), ctx);
       for (const succ of block.successors) {
-        if (succ.branchCondition && isConstantBool(succ.branchCondition) !== null) {
-          const val = isConstantBool(succ.branchCondition);
+        if (succ.branchCondition && isConstantBool(succ.branchCondition, ctx) !== null) {
+          const val = isConstantBool(succ.branchCondition, ctx);
           if (val === false && succ.branchPolarity === true) continue;
           if (val === true && succ.branchPolarity === false) continue;
         }
@@ -44497,6 +44500,8 @@ ${rootStack}`;
       if (!cur) return void 0;
       if (isStringLiteral(cur)) return cur.value;
       if (isNumericLit(cur)) return cur.value;
+      if (cur.type === "BooleanLiteral" || cur.type === "Literal" && typeof cur.value === "boolean") return cur.value;
+      if (cur.type === "NullLiteral" || cur.type === "Literal" && cur.value === null) return null;
       if (cur.type === "Identifier") {
         if (ctx?._paramConstants?.has(cur.name)) {
           return ctx._paramConstants.get(cur.name);
@@ -44899,7 +44904,12 @@ ${rootStack}`;
         continue;
       }
       if (isObjectProp(prop) && prop.key) {
-        const propName = propKeyName(prop.key);
+        let propName;
+        if (prop.computed) {
+          const resolved = resolveToConstant(prop.key, env, ctx);
+          if (typeof resolved === "string") propName = resolved;
+        }
+        if (!propName) propName = propKeyName(prop.key);
         if (propName) {
           const propTaint = evaluateExpr(prop.value, env, ctx);
           env.set(`${varName}.${propName}`, propTaint);
@@ -44907,20 +44917,21 @@ ${rootStack}`;
       }
     }
   }
-  function isCreateScriptElement(node, env) {
-    if (node.type !== "CallExpression") return false;
+  function getCreateElementTag(node, env) {
+    if (node.type !== "CallExpression") return null;
     const callee = node.callee;
-    if (!callee || callee.type !== "MemberExpression" || callee.computed) return false;
-    if (callee.property?.name !== "createElement") return false;
+    if (!callee || callee.type !== "MemberExpression" || callee.computed) return null;
+    if (callee.property?.name !== "createElement") return null;
     const obj = callee.object;
     if (obj.type === "Identifier") {
       if (obj.name !== "document") {
         const alias = env?.aliases?.get(obj.name);
-        if (alias !== "document") return false;
+        if (alias !== "document") return null;
       }
-    } else return false;
+    } else return null;
     const arg = node.arguments[0];
-    return arg && isStringLiteral(arg) && stringLiteralValue(arg).toLowerCase() === "script";
+    if (arg && isStringLiteral(arg)) return stringLiteralValue(arg).toLowerCase();
+    return null;
   }
   function processVarDeclarator(node, env, ctx) {
     if (!node.init) {
@@ -44945,7 +44956,12 @@ ${rootStack}`;
         const { objExpr, prefix } = romStack.pop();
         for (const prop of objExpr.properties) {
           if (isObjectProp(prop) && prop.key) {
-            const propName = propKeyName(prop.key);
+            let propName;
+            if (prop.computed) {
+              const resolved = resolveToConstant(prop.key, env, ctx);
+              if (typeof resolved === "string") propName = resolved;
+            }
+            if (!propName) propName = propKeyName(prop.key);
             const val = prop.value;
             if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
               val._closureEnv = env;
@@ -44965,7 +44981,12 @@ ${rootStack}`;
             }
           }
           if (prop.type === "ObjectMethod" && prop.key) {
-            const propName = propKeyName(prop.key);
+            let propName;
+            if (prop.computed) {
+              const resolved = resolveToConstant(prop.key, env, ctx);
+              if (typeof resolved === "string") propName = resolved;
+            }
+            if (!propName) propName = propKeyName(prop.key);
             if (propName) {
               prop._closureEnv = env;
               const accessorPrefix = prop.kind === "get" ? "getter:" : prop.kind === "set" ? "setter:" : "";
@@ -45004,9 +45025,17 @@ ${rootStack}`;
         ctx.funcMap.set(node.id.name, refFunc);
       }
     }
-    if (node.id.type === "Identifier" && isCreateScriptElement(node.init, env)) {
-      ctx.scriptElements.add(resolveId(node.id, ctx));
-      ctx.scriptElements.add(node.id.name);
+    if (node.id.type === "Identifier") {
+      const tag = getCreateElementTag(node.init, env);
+      if (tag) {
+        const key = resolveId(node.id, ctx);
+        ctx.elementTypes.set(key, tag);
+        ctx.elementTypes.set(node.id.name, tag);
+        if (tag === "script") {
+          ctx.scriptElements.add(key);
+          ctx.scriptElements.add(node.id.name);
+        }
+      }
     }
     const taint = evaluateExpr(node.init, env, ctx);
     if (node.id.type === "ObjectPattern") {
@@ -45304,13 +45333,21 @@ ${rootStack}`;
   function processAssignment(node, env, ctx) {
     ctx.returnedFuncNode = null;
     ctx.returnedMethods = null;
-    if (node.operator === "=" && node.left.type === "Identifier" && isCreateScriptElement(node.right, env)) {
-      ctx.scriptElements.add(resolveId(node.left, ctx));
-      ctx.scriptElements.add(node.left.name);
+    if (node.operator === "=" && node.left.type === "Identifier") {
+      const tag = getCreateElementTag(node.right, env);
+      if (tag) {
+        const key = resolveId(node.left, ctx);
+        ctx.elementTypes.set(key, tag);
+        ctx.elementTypes.set(node.left.name, tag);
+        if (tag === "script") {
+          ctx.scriptElements.add(key);
+          ctx.scriptElements.add(node.left.name);
+        }
+      }
     }
     const rhsTaint = evaluateExpr(node.right, env, ctx);
     checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
-    checkScriptElementSink(node.left, rhsTaint, env, ctx);
+    checkElementPropertySink(node.left, rhsTaint, node.right, env, ctx);
     checkPrototypePollution(node, env, ctx);
     if (node.operator === "=" && node.left.type === "MemberExpression") {
       let leftStr = null;
@@ -45343,7 +45380,7 @@ ${rootStack}`;
             finalTaint = leftEnvTaint.clone().merge(rhsTaint);
           } else {
             const leftConst = resolveToConstant(node.left, env, ctx);
-            if (leftConst !== void 0) {
+            if (leftConst !== void 0 && leftConst !== null) {
               finalTaint = leftTaint.clone();
             } else {
               finalTaint = leftTaint.clone().merge(rhsTaint);
@@ -45355,7 +45392,7 @@ ${rootStack}`;
         if (leftConst !== void 0 && leftConst) {
           finalTaint = leftTaint.clone();
         } else if (leftTaint.tainted) {
-          finalTaint = leftTaint.clone().merge(rhsTaint);
+          finalTaint = leftTaint.clone();
         } else {
           finalTaint = leftTaint.clone().merge(rhsTaint);
         }
@@ -45773,12 +45810,17 @@ ${rootStack}`;
           V.push(TaintSet.empty());
           return;
         }
+        if (constLeft === true || accum.tainted) {
+          W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum: TaintSet.empty(), parts, index, ln: right, env, ctx });
+          W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
+          return;
+        }
         W.push({ kind: W_CONTINUATION, label: C_LOGICAL_NEXT, accum, parts, index, ln: right, env, ctx });
         W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
         return;
       } else if (op === "||") {
         const constLeft = isConstantBool(ln, ctx);
-        if (constLeft === true) {
+        if (constLeft === true || accum.tainted) {
           V.push(accum);
           return;
         }
@@ -46111,7 +46153,7 @@ ${rootStack}`;
             case C_COND_TEST: {
               V.pop();
               const cn = item.cn;
-              const constCond = isConstantBool(cn.test);
+              const constCond = isConstantBool(cn.test, item.ctx);
               if (constCond === true) {
                 W.push({ kind: W_CONTINUATION, label: C_COND_FINAL, accum: TaintSet.empty(), ctx: item.ctx, node: cn.consequent });
                 W.push({ kind: W_EVAL_EXPR, node: cn.consequent, env: item.env, ctx: item.ctx });
@@ -46168,10 +46210,11 @@ ${rootStack}`;
       const tagStr = nodeToString(tagCallee);
       if (tagStr) funcNode = ctx.funcMap.get(tagStr);
     }
+    const tagCalleeStr = nodeToString(tagCallee);
+    const tagMethodName = tagCallee.type === "MemberExpression" ? tagCallee.property?.name || "" : "";
+    if (isSanitizer(tagCalleeStr, tagMethodName)) return TaintSet.empty();
     if (funcNode && funcNode.body) {
       const synthCall = { type: "CallExpression", callee: tagCallee, arguments: [{ type: "ArrayExpression", elements: [] }, ...node.quasi.expressions] };
-      const tagCalleeStr = nodeToString(tagCallee);
-      if (isSanitizer(tagCalleeStr, "")) return TaintSet.empty();
       return analyzeCalledFunction(synthCall, tagCalleeStr, allArgTaints, env, ctx);
     }
     const t = TaintSet.empty();
@@ -46539,6 +46582,40 @@ ${rootStack}`;
     if (node.callee.type === "ConditionalExpression") {
       evaluateExpr(node.callee, env, ctx);
     }
+    if (!calleeStr && node.callee.type === "LogicalExpression") {
+      const leftStr = nodeToString(node.callee.left);
+      const rightStr = nodeToString(node.callee.right);
+      const leftConst = resolveToConstant(node.callee.left, env, ctx);
+      if (node.callee.operator === "??") {
+        if (leftConst === null || leftConst === void 0) {
+          calleeStr = rightStr;
+        } else if (leftConst !== void 0) {
+          calleeStr = leftStr;
+        } else {
+          calleeStr = rightStr || leftStr;
+        }
+      } else if (node.callee.operator === "||") {
+        if (leftConst !== void 0 && !leftConst) {
+          calleeStr = rightStr;
+        } else if (leftConst !== void 0 && leftConst) {
+          calleeStr = leftStr;
+        } else {
+          calleeStr = rightStr || leftStr;
+        }
+      } else if (node.callee.operator === "&&") {
+        if (leftConst !== void 0 && leftConst) {
+          calleeStr = rightStr;
+        } else if (leftConst !== void 0 && !leftConst) {
+          calleeStr = leftStr;
+        } else {
+          calleeStr = rightStr || leftStr;
+        }
+      }
+      if (calleeStr) {
+        const parts = calleeStr.split(".");
+        methodName = parts[parts.length - 1];
+      }
+    }
     const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
     if (isSanitizer(calleeStr, methodName)) return TaintSet.empty();
     const sinkInfo = checkCallSink(calleeStr, methodName);
@@ -46663,7 +46740,14 @@ ${rootStack}`;
       const objStr = nodeToString(objNode);
       if (objStr && isStringLiteral(propNode)) {
         const propName = stringLiteralValue(propNode);
-        if (env.has(`${objStr}.${propName}`)) return env.get(`${objStr}.${propName}`).clone();
+        const fullPath = `${objStr}.${propName}`;
+        const sourceLabel = MEMBER_SOURCES[fullPath];
+        if (sourceLabel) {
+          const taint = new TaintSet();
+          taint.add(new TaintLabel(sourceLabel, ctx.file, node.loc?.start?.line || 0, fullPath));
+          return taint;
+        }
+        if (env.has(fullPath)) return env.get(fullPath).clone();
         if (objNode.type === "Identifier") {
           const key = resolveId(objNode, ctx);
           if (env.has(`${key}.${propName}`)) return env.get(`${key}.${propName}`).clone();
@@ -46838,6 +46922,25 @@ ${rootStack}`;
               const propName = key.slice(srcStr.length + 1);
               if (propName && !propName.startsWith("#")) {
                 propTaints.set(propName, taint);
+              }
+            }
+            const keysToCheck = /* @__PURE__ */ new Set([...propTaints.keys()]);
+            if (targetStr) {
+              for (const [key] of env.getTaintedWithPrefix(`${targetStr}.`)) {
+                const propName = key.slice(targetStr.length + 1);
+                if (propName && !propName.startsWith("#")) keysToCheck.add(propName);
+              }
+              if (targetKey) {
+                for (const [key] of env.getTaintedWithPrefix(`${targetKey}.`)) {
+                  const propName = key.slice(targetKey.length + 1);
+                  if (propName && !propName.startsWith("#")) keysToCheck.add(propName);
+                }
+              }
+            }
+            for (const propName of keysToCheck) {
+              const srcPropTaint = env.get(`${srcStr}.${propName}`);
+              if (!srcPropTaint.tainted && env.has(`${srcStr}.${propName}`)) {
+                propTaints.set(propName, srcPropTaint);
               }
             }
           }
@@ -48651,7 +48754,12 @@ ${rootStack}`;
       }
     }
     if (rhsNode) {
-      const leftmostLiteral = getLeftmostStringLiteral(rhsNode);
+      let exprToCheck = rhsNode;
+      if (exprToCheck.type === "Identifier" && ctx) {
+        const init = resolveInitFromScope(exprToCheck, ctx);
+        if (init) exprToCheck = init;
+      }
+      const leftmostLiteral = getLeftmostStringLiteral(exprToCheck);
       if (leftmostLiteral !== null && /^https?:\/\//i.test(leftmostLiteral)) {
         return "Open Redirect";
       }
@@ -48671,30 +48779,66 @@ ${rootStack}`;
     }
     return null;
   }
-  function checkScriptElementSink(leftNode, rhsTaint, env, ctx) {
+  var NAVIGABLE_ELEMENTS = /* @__PURE__ */ new Set(["iframe", "embed", "object", "frame"]);
+  function checkElementPropertySink(leftNode, rhsTaint, rhsNode, env, ctx) {
     if (!rhsTaint.tainted) return;
     if (leftNode.type !== "MemberExpression" && leftNode.type !== "OptionalMemberExpression") return;
     const propName = leftNode.property?.name;
-    if (propName !== "src" && propName !== "textContent" && propName !== "text") return;
+    if (!propName) return;
     const objName = nodeToString(leftNode.object);
     if (!objName) return;
     const objKey = leftNode.object.type === "Identifier" ? resolveId(leftNode.object, ctx) : objName;
-    if (!ctx.scriptElements.has(objKey) && !ctx.scriptElements.has(objName)) return;
+    const tag = ctx.elementTypes.get(objKey) || ctx.elementTypes.get(objName);
+    if (!tag) return;
     const loc = getNodeLoc(leftNode);
-    ctx.findings.push({
-      type: "Script Injection",
-      severity: "critical",
-      title: `Script Injection: tainted data flows to script element ${propName}`,
-      sink: makeSinkInfo(`${objName}.${propName}`, ctx, loc),
-      source: formatSources(rhsTaint),
-      path: buildTaintPath(rhsTaint, `${objName}.${propName}`)
-    });
+    const sinkExpr = `${objName}.${propName}`;
+    if (tag === "script") {
+      if (propName === "src" || propName === "textContent" || propName === "text") {
+        ctx.findings.push({
+          type: "Script Injection",
+          severity: "critical",
+          title: `Script Injection: tainted data flows to script element ${propName}`,
+          sink: makeSinkInfo(sinkExpr, ctx, loc),
+          source: formatSources(rhsTaint),
+          path: buildTaintPath(rhsTaint, sinkExpr)
+        });
+      }
+      return;
+    }
+    if (NAVIGABLE_ELEMENTS.has(tag)) {
+      if (propName === "src" || tag === "object" && propName === "data") {
+        const sinkInfo = { navigation: true, type: "XSS" };
+        const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
+        ctx.findings.push({
+          type,
+          severity: getSeverity(type),
+          title: `${type}: tainted data flows to ${tag} element ${propName}`,
+          sink: makeSinkInfo(sinkExpr, ctx, loc),
+          source: formatSources(rhsTaint),
+          path: buildTaintPath(rhsTaint, sinkExpr)
+        });
+      }
+      return;
+    }
+    if ((tag === "a" || tag === "area") && propName === "href") {
+      const sinkInfo = { navigation: true, type: "XSS" };
+      const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
+      ctx.findings.push({
+        type,
+        severity: getSeverity(type),
+        title: `${type}: tainted data flows to ${tag} element ${propName}`,
+        sink: makeSinkInfo(sinkExpr, ctx, loc),
+        source: formatSources(rhsTaint),
+        path: buildTaintPath(rhsTaint, sinkExpr)
+      });
+      return;
+    }
   }
   function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
     if (!rhsTaint.tainted) return;
     const leftStr = nodeToString(leftNode);
     let propName = null;
-    if (leftNode.type === "MemberExpression") {
+    if (leftNode.type === "MemberExpression" || leftNode.type === "OptionalMemberExpression") {
       if (leftNode.computed) {
         const prop = leftNode.property;
         if (prop && (prop.type === "StringLiteral" || prop.type === "Literal" && typeof prop.value === "string")) {
@@ -48719,6 +48863,14 @@ ${rootStack}`;
     }
     const sinkInfo = checkAssignmentSink(leftStr, propName);
     if (!sinkInfo) return;
+    if (propName === "href" && (leftNode.type === "MemberExpression" || leftNode.type === "OptionalMemberExpression") && !leftStr?.includes("location")) {
+      const objName = nodeToString(leftNode.object);
+      if (objName) {
+        const objKey = leftNode.object?.type === "Identifier" ? resolveId(leftNode.object, ctx) : objName;
+        const tag = ctx.elementTypes.get(objKey) || ctx.elementTypes.get(objName);
+        if (tag) return;
+      }
+    }
     if (sinkInfo.navigation && isSelfRedirect(sinkInfo, rhsNode)) return;
     const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
     const severity = getSeverity(type);
@@ -48824,6 +48976,21 @@ ${rootStack}`;
           sink: makeSinkInfo(expr, ctx, loc),
           source: formatSources(keyTaint),
           path: buildTaintPath(keyTaint, expr)
+        });
+      }
+    }
+    if (!left.computed && left.property?.name === "__proto__") {
+      const rhsTaint = evaluateExpr(node.right, env, ctx);
+      if (rhsTaint.tainted) {
+        const loc = getNodeLoc(node);
+        const expr = nodeToString(left) || "obj.__proto__";
+        ctx.findings.push({
+          type: "Prototype Pollution",
+          severity: "critical",
+          title: "Prototype Pollution: tainted data assigned to __proto__",
+          sink: makeSinkInfo(expr, ctx, loc),
+          source: formatSources(rhsTaint),
+          path: buildTaintPath(rhsTaint, expr)
         });
       }
     }
