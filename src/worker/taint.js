@@ -4239,6 +4239,23 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
     }
   }
 
+  // Reflect.defineProperty(obj, taintedKey, descriptor) — PP with tainted key
+  if (isCalleeMatch(node, 'Reflect', 'defineProperty', env) && node.arguments.length >= 2) {
+    const propTaint = argTaints[1] || TaintSet.empty();
+    if (propTaint.tainted) {
+      const loc = getNodeLoc(node);
+      const objStr = nodeToString(node.arguments[0]) || 'obj';
+      pushFinding(ctx, {
+        type: 'Prototype Pollution',
+        severity: 'critical',
+        title: 'Prototype Pollution: attacker controls property key in Reflect.defineProperty',
+        sink: makeSinkInfo(`Reflect.defineProperty(${objStr}, taintedKey)`, ctx, loc),
+        source: formatSources(propTaint),
+        path: buildTaintPath(propTaint, `Reflect.defineProperty(${objStr}, taintedKey)`),
+      });
+    }
+  }
+
   // Object.freeze/seal/preventExtensions — return the same object, propagate taint
   if (isCalleeMatch(node, 'Object', 'freeze', env) || isCalleeMatch(node, 'Object', 'seal', env) || isCalleeMatch(node, 'Object', 'preventExtensions', env)) {
     return argTaints[0]?.clone() || TaintSet.empty();
@@ -4287,13 +4304,33 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
 
   // Object.assign(target, ...sources) — propagate taint from sources to target and return
   if (isCalleeMatch(node, 'Object', 'assign', env) && node.arguments.length >= 2) {
-    // If target is an identifier or member, update its taint in env
+    // PP check: Object.assign(Object.prototype, tainted) or Object.assign(X.prototype, tainted)
     const targetNode = node.arguments[0];
+    const targetStr = targetNode ? nodeToString(targetNode) : null;
+    if (targetStr && (targetStr.endsWith('.prototype') || targetStr === 'Object.prototype')) {
+      // Check if any source argument is tainted
+      for (let si = 1; si < node.arguments.length; si++) {
+        const srcTaint = argTaints[si] || TaintSet.empty();
+        if (srcTaint.tainted) {
+          const loc = getNodeLoc(node);
+          pushFinding(ctx, {
+            type: 'Prototype Pollution',
+            severity: 'critical',
+            title: `Prototype Pollution: Object.assign to ${targetStr} with tainted source`,
+            sink: makeSinkInfo(`Object.assign(${targetStr}, ...)`, ctx, loc),
+            source: formatSources(srcTaint),
+            path: buildTaintPath(srcTaint, `Object.assign(${targetStr}, ...)`),
+          });
+          break;
+        }
+      }
+    }
+
+    // If target is an identifier or member, update its taint in env
     // Collect per-property taints from all sources in order (later sources override earlier)
     const propTaints = new Map();
     let overallTaint = TaintSet.empty();
 
-    const targetStr = targetNode ? nodeToString(targetNode) : null;
     const targetKey = targetNode?.type === 'Identifier' ? resolveId(targetNode, ctx) : null;
 
     for (let si = 1; si < node.arguments.length; si++) {

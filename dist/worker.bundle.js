@@ -47744,6 +47744,21 @@ ${rootStack}`;
         });
       }
     }
+    if (isCalleeMatch(node, "Reflect", "defineProperty", env) && node.arguments.length >= 2) {
+      const propTaint = argTaints[1] || TaintSet.empty();
+      if (propTaint.tainted) {
+        const loc = getNodeLoc(node);
+        const objStr = nodeToString(node.arguments[0]) || "obj";
+        pushFinding(ctx, {
+          type: "Prototype Pollution",
+          severity: "critical",
+          title: "Prototype Pollution: attacker controls property key in Reflect.defineProperty",
+          sink: makeSinkInfo(`Reflect.defineProperty(${objStr}, taintedKey)`, ctx, loc),
+          source: formatSources(propTaint),
+          path: buildTaintPath(propTaint, `Reflect.defineProperty(${objStr}, taintedKey)`)
+        });
+      }
+    }
     if (isCalleeMatch(node, "Object", "freeze", env) || isCalleeMatch(node, "Object", "seal", env) || isCalleeMatch(node, "Object", "preventExtensions", env)) {
       return argTaints[0]?.clone() || TaintSet.empty();
     }
@@ -47779,9 +47794,26 @@ ${rootStack}`;
     }
     if (isCalleeMatch(node, "Object", "assign", env) && node.arguments.length >= 2) {
       const targetNode = node.arguments[0];
+      const targetStr = targetNode ? nodeToString(targetNode) : null;
+      if (targetStr && (targetStr.endsWith(".prototype") || targetStr === "Object.prototype")) {
+        for (let si = 1; si < node.arguments.length; si++) {
+          const srcTaint = argTaints[si] || TaintSet.empty();
+          if (srcTaint.tainted) {
+            const loc = getNodeLoc(node);
+            pushFinding(ctx, {
+              type: "Prototype Pollution",
+              severity: "critical",
+              title: `Prototype Pollution: Object.assign to ${targetStr} with tainted source`,
+              sink: makeSinkInfo(`Object.assign(${targetStr}, ...)`, ctx, loc),
+              source: formatSources(srcTaint),
+              path: buildTaintPath(srcTaint, `Object.assign(${targetStr}, ...)`)
+            });
+            break;
+          }
+        }
+      }
       const propTaints = /* @__PURE__ */ new Map();
       let overallTaint = TaintSet.empty();
-      const targetStr = targetNode ? nodeToString(targetNode) : null;
       const targetKey = targetNode?.type === "Identifier" ? resolveId(targetNode, ctx) : null;
       for (let si = 1; si < node.arguments.length; si++) {
         const srcNode = node.arguments[si];
