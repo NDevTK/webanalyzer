@@ -8,6 +8,7 @@ import { analyze, analyzeMultiple } from './harness.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const libsDir = resolve(__dirname, 'libs');
+const jquerySrc = readFileSync(resolve(libsDir, 'jquery.min.js'), 'utf8');
 
 let passed = 0, failed = 0;
 
@@ -62,6 +63,13 @@ function assertHasTransform(transforms, op, args) {
   if (!match) throw new Error(`Expected transform {op:${JSON.stringify(op)}${args !== undefined ? ',args:'+JSON.stringify(args) : ''}} in ${JSON.stringify(transforms.map(t=>({op:t.op,args:t.args})))}`);
 }
 
+// Helper: analyze app code with the real jQuery library loaded
+function analyzeWithJQuery(appCode) {
+  return analyzeMultiple([
+    { source: jquerySrc, file: 'jquery.min.js' },
+    { source: appCode, file: 'app.js' },
+  ]);
+}
 
 // ╔═══════════════════════════════════════════════════════╗
 // ║  POSITIVE DETECTIONS — should find vulnerabilities    ║
@@ -317,7 +325,7 @@ test('template literal directly in innerHTML assignment', () => {
 console.log('\n--- XSS: jQuery sinks ---');
 
 test('location.hash → $.html()', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var h = location.hash;
     $('#output').html(h);
   `);
@@ -325,7 +333,7 @@ test('location.hash → $.html()', () => {
 });
 
 test('location.search → jQuery.append()', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var data = location.search;
     jQuery('#list').append(data);
   `);
@@ -333,7 +341,7 @@ test('location.search → jQuery.append()', () => {
 });
 
 test('location.hash → $.prepend()', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     $('#container').prepend(location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -2851,7 +2859,7 @@ test('startsWith http → location.href is Open Redirect', () => {
   expect(findings).not.toHaveType('XSS');
   // PoC: open redirect → attacker URL payload (not javascript:)
   const poc = findings[0].poc;
-  if (!poc.payload.includes('attacker.com')) throw new Error('PoC: expected attacker URL for redirect, got: ' + poc.payload);
+  if (!poc.payload.includes('evil.com')) throw new Error('PoC: expected attacker URL for redirect, got: ' + poc.payload);
 });
 
 test('startsWith https:// → location.assign is Open Redirect', () => {
@@ -3146,7 +3154,7 @@ test('document.createElement("script") with tainted src', () => {
     s.src = location.hash.slice(1);
     document.body.appendChild(s);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('createElement variable tag with tainted src', () => {
@@ -3155,7 +3163,7 @@ test('createElement variable tag with tainted src', () => {
     el.setAttribute('src', location.search.slice(1));
     document.head.appendChild(el);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 
@@ -4090,16 +4098,16 @@ test('iframe.srcdoc with tainted data is XSS', () => {
 console.log('\n--- jQuery sinks ---');
 
 test('$.html(tainted) is XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var data = location.hash;
-    $.html(data);
+    $(".target").html(data);
   `);
   expect(findings).toHaveType('XSS');
 });
 
 test('jQuery.append(tainted) is XSS', () => {
-  const { findings } = analyze(`
-    jQuery.append(location.search);
+  const findings = analyzeWithJQuery(`
+    jQuery("#list").append(location.search);
   `);
   expect(findings).toHaveType('XSS');
 });
@@ -6016,6 +6024,7 @@ test('setAttribute("onclick", tainted) → XSS', () => {
 test('setAttribute("href", tainted) → XSS', () => {
   const { findings } = analyze(`
     var el = document.createElement('a');
+    document.body.appendChild(el);
     el.setAttribute('href', location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -6572,12 +6581,12 @@ test('safe: fetch(tainted).then(sanitize).then(render)', () => {
 // ── setAttribute with tainted src on any element ──
 console.log('\n--- setAttribute src on elements ---');
 
-test('img.setAttribute("src", tainted) → XSS', () => {
+test('safe: img.setAttribute("src", tainted) → no finding (img src is not a script sink)', () => {
   const { findings } = analyze(`
     var img = document.createElement('img');
     img.setAttribute('src', location.hash);
   `);
-  expect(findings).toHaveType('XSS');
+  expect(findings).toBeEmpty();
 });
 
 test('safe: div.setAttribute("id", tainted) → no finding', () => {
@@ -8055,7 +8064,7 @@ test('String.fromCharCode not a source, safe', () => {
 console.log('\n--- jQuery sinks ---');
 
 test('$(selector).html(tainted) is XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var el = $('#app');
     el.html(location.hash);
   `);
@@ -8063,7 +8072,7 @@ test('$(selector).html(tainted) is XSS', () => {
 });
 
 test('$(selector).append(tainted) is XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     $('#app').append(location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -8234,7 +8243,7 @@ test('range.createContextualFragment(tainted) → XSS', () => {
 // ── script.textContent = tainted (script injection) ──
 console.log('\n--- Script text injection ---');
 
-test('script.textContent = tainted → Script Injection', () => {
+test('script.textContent = tainted → XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement('script');
     s.textContent = location.hash;
@@ -8242,7 +8251,7 @@ test('script.textContent = tainted → Script Injection', () => {
   expect(findings).toHaveAtLeast(1);
 });
 
-test('script.text = tainted → Script Injection', () => {
+test('script.text = tainted → XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement('script');
     s.text = location.hash;
@@ -11041,16 +11050,16 @@ test('switch fallthrough: tainted case falls to sink', () => {
   expect(findings).toHaveType('XSS');
 });
 
-// ── Script Injection: script.src ──
+// ── XSS: script.src ──
 console.log('\n--- Dynamic script loading ---');
 
-test('script.src = tainted is Script Injection', () => {
+test('script.src = tainted is XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement('script');
     s.src = location.hash;
     document.body.appendChild(s);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── Cross-file: tainted passed through callback ──
@@ -14992,12 +15001,13 @@ test('script element .src assignment with tainted value', () => {
     var s = document.createElement('script');
     s.src = location.hash;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('setAttribute with tainted value on href', () => {
   const { findings } = analyze(`
     var a = document.createElement('a');
+    document.body.appendChild(a);
     a.setAttribute('href', location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -15695,7 +15705,7 @@ test('import() with tainted module path', () => {
     var path = location.hash.slice(1);
     import(path);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── Object.freeze / Object.seal on tainted ──
@@ -18826,7 +18836,7 @@ test('script.src assignment with tainted value', () => {
     var el = document.createElement('script');
     el.src = location.hash;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── Taint through window.open ──
@@ -19175,7 +19185,7 @@ test('dynamic import with tainted source', () => {
   const { findings } = analyze(`
     import(location.hash);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('safe: dynamic import with safe source', () => {
@@ -20932,7 +20942,7 @@ test('Blob with tainted content used as script src', () => {
     s.src = url;
     document.body.appendChild(s);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('Blob with tainted content flows through createObjectURL to innerHTML', () => {
@@ -23719,12 +23729,12 @@ test('conditional computed sink: tainted branch', () => {
 
 // ── dynamic import() as XSS sink ──
 
-test('dynamic import with tainted specifier is Script Injection', () => {
+test('dynamic import with tainted specifier is XSS', () => {
   const { findings } = analyze(`
     var mod = location.hash.slice(1);
     import(mod);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('safe: dynamic import with string literal', () => {
@@ -23739,7 +23749,7 @@ test('dynamic import with tainted template literal', () => {
     var name = location.hash;
     import(\`./modules/\${name}\`);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── with() statement source injection ──
@@ -25887,7 +25897,7 @@ test('createElement script with tainted src', () => {
     var script = document.createElement("script");
     script.src = location.hash;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('createElement script with tainted textContent', () => {
@@ -25895,7 +25905,7 @@ test('createElement script with tainted textContent', () => {
     var script = document.createElement("script");
     script.textContent = location.hash;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('safe: createElement div with tainted textContent', () => {
@@ -27993,6 +28003,7 @@ test('setAttribute onclick with tainted value is XSS', () => {
 test('setAttribute href with tainted value is XSS', () => {
   const { findings } = analyze(`
     var a = document.createElement("a");
+    document.body.appendChild(a);
     a.setAttribute("href", location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -29265,7 +29276,7 @@ test('PoC: open redirect uses attacker URL', () => {
   const redirectFindings = findings.filter(f => f.type === 'Open Redirect');
   if (redirectFindings.length === 0) throw new Error('Expected Open Redirect finding');
   const poc = redirectFindings[0].poc;
-  if (!poc.payload.includes('attacker.com')) throw new Error('PoC: expected attacker URL, got: ' + poc.payload);
+  if (!poc.payload.includes('evil.com')) throw new Error('PoC: expected attacker URL, got: ' + poc.payload);
   if (!poc.vector.includes('?redirect=')) throw new Error('PoC: expected ?redirect= in URL, got: ' + poc.vector);
 });
 
@@ -30102,7 +30113,7 @@ test('import(tainted) detects script injection with hash delivery', () => {
     var mod = location.hash.slice(1);
     import(mod);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
   if (!findings[0].poc.vector.includes('#')) throw new Error('PoC: expected hash delivery');
 });
 
@@ -31165,7 +31176,7 @@ test('eval(`${tainted}`) with alert payload', () => {
 console.log('\n--- jQuery sink PoC ---');
 
 test('$.html(tainted) → XSS with HTML payload', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var content = location.hash;
     $(".target").html(content);
   `);
@@ -31173,7 +31184,7 @@ test('$.html(tainted) → XSS with HTML payload', () => {
 });
 
 test('jQuery.append(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var content = location.hash;
     jQuery(".target").append(content);
   `);
@@ -31525,16 +31536,16 @@ test('safe: comma operator returns last safe value', () => {
 // ── Script injection PoC ──
 console.log('\n--- Script injection PoC ---');
 
-test('import(tainted) → Script Injection with script URL payload', () => {
+test('import(tainted) → XSS with script URL payload', () => {
   const { findings } = analyze(`
     var mod = location.hash.slice(1);
     import(mod);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const poc = findings.find(f => f.type === 'Script Injection').poc;
+  expect(findings).toHaveType('XSS');
+  const poc = findings.find(f => f.type === 'XSS').poc;
   if (!poc) throw new Error('Expected PoC');
   if (!poc.vector.includes('#')) throw new Error('PoC: expected hash delivery');
-  if (!poc.payload.includes('attacker.com') && !poc.payload.includes('.js')) throw new Error('PoC: expected script URL payload');
+  if (!poc.payload.includes('alert')) throw new Error('PoC: expected JS payload, got: ' + poc.payload);
 });
 
 // ── srcdoc sink PoC ──
@@ -31712,13 +31723,13 @@ test('(debug ? console.log : eval)(tainted) → XSS', () => {
 // ── Worker/SharedWorker constructor sink ──
 console.log('\n--- Worker/SharedWorker constructor sink ---');
 
-test('new Worker(tainted) detected as Script Injection with hash delivery + script URL payload', () => {
+test('new Worker(tainted) detected as XSS with hash delivery + script URL payload', () => {
   const { findings } = analyze(`
     var url = location.hash.slice(1);
     new Worker(url);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   const poc = f.poc;
   if (!poc) throw new Error('Expected PoC');
   // Source: location.hash with slice(1) transform
@@ -31726,17 +31737,17 @@ test('new Worker(tainted) detected as Script Injection with hash delivery + scri
   if (!f.source[0].transforms?.some(t => t.op === 'slice')) throw new Error('PoC: expected slice transform');
   // Delivery: hash fragment URL
   if (!poc.vector.startsWith('https://victim.com/page#')) throw new Error('PoC: expected hash delivery URL, got: ' + poc.vector);
-  // Payload: script URL for Script Injection
-  if (!poc.payload.includes('attacker.com')) throw new Error('PoC: expected attacker script URL payload, got: ' + poc.payload);
+  // Payload: JS code for XSS
+  if (!poc.payload.includes('alert')) throw new Error('PoC: expected JS payload, got: ' + poc.payload);
 });
 
-test('new SharedWorker(tainted) detected as Script Injection with search delivery', () => {
+test('new SharedWorker(tainted) detected as XSS with search delivery', () => {
   const { findings } = analyze(`
     var url = location.search.slice(1);
     new SharedWorker(url);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   const poc = f.poc;
   if (!poc) throw new Error('Expected PoC');
   // Source: location.search with slice(1)
@@ -31749,7 +31760,7 @@ test('safe: new Worker with string literal', () => {
   const { findings } = analyze(`
     new Worker("/scripts/worker.js");
   `);
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 // ── Error subclass taint ──
@@ -31853,12 +31864,12 @@ test('Promise.allSettled → results[0].value → innerHTML', () => {
 // ── Reflect.construct PoC ──
 console.log('\n--- Reflect.construct + PoC ---');
 
-test('Reflect.construct(Worker, [tainted]) → Script Injection', () => {
+test('Reflect.construct(Worker, [tainted]) → XSS', () => {
   const { findings } = analyze(`
     var url = location.hash.slice(1);
     Reflect.construct(Worker, [url]);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── document.domain PoC ──
@@ -31889,13 +31900,13 @@ test('new Blob([tainted]) → createObjectURL → script.src: hash source, scrip
     var s = document.createElement("script");
     s.src = url;
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   const poc = f.poc;
   if (!poc) throw new Error('Expected PoC');
   if (f.source[0].type !== 'url.location.hash') throw new Error('PoC: source should be url.location.hash');
   if (!poc.vector.startsWith('https://victim.com/page#')) throw new Error('PoC: expected hash delivery URL');
-  if (!poc.payload.includes('attacker.com')) throw new Error('PoC: expected attacker script URL payload');
+  if (!poc.payload.includes('alert')) throw new Error('PoC: expected JS payload, got: ' + poc.payload);
 });
 
 test('safe: Blob with safe content', () => {
@@ -31905,7 +31916,7 @@ test('safe: Blob with safe content', () => {
     var s = document.createElement("script");
     s.src = url;
   `);
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 // ── Symbol.toPrimitive PoC ──
@@ -32125,14 +32136,14 @@ test('createElement("script") + setAttribute("src", tainted): hash source, slice
     s.setAttribute("src", location.hash.slice(1));
     document.body.appendChild(s);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   const poc = f.poc;
   if (!poc) throw new Error('Expected PoC');
   if (f.source[0].type !== 'url.location.hash') throw new Error('PoC: source should be url.location.hash');
   if (!f.source[0].transforms?.some(t => t.op === 'slice')) throw new Error('PoC: expected slice transform from .slice(1)');
   if (!poc.vector.startsWith('https://victim.com/page#')) throw new Error('PoC: expected hash delivery URL');
-  if (!poc.payload.includes('attacker.com')) throw new Error('PoC: expected attacker script URL payload');
+  if (!poc.payload.includes('alert')) throw new Error('PoC: expected JS payload, got: ' + poc.payload);
 });
 
 test('createElement("script") + .src = tainted: search source, script URL payload', () => {
@@ -32140,8 +32151,8 @@ test('createElement("script") + .src = tainted: search source, script URL payloa
     var s = document.createElement("script");
     s.src = location.search.slice(1);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   const poc = f.poc;
   if (!poc) throw new Error('Expected PoC');
   if (f.source[0].type !== 'url.location.search') throw new Error('PoC: source should be url.location.search');
@@ -32153,7 +32164,7 @@ test('safe: createElement("div") + .src = tainted is not script injection', () =
     var d = document.createElement("div");
     d.src = location.hash;
   `);
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 // ── Async generator PoC ──
@@ -33749,13 +33760,13 @@ test('safe: el.onclick = function() {} is not XSS', () => {
 // ── Worker/SharedWorker sink PoC ──
 console.log('\n--- Worker sink PoC ---');
 
-test('PoC: new Worker(tainted) → Script Injection with PoC', () => {
+test('PoC: new Worker(tainted) → XSS with PoC', () => {
   const { findings } = analyze(`
     var url = location.hash.slice(1);
     new Worker(url);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   assertEq(f.source[0].type, 'url.location.hash');
   assert(f.poc, 'Expected PoC');
   assertMatch(f.poc.vector, /^https:\/\/victim\.com\/page#/, 'hash delivery');
@@ -33764,13 +33775,13 @@ test('PoC: new Worker(tainted) → Script Injection with PoC', () => {
 // ── import() sink PoC ──
 console.log('\n--- import() sink PoC ---');
 
-test('PoC: import(tainted) → Script Injection with PoC', () => {
+test('PoC: import(tainted) → XSS with PoC', () => {
   const { findings } = analyze(`
     var url = location.hash.slice(1);
     import(url);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   assertEq(f.source[0].type, 'url.location.hash');
   assert(f.poc, 'Expected PoC');
 });
@@ -33781,6 +33792,7 @@ console.log('\n--- setAttribute PoC ---');
 test('PoC: setAttribute("href", tainted) on <a> → finding with PoC', () => {
   const { findings } = analyze(`
     var link = document.createElement("a");
+    document.body.appendChild(link);
     link.setAttribute("href", location.hash);
   `);
   const f = findings.find(f => f.type === 'XSS' || f.type === 'Open Redirect');
@@ -35509,37 +35521,37 @@ test('func.apply(null, [tainted]) → innerHTML', () => {
   expect(findings).toHaveType('XSS');
 });
 
-// ── Worker/SharedWorker Script Injection ──
+// ── Worker/SharedWorker XSS ──
 console.log('\n--- Worker sinks ---');
 
-test('new Worker(tainted) → Script Injection with PoC', () => {
+test('new Worker(tainted) → XSS with PoC', () => {
   const { findings } = analyze(`
     var url = location.hash.slice(1);
     new Worker(url);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   assertEq(f.source[0].type, 'url.location.hash');
   assertHasTransform(f.source[0].transforms, 'slice', [1]);
 });
 
-test('new SharedWorker(tainted) → Script Injection', () => {
+test('new SharedWorker(tainted) → XSS', () => {
   const { findings } = analyze(`
     new SharedWorker(location.hash);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
-// ── import() as Script Injection ──
+// ── import() as XSS ──
 console.log('\n--- dynamic import ---');
 
-test('import(tainted) → Script Injection with source tracking', () => {
+test('import(tainted) → XSS with source tracking', () => {
   const { findings } = analyze(`
     var mod = location.hash.slice(1);
     import(mod);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   assertEq(f.source[0].type, 'url.location.hash');
 });
 
@@ -36151,7 +36163,7 @@ test('document.writeln(tainted) → XSS', () => {
 console.log('\n--- jQuery sinks ---');
 
 test('$.html(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var data = location.hash;
     $(".target").html(data);
   `);
@@ -36159,7 +36171,7 @@ test('$.html(tainted) → XSS', () => {
 });
 
 test('$.append(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     $("body").append(location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -36332,38 +36344,38 @@ test('PoC: localStorage source → localStorage delivery', () => {
 // ── script element sinks ──
 console.log('\n--- Script element sinks ---');
 
-test('script.src = tainted → Script Injection', () => {
+test('script.src = tainted → XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement("script");
     s.src = location.hash.slice(1);
   `);
-  expect(findings).toHaveType('Script Injection');
-  const f = findings.find(f => f.type === 'Script Injection');
+  expect(findings).toHaveType('XSS');
+  const f = findings.find(f => f.type === 'XSS');
   assertEq(f.source[0].type, 'url.location.hash');
 });
 
-test('script.text = tainted → Script Injection', () => {
+test('script.text = tainted → XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement("script");
     s.text = location.hash;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
-test('script.textContent = tainted → Script Injection', () => {
+test('script.textContent = tainted → XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement("script");
     s.textContent = location.hash;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
-test('safe: div.src = tainted → not Script Injection', () => {
+test('safe: div.src = tainted → not XSS', () => {
   const { findings } = analyze(`
     var d = document.createElement("div");
     d.src = location.hash;
   `);
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 // ── Array.from with mapping ──
@@ -37523,7 +37535,7 @@ test('script element: createElement("script") then .src = tainted', () => {
     s.src = location.hash.slice(1);
     document.body.appendChild(s);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('script element: .textContent = tainted', () => {
@@ -37532,7 +37544,7 @@ test('script element: .textContent = tainted', () => {
     s.textContent = location.hash;
     document.head.appendChild(s);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('script element: .text = tainted', () => {
@@ -37540,7 +37552,7 @@ test('script element: .text = tainted', () => {
     var s = document.createElement('script');
     s.text = location.hash;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('safe: createElement("div") then .src = tainted (not a script)', () => {
@@ -37548,7 +37560,7 @@ test('safe: createElement("div") then .src = tainted (not a script)', () => {
     var d = document.createElement('div');
     d.src = location.hash;
   `);
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 test('safe: script element .src = safe string', () => {
@@ -37556,7 +37568,7 @@ test('safe: script element .src = safe string', () => {
     var s = document.createElement('script');
     s.src = '/static/bundle.js';
   `);
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 // ── Element property sinks: a.href, iframe.src, form.action ──
@@ -37565,6 +37577,7 @@ console.log('\n--- Element property sinks ---');
 test('anchor href: a.href = tainted → XSS (javascript: possible on click)', () => {
   const { findings } = analyze(`
     var a = document.createElement('a');
+    document.body.appendChild(a);
     a.href = location.hash;
   `);
   expect(findings).toHaveType('XSS');
@@ -37604,7 +37617,7 @@ test('safe: img.src = tainted (images cannot execute JS)', () => {
     img.src = location.hash;
   `);
   expect(findings).not.toHaveType('XSS');
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 test('safe: video.src = tainted (media cannot execute JS)', () => {
@@ -37634,6 +37647,7 @@ test('object.data = tainted → XSS', () => {
 test('a.href = scheme-checked → Open Redirect (not XSS)', () => {
   const { findings } = analyze(`
     var a = document.createElement('a');
+    document.body.appendChild(a);
     var url = location.hash.slice(1);
     if (url.startsWith("https")) {
       a.href = url;
@@ -38708,25 +38722,25 @@ test('PoC: postMessage source shows data shape', () => {
 // ── Worker/SharedWorker sinks ──
 console.log('\n--- Worker sinks ---');
 
-test('new Worker(tainted) → Script Injection', () => {
+test('new Worker(tainted) → XSS', () => {
   const { findings } = analyze(`
     new Worker(location.hash);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
-test('new SharedWorker(tainted) → Script Injection', () => {
+test('new SharedWorker(tainted) → XSS', () => {
   const { findings } = analyze(`
     new SharedWorker(location.hash);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('safe: new Worker with safe URL', () => {
   const { findings } = analyze(`
     new Worker("/static/worker.js");
   `);
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 // ── WebSocket sink ──
@@ -38742,11 +38756,11 @@ test('new WebSocket(tainted) → XSS', () => {
 // ── import() dynamic import ──
 console.log('\n--- Dynamic import ---');
 
-test('import(tainted) → Script Injection', () => {
+test('import(tainted) → XSS', () => {
   const { findings } = analyze(`
     import(location.hash);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── Reflect patterns ──
@@ -38949,7 +38963,7 @@ test('insertAdjacentHTML(position, tainted) → XSS', () => {
 console.log('\n--- jQuery sinks ---');
 
 test('$.html(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var el = $(".target");
     el.html(location.hash);
   `);
@@ -38957,7 +38971,7 @@ test('$.html(tainted) → XSS', () => {
 });
 
 test('$.append(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     $(".container").append(location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -39211,7 +39225,7 @@ test('PoC e2e: document.referrer → innerHTML shows referrer-based delivery', (
   `);
   const f = findings.find(f => f.type === 'XSS');
   assert(f && f.poc, 'Expected XSS with PoC');
-  assertIncludes(f.poc.vector, 'attacker.com', 'referrer delivery from attacker page');
+  assertIncludes(f.poc.vector, 'evil.com', 'referrer delivery from attacker page');
 });
 
 // ── Sink-specific payloads ──
@@ -39284,18 +39298,18 @@ test('PoC e2e: scheme-checked location.href → attacker URL payload', () => {
   `);
   const f = findings.find(f => f.type === 'Open Redirect');
   assert(f && f.poc, 'Expected Open Redirect with PoC');
-  assertIncludes(f.poc.payload, 'attacker.com', 'redirect payload is attacker URL');
+  assertIncludes(f.poc.payload, 'evil.com', 'redirect payload is attacker URL');
   assert(!f.poc.payload.includes('javascript:'), 'redirect payload should NOT be javascript:');
 });
 
-// ── Script Injection payload ──
+// ── XSS payload ──
 test('PoC e2e: import(tainted) → script URL payload', () => {
   const { findings } = analyze(`
     import(location.hash);
   `);
-  const f = findings.find(f => f.type === 'Script Injection');
-  assert(f && f.poc, 'Expected Script Injection with PoC');
-  assertIncludes(f.poc.payload, 'attacker.com', 'script injection payload points to attacker');
+  const f = findings.find(f => f.type === 'XSS');
+  assert(f && f.poc, 'Expected XSS with PoC');
+  assertIncludes(f.poc.payload, 'alert', 'import payload should be JS code');
 });
 
 // ── Transform chain verification ──
@@ -39377,7 +39391,7 @@ test('PoC e2e: iframe.src scheme-checked → Open Redirect payload', () => {
   `);
   const f = findings.find(f => f.type === 'Open Redirect');
   assert(f && f.poc, 'Expected Open Redirect with PoC');
-  assertIncludes(f.poc.payload, 'attacker.com', 'redirect payload');
+  assertIncludes(f.poc.payload, 'evil.com', 'redirect payload');
   assert(!f.poc.payload.includes('javascript:'), 'scheme-checked should not have javascript:');
 });
 
@@ -40369,20 +40383,20 @@ test('window.open with scheme-checked URL → Open Redirect', () => {
 // ── Element type-aware sinks ──
 console.log('\n--- Element type-aware sinks ---');
 
-test('script.src = tainted → Script Injection', () => {
+test('script.src = tainted → XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement("script");
     s.src = location.hash.slice(1);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
-test('script.textContent = tainted → Script Injection', () => {
+test('script.textContent = tainted → XSS', () => {
   const { findings } = analyze(`
     var s = document.createElement("script");
     s.textContent = location.hash.slice(1);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('iframe.src = tainted → XSS (navigable element)', () => {
@@ -40399,7 +40413,7 @@ test('safe: img.src = tainted → no finding (non-navigable)', () => {
     img.src = location.hash;
   `);
   expect(findings).not.toHaveType('XSS');
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 test('safe: video.src = tainted → no finding', () => {
@@ -40408,7 +40422,7 @@ test('safe: video.src = tainted → no finding', () => {
     v.src = location.hash;
   `);
   expect(findings).not.toHaveType('XSS');
-  expect(findings).not.toHaveType('Script Injection');
+  expect(findings).not.toHaveType('XSS');
 });
 
 test('embed.src = tainted → XSS (navigable)', () => {
@@ -40430,6 +40444,7 @@ test('object.data = tainted → XSS (navigable)', () => {
 test('a.href = tainted → XSS (click navigable)', () => {
   const { findings } = analyze(`
     var a = document.createElement("a");
+    document.body.appendChild(a);
     a.href = location.hash.slice(1);
   `);
   const f = findings.find(f => f.type === 'XSS' || f.type === 'Open Redirect');
@@ -40774,18 +40789,18 @@ test('safe: style.cssText = safe string', () => {
 // ── Worker / WebSocket / import sinks ──
 console.log('\n--- Worker / WebSocket / import sinks ---');
 
-test('new Worker(tainted) → Script Injection', () => {
+test('new Worker(tainted) → XSS', () => {
   const { findings } = analyze(`
     new Worker(location.hash.slice(1));
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
-test('new SharedWorker(tainted) → Script Injection', () => {
+test('new SharedWorker(tainted) → XSS', () => {
   const { findings } = analyze(`
     new SharedWorker(location.hash.slice(1));
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('new WebSocket(tainted) → XSS', () => {
@@ -40795,11 +40810,11 @@ test('new WebSocket(tainted) → XSS', () => {
   expect(findings).toHaveType('XSS');
 });
 
-test('import(tainted) → Script Injection', () => {
+test('import(tainted) → XSS', () => {
   const { findings } = analyze(`
     import(location.hash.slice(1));
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── Reflect patterns ──
@@ -40843,7 +40858,7 @@ test('new Blob([tainted]) → URL.createObjectURL → script.src', () => {
     var s = document.createElement("script");
     s.src = url;
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ── JSON roundtrip ──
@@ -41160,21 +41175,21 @@ test('safe: exponentiation produces number', () => {
 console.log('\n--- jQuery sinks ---');
 
 test('$.html(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     $(".target").html(location.hash);
   `);
   expect(findings).toHaveType('XSS');
 });
 
 test('jQuery.append(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     jQuery("#container").append(location.hash);
   `);
   expect(findings).toHaveType('XSS');
 });
 
 test('$.prepend(tainted) → XSS', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     $("body").prepend(location.hash);
   `);
   expect(findings).toHaveType('XSS');
@@ -41350,13 +41365,13 @@ test('PoC e2e: CSS Injection delivery vector', () => {
   assertMatch(f.poc.vector, /\?/, 'search delivery');
 });
 
-test('PoC e2e: Script Injection via Worker', () => {
+test('PoC e2e: XSS via Worker', () => {
   const { findings } = analyze(`
     new Worker(location.hash.slice(1));
   `);
-  const f = findings.find(f => f.type === 'Script Injection');
-  assert(f && f.poc, 'Expected Script Injection with PoC');
-  assertIncludes(f.poc.payload, 'attacker.com', 'attacker URL');
+  const f = findings.find(f => f.type === 'XSS');
+  assert(f && f.poc, 'Expected XSS with PoC');
+  assertIncludes(f.poc.payload, 'alert', 'Worker payload should be JS code');
   assertMatch(f.poc.vector, /^https:\/\/victim\.com\/page#/, 'hash delivery');
 });
 
@@ -42415,7 +42430,7 @@ test('nested ternary with mixed taint', () => {
 console.log('\n--- Advanced: real-world vulnerability patterns ---');
 
 test('jQuery-like $.html() with tainted arg', () => {
-  const { findings } = analyze(`
+  const findings = analyzeWithJQuery(`
     var data = location.hash;
     $('div').html(data);
   `);
@@ -42537,20 +42552,20 @@ test('Prototype Pollution via JSON.parse + merge', () => {
   expect(findings).toHaveType('Prototype Pollution');
 });
 
-test('Script Injection: createElement("script") + tainted src', () => {
+test('XSS: createElement("script") + tainted src', () => {
   const { findings } = analyze(`
     var s = document.createElement('script');
     s.src = location.hash;
     document.body.appendChild(s);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
-test('Script Injection: new Worker(tainted)', () => {
+test('XSS: new Worker(tainted)', () => {
   const { findings } = analyze(`
     new Worker(location.hash);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 test('XSS: new WebSocket(tainted)', () => {
@@ -42560,12 +42575,12 @@ test('XSS: new WebSocket(tainted)', () => {
   expect(findings).toHaveType('XSS');
 });
 
-test('Script Injection: import(tainted)', () => {
+test('XSS: import(tainted)', () => {
   const { findings } = analyze(`
     var mod = location.hash;
     import(mod);
   `);
-  expect(findings).toHaveType('Script Injection');
+  expect(findings).toHaveType('XSS');
 });
 
 // ─── Advanced: sanitizer bypass patterns (should detect) ──
@@ -42855,6 +42870,1331 @@ test('cross-file: function defined in A, called with tainted arg in B', () => {
   const findings = analyzeMultiple([
     { source: `function renderHtml(html) { document.body.innerHTML = html; }`, file: 'utils.js' },
     { source: `renderHtml(location.hash);`, file: 'app.js' },
+  ]);
+  expect(findings).toHaveType('XSS');
+});
+
+// ╔═══════════════════════════════════════════════════════╗
+// ║  ROUND 44 — Advanced AST tests & multi-step PoC gaps ║
+// ╚═══════════════════════════════════════════════════════╝
+
+// ─── Advanced positive: complex data flow patterns ──────
+console.log('\n--- Advanced positive: complex interprocedural data flow ---');
+
+test('taint through Promise.resolve().then() chain', () => {
+  const { findings } = analyze(`
+    Promise.resolve(location.hash).then(function(data) {
+      document.body.innerHTML = data;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through nested callback factory', () => {
+  const { findings } = analyze(`
+    function makeHandler(sink) {
+      return function(data) { sink.innerHTML = data; };
+    }
+    var handler = makeHandler(document.body);
+    handler(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through array push then pop to sink', () => {
+  const { findings } = analyze(`
+    var queue = [];
+    queue.push(location.hash);
+    document.body.innerHTML = queue[0];
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through Map.set then Map.get to sink', () => {
+  const { findings } = analyze(`
+    var cache = new Map();
+    cache.set('html', location.hash);
+    document.body.innerHTML = cache.get('html');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through object spread to sink', () => {
+  const { findings } = analyze(`
+    var base = { html: location.hash };
+    var config = { ...base };
+    document.body.innerHTML = config.html;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through array destructuring from function return', () => {
+  const { findings } = analyze(`
+    function getData() { return [location.hash, 'safe']; }
+    var [tainted, safe] = getData();
+    document.body.innerHTML = tainted;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through class method returning source', () => {
+  const { findings } = analyze(`
+    class Loader {
+      load() { return location.hash; }
+    }
+    var loader = new Loader();
+    document.body.innerHTML = loader.load();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through class inheritance - parent method returns source', () => {
+  const { findings } = analyze(`
+    class Base {
+      getData() { return location.hash; }
+    }
+    class Child extends Base {}
+    var c = new Child();
+    document.body.innerHTML = c.getData();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through try-catch: source in try, sink in catch via shared var', () => {
+  const { findings } = analyze(`
+    var data;
+    try {
+      data = location.hash;
+      throw new Error();
+    } catch(e) {
+      document.body.innerHTML = data;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through finally block', () => {
+  const { findings } = analyze(`
+    var data;
+    try {
+      data = location.hash;
+    } finally {
+      document.body.innerHTML = data;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through for-of with tainted array', () => {
+  const { findings } = analyze(`
+    var items = [location.hash];
+    for (var item of items) {
+      document.body.innerHTML = item;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through while loop with tainted condition body', () => {
+  const { findings } = analyze(`
+    var data = location.hash;
+    var i = 0;
+    while (i < 1) {
+      document.body.innerHTML = data;
+      i++;
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through template literal in sink', () => {
+  const { findings } = analyze(`
+    var data = location.hash;
+    document.body.innerHTML = \`<div>\${data}</div>\`;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through string concat with template literal', () => {
+  const { findings } = analyze(`
+    var name = location.hash;
+    eval(\`console.log('\${name}')\`);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through ternary: both branches tainted', () => {
+  const { findings } = analyze(`
+    var a = location.hash;
+    var b = location.search;
+    var result = Math.random() > 0.5 ? a : b;
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through logical OR: tainted || tainted', () => {
+  const { findings } = analyze(`
+    var result = location.hash || location.search;
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through nullish coalescing: tainted ?? safe', () => {
+  const { findings } = analyze(`
+    var result = location.hash ?? "default";
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through Object.keys on tainted-key object (PP source)', () => {
+  const { findings } = analyze(`
+    var parsed = JSON.parse(location.hash);
+    for (var key in parsed) {
+      document.body.innerHTML = parsed[key];
+    }
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through chained string methods', () => {
+  const { findings } = analyze(`
+    var data = location.hash.slice(1).trim().toLowerCase();
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through String.raw template tag', () => {
+  const { findings } = analyze(`
+    var data = location.hash;
+    document.body.innerHTML = String.raw\`\${data}\`;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── Advanced positive: sink patterns ──────────────────
+console.log('\n--- Advanced positive: sink pattern variations ---');
+
+test('eval via window["eval"]', () => {
+  const { findings } = analyze(`
+    window["eval"](location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('Function constructor via new Function', () => {
+  const { findings } = analyze(`
+    var fn = new Function(location.hash);
+    fn();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('document.write via variable alias', () => {
+  const { findings } = analyze(`
+    var write = document.write.bind(document);
+    write(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('innerHTML via Element.prototype property', () => {
+  const { findings } = analyze(`
+    var el = document.createElement('div');
+    el.innerHTML = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('insertAdjacentHTML with tainted content', () => {
+  const { findings } = analyze(`
+    document.body.insertAdjacentHTML('beforeend', location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('srcdoc on iframe', () => {
+  const { findings } = analyze(`
+    var iframe = document.createElement('iframe');
+    iframe.srcdoc = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('location.assign with tainted URL', () => {
+  const { findings } = analyze(`
+    location.assign(location.hash);
+  `);
+  expect(findings).toHaveAtLeast(1);
+});
+
+test('location.replace with tainted URL', () => {
+  const { findings } = analyze(`
+    location.replace(location.hash);
+  `);
+  expect(findings).toHaveAtLeast(1);
+});
+
+test('window.open with tainted URL', () => {
+  const { findings } = analyze(`
+    window.open(location.hash);
+  `);
+  expect(findings).toHaveAtLeast(1);
+});
+
+test('setAttribute with onclick and tainted value', () => {
+  const { findings } = analyze(`
+    var el = document.createElement('div');
+    el.setAttribute('onclick', location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('jQuery .html() with tainted input', () => {
+  const findings = analyzeWithJQuery(`
+    $(document.body).html(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('jQuery $(tainted) selector injection via real jQuery library', () => {
+  const jquerySrc = readFileSync(resolve(libsDir, 'jquery.min.js'), 'utf8');
+  const findings = analyzeMultiple([
+    { source: jquerySrc, file: 'jquery.min.js' },
+    { source: `$(location.hash);`, file: 'app.js' },
+  ]);
+  expect(findings).toHaveType('XSS');
+});
+
+test('document.writeln with tainted input', () => {
+  const { findings } = analyze(`
+    document.writeln(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('Range.createContextualFragment with tainted input', () => {
+  const { findings } = analyze(`
+    var range = document.createRange();
+    var frag = range.createContextualFragment(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── Advanced positive: prototype pollution patterns ────
+console.log('\n--- Advanced positive: prototype pollution patterns ---');
+
+test('PP: nested bracket access obj[a][b] = tainted', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      var obj = {};
+      obj[e.data.key1][e.data.key2] = e.data.value;
+    });
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+test('PP: Object.defineProperty with tainted property name', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      Object.defineProperty({}, e.data.prop, { value: e.data.val });
+    });
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+test('PP: Reflect.set with __proto__ key', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      Reflect.set({}, "__proto__", e.data);
+    });
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+test('PP: recursive merge function', () => {
+  const { findings } = analyze(`
+    function merge(target, source) {
+      for (var key in source) {
+        if (typeof source[key] === 'object') {
+          target[key] = target[key] || {};
+          merge(target[key], source[key]);
+        } else {
+          target[key] = source[key];
+        }
+      }
+    }
+    window.addEventListener('message', function(e) {
+      merge({}, JSON.parse(e.data));
+    });
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+// ─── Advanced positive: script injection ─────────────
+console.log('\n--- Advanced positive: script injection patterns ---');
+
+test('dynamic import() with tainted URL', () => {
+  const { findings } = analyze(`
+    import(location.hash.slice(1));
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('new Worker with tainted URL', () => {
+  const { findings } = analyze(`
+    new Worker(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('new SharedWorker with tainted URL', () => {
+  const { findings } = analyze(`
+    new SharedWorker(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('script.src = tainted', () => {
+  const { findings } = analyze(`
+    var s = document.createElement('script');
+    s.src = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('WebSocket with tainted URL', () => {
+  const { findings } = analyze(`
+    new WebSocket(location.hash);
+  `);
+  expect(findings).toHaveAtLeast(1);
+});
+
+// ─── Advanced positive: source patterns ─────────────
+console.log('\n--- Advanced positive: source pattern variations ---');
+
+test('document.URL as source', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = document.URL;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('document.referrer as source', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = document.referrer;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('document.cookie as source', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = document.cookie;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('window.name as source', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = window.name;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('URLSearchParams from location.search', () => {
+  const { findings } = analyze(`
+    var params = new URLSearchParams(location.search);
+    document.body.innerHTML = params.get('q');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('hashchange event handler', () => {
+  const { findings } = analyze(`
+    window.addEventListener('hashchange', function() {
+      document.body.innerHTML = location.hash;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('sessionStorage as source', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = sessionStorage.getItem('data');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('localStorage as source', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = localStorage.getItem('data');
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── Advanced negative: sanitizer patterns ──────────────
+console.log('\n--- Advanced negative: sanitizer and safe patterns ---');
+
+test('SAFE: DOMPurify.sanitize in middle of chain', () => {
+  const { findings } = analyze(`
+    var raw = location.hash;
+    var clean = DOMPurify.sanitize(raw);
+    document.body.innerHTML = clean;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: encodeURIComponent before eval (encoded is not executable)', () => {
+  const { findings } = analyze(`
+    var safe = encodeURIComponent(location.hash);
+    document.body.innerHTML = safe;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: parseInt converts to number', () => {
+  const { findings } = analyze(`
+    var num = parseInt(location.hash, 10);
+    document.body.innerHTML = num;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: Number() converts to number', () => {
+  const { findings } = analyze(`
+    var num = Number(location.hash);
+    document.body.innerHTML = num;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: Math.floor of tainted is number', () => {
+  const { findings } = analyze(`
+    var num = Math.floor(location.hash);
+    document.body.innerHTML = num;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('JSON.stringify preserves taint (angle brackets NOT escaped in standard JS)', () => {
+  const { findings } = analyze(`
+    var str = JSON.stringify(location.hash);
+    document.body.innerHTML = str;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: typeof result is a safe string', () => {
+  const { findings } = analyze(`
+    var t = typeof location.hash;
+    document.body.innerHTML = t;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: boolean coercion via !!', () => {
+  const { findings } = analyze(`
+    var b = !!location.hash;
+    document.body.innerHTML = b;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: textContent assignment is not a sink', () => {
+  const { findings } = analyze(`
+    document.body.textContent = location.hash;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: innerText assignment is not a sink', () => {
+  const { findings } = analyze(`
+    document.body.innerText = location.hash;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: console.log is not a sink', () => {
+  const { findings } = analyze(`
+    console.log(location.hash);
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: array length is numeric', () => {
+  const { findings } = analyze(`
+    var arr = [location.hash];
+    document.body.innerHTML = arr.length;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: string length is numeric', () => {
+  const { findings } = analyze(`
+    var len = location.hash.length;
+    document.body.innerHTML = len;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: comparison operators return boolean', () => {
+  const { findings } = analyze(`
+    var a = location.hash === "safe";
+    var b = location.hash > "a";
+    var c = location.hash !== "bad";
+    document.body.innerHTML = "" + a + b + c;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: indexOf returns number', () => {
+  const { findings } = analyze(`
+    var idx = location.hash.indexOf('test');
+    document.body.innerHTML = idx;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: regex test returns boolean', () => {
+  const { findings } = analyze(`
+    var result = /safe/.test(location.hash);
+    document.body.innerHTML = result;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: sanitized via allowlist check before sink', () => {
+  const { findings } = analyze(`
+    var val = location.hash.slice(1);
+    if (val === 'home' || val === 'about' || val === 'contact') {
+      document.body.innerHTML = val;
+    }
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: object property that is a literal, not tainted', () => {
+  const { findings } = analyze(`
+    var config = { html: '<b>hello</b>' };
+    document.body.innerHTML = config.html;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: function returning literal', () => {
+  const { findings } = analyze(`
+    function getHtml() { return '<b>hello</b>'; }
+    document.body.innerHTML = getHtml();
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: tainted used only in condition, not in sink', () => {
+  const { findings } = analyze(`
+    if (location.hash === '#admin') {
+      document.body.innerHTML = '<p>Admin panel</p>';
+    }
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ─── Advanced negative: complex safe data flow ─────────
+console.log('\n--- Advanced negative: complex safe data flow ---');
+
+test('SAFE: taint replaced by safe value before sink', () => {
+  const { findings } = analyze(`
+    var data = location.hash;
+    data = "safe replacement";
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: ternary with constant true selects safe branch', () => {
+  const { findings } = analyze(`
+    var x = true ? "safe" : location.hash;
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: ternary with constant false selects safe branch', () => {
+  const { findings } = analyze(`
+    var x = false ? location.hash : "safe";
+    document.body.innerHTML = x;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: taint goes to textContent, safe goes to innerHTML', () => {
+  const { findings } = analyze(`
+    var el = document.createElement('div');
+    el.textContent = location.hash;
+    document.body.innerHTML = '<p>safe</p>';
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: sanitizer applied in called function', () => {
+  const { findings } = analyze(`
+    function safePrint(html) {
+      document.body.innerHTML = DOMPurify.sanitize(html);
+    }
+    safePrint(location.hash);
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: Object.assign with safe override of tainted property', () => {
+  const { findings } = analyze(`
+    var tainted = { html: location.hash };
+    var config = Object.assign({}, tainted, { html: '<b>safe</b>' });
+    document.body.innerHTML = config.html;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ─── Advanced: multi-step PoC edge cases ────────────────
+console.log('\n--- Advanced: multi-step PoC edge cases ---');
+
+test('multi-step: negated condition (!==) branching', () => {
+  const { findings } = analyze(`
+    var state = {};
+    window.addEventListener('message', function(e) {
+      if (e.data.mode !== 'display') {
+        state.content = e.data.html;
+      }
+      if (e.data.mode === 'display') {
+        document.body.innerHTML = state.content;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  const pmCount = (poc.vector.match(/postMessage/g) || []).length;
+  assert(pmCount >= 2, 'negated condition multi-step should have 2+ postMessage calls, got ' + pmCount);
+  assertIncludes(poc.vector, '"display"', 'sink step should include display condition');
+});
+
+test('multi-step: onmessage property style (not addEventListener)', () => {
+  const { findings } = analyze(`
+    var cache = {};
+    window.onmessage = function(e) {
+      if (e.data.action === 'cache') {
+        cache.template = e.data.tpl;
+      }
+      if (e.data.action === 'render') {
+        document.body.innerHTML = cache.template;
+      }
+    };
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  const pmCount = (poc.vector.match(/postMessage/g) || []).length;
+  assert(pmCount >= 2, 'onmessage multi-step should have 2+ postMessage calls, got ' + pmCount);
+});
+
+test('multi-step: three conditions (init → config → render)', () => {
+  const { findings } = analyze(`
+    var app = {};
+    window.addEventListener('message', function(e) {
+      if (e.data.step === 'init') {
+        app.ready = true;
+      }
+      if (e.data.step === 'config') {
+        app.template = e.data.html;
+      }
+      if (e.data.step === 'render') {
+        document.body.innerHTML = app.template;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.vector, '"config"', 'should include config step');
+  assertIncludes(poc.vector, '"render"', 'should include render step');
+});
+
+test('multi-step: postMessage stores, setTimeout sinks', () => {
+  const { findings } = analyze(`
+    var pending;
+    window.addEventListener('message', function(e) {
+      pending = e.data.code;
+    });
+    setTimeout(function() {
+      if (pending) eval(pending);
+    }, 1000);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('multi-step: different property names in data shape', () => {
+  const { findings } = analyze(`
+    var state = {};
+    window.addEventListener('message', function(e) {
+      if (e.data.type === 'setPayload') {
+        state.payload = e.data.content;
+      }
+      if (e.data.type === 'execute') {
+        document.body.innerHTML = state.payload;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.vector, '"setPayload"', 'store step condition value');
+  assertIncludes(poc.vector, '"execute"', 'sink step condition value');
+});
+
+test('multi-step: switch with default case', () => {
+  const { findings } = analyze(`
+    var data = {};
+    window.addEventListener('message', function(e) {
+      switch(e.data.cmd) {
+        case 'save':
+          data.html = e.data.body;
+          break;
+        case 'load':
+          document.body.innerHTML = data.html;
+          break;
+        default:
+          break;
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  const pmCount = (poc.vector.match(/postMessage/g) || []).length;
+  assert(pmCount >= 2, 'switch multi-step should have 2+ postMessage calls, got ' + pmCount);
+});
+
+test('multi-step: postMessage to eval (JS payload, not HTML)', () => {
+  const { findings } = analyze(`
+    var stored = {};
+    window.addEventListener('message', function(e) {
+      if (e.data.action === 'store') {
+        stored.code = e.data.js;
+      }
+      if (e.data.action === 'run') {
+        eval(stored.code);
+      }
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('multi-step: location.href sink (navigation)', () => {
+  const { findings } = analyze(`
+    var config = {};
+    window.addEventListener('message', function(e) {
+      if (e.data.type === 'setUrl') {
+        config.redirect = e.data.url;
+      }
+      if (e.data.type === 'go') {
+        location.href = config.redirect;
+      }
+    });
+  `);
+  expect(findings).toHaveAtLeast(1);
+});
+
+// ─── Advanced: data-flow PoC accuracy ──────────────────
+console.log('\n--- Advanced: data-flow PoC accuracy ---');
+
+test('PoC: hash.slice(1) → JSON.parse → .config.html → innerHTML', () => {
+  const { findings } = analyze(`
+    var obj = JSON.parse(location.hash.slice(1));
+    document.body.innerHTML = obj.config.html;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  // Vector should contain JSON with nested config.html
+  assertIncludes(poc.vector, 'config', 'should reference config in vector');
+  assertIncludes(poc.vector, 'html', 'should reference html key in vector');
+});
+
+test('PoC: URLSearchParams → .get("input") → innerHTML shows ?input=', () => {
+  const { findings } = analyze(`
+    var p = new URLSearchParams(location.search);
+    document.body.innerHTML = p.get('input');
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.vector, 'input', 'should reference param name in vector');
+});
+
+test('PoC: atob(hash) → innerHTML should track atob transform', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = atob(location.hash.slice(1));
+  `);
+  expect(findings).toHaveType('XSS');
+  const f = findings[0];
+  assert(f.poc, 'Expected PoC');
+  assertHasTransform(f.source[0].transforms, 'atob');
+});
+
+test('PoC: decodeURIComponent transform tracked', () => {
+  const { findings } = analyze(`
+    var decoded = decodeURIComponent(location.hash.slice(1));
+    document.body.innerHTML = decoded;
+  `);
+  expect(findings).toHaveType('XSS');
+  assertHasTransform(findings[0].source[0].transforms, 'decodeURIComponent');
+});
+
+test('PoC: split + index transform tracked', () => {
+  const { findings } = analyze(`
+    var parts = location.hash.split('#');
+    document.body.innerHTML = parts[1];
+  `);
+  expect(findings).toHaveType('XSS');
+  const transforms = findings[0].source[0].transforms;
+  assertHasTransform(transforms, 'split');
+});
+
+test('PoC: postMessage nested property data shape', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      document.body.innerHTML = e.data.config.template;
+    });
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.vector, 'config', 'should show config in data shape');
+  assertIncludes(poc.vector, 'template', 'should show template in data shape');
+});
+
+test('PoC: localStorage key name preserved in vector', () => {
+  const { findings } = analyze(`
+    var prefs = localStorage.getItem('userPrefs');
+    document.body.innerHTML = prefs;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.vector, 'userPrefs', 'should preserve storage key name');
+});
+
+test('PoC: cookie source shows document.cookie in vector', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = document.cookie;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.vector, 'cookie', 'should reference cookie');
+});
+
+test('PoC: window.name source shows window.open in vector', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = window.name;
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.vector, 'window', 'should reference window in vector');
+});
+
+test('PoC: eval sink gets JS payload, not HTML', () => {
+  const { findings } = analyze(`
+    eval(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+  const poc = findings[0].poc;
+  assert(poc, 'Expected PoC');
+  assertEq(poc.payload, 'alert(1)', 'eval sink should get JS payload');
+});
+
+test('PoC: location.href sink gets javascript: payload', () => {
+  const { findings } = analyze(`
+    location.href = location.hash;
+  `);
+  const xss = findings.find(f => f.type === 'XSS');
+  assert(xss, 'Expected XSS finding');
+  const poc = xss.poc;
+  assert(poc, 'Expected PoC');
+  assertIncludes(poc.payload, 'javascript:', 'navigation XSS should have javascript: payload');
+});
+
+// ─── Advanced: constructor escape patterns ─────────────
+console.log('\n--- Advanced: constructor escape and indirect eval ---');
+
+test('"".constructor.constructor(tainted)()', () => {
+  const { findings } = analyze(`
+    "".constructor.constructor(location.hash)();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('[].constructor.constructor(tainted)()', () => {
+  const { findings } = analyze(`
+    [].constructor.constructor(location.hash)();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('(0,eval)(tainted) - indirect eval', () => {
+  const { findings } = analyze(`
+    (0, eval)(location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('Function.prototype.call.call(eval, null, tainted)', () => {
+  const { findings } = analyze(`
+    Function.prototype.call.call(eval, null, location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('Reflect.apply(eval, null, [tainted])', () => {
+  const { findings } = analyze(`
+    Reflect.apply(eval, null, [location.hash]);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('setTimeout with string argument', () => {
+  const { findings } = analyze(`
+    setTimeout(location.hash, 0);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('setInterval with string argument', () => {
+  const { findings } = analyze(`
+    setInterval(location.hash, 100);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── Advanced: event handler patterns ──────────────────
+console.log('\n--- Advanced: event handler property XSS ---');
+
+test('el.onload = tainted', () => {
+  const { findings } = analyze(`
+    var img = document.createElement('img');
+    img.onload = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('el.onerror = tainted', () => {
+  const { findings } = analyze(`
+    var img = document.createElement('img');
+    img.onerror = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('el.onclick = tainted', () => {
+  const { findings } = analyze(`
+    var el = document.createElement('div');
+    el.onclick = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── Advanced: CSS Injection patterns ──────────────────
+console.log('\n--- Advanced: CSS Injection ---');
+
+test('style.cssText = tainted', () => {
+  const { findings } = analyze(`
+    document.body.style.cssText = location.hash;
+  `);
+  expect(findings).toHaveType('CSS Injection');
+});
+
+test('el.style.background = tainted', () => {
+  const { findings } = analyze(`
+    document.body.style.background = location.hash;
+  `);
+  expect(findings).toHaveType('CSS Injection');
+});
+
+// ─── Advanced: Open Redirect vs XSS distinction ───────
+console.log('\n--- Advanced: Open Redirect classification ---');
+
+test('safe URL prefix → Open Redirect (not XSS)', () => {
+  const { findings } = analyze(`
+    var url = "https://example.com/" + location.hash;
+    location.href = url;
+  `);
+  const or = findings.filter(f => f.type === 'Open Redirect');
+  assert(or.length > 0, 'Expected Open Redirect');
+  const xss = findings.filter(f => f.type === 'XSS');
+  assertEq(xss.length, 0, 'Should not have XSS when URL has safe prefix');
+});
+
+test('no prefix → XSS (full URL control)', () => {
+  const { findings } = analyze(`
+    location.href = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('location.assign with safe prefix → Open Redirect only', () => {
+  const { findings } = analyze(`
+    var target = "https://safe.com/redirect?to=" + location.hash;
+    location.assign(target);
+  `);
+  const or = findings.filter(f => f.type === 'Open Redirect');
+  assert(or.length > 0, 'Expected Open Redirect');
+  expect(findings).not.toHaveType('XSS');
+});
+
+// ─── Advanced: complex interprocedural chains ──────────
+console.log('\n--- Advanced: complex interprocedural chains ---');
+
+test('taint through two function calls in chain', () => {
+  const { findings } = analyze(`
+    function getInput() { return location.hash; }
+    function render(html) { document.body.innerHTML = html; }
+    render(getInput());
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through object method chain: get then render', () => {
+  const { findings } = analyze(`
+    var app = {
+      getData: function() { return location.hash; },
+      render: function(html) { document.body.innerHTML = html; }
+    };
+    app.render(app.getData());
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through closure capture', () => {
+  const { findings } = analyze(`
+    function createRenderer() {
+      var data = location.hash;
+      return function() {
+        document.body.innerHTML = data;
+      };
+    }
+    var render = createRenderer();
+    render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through higher-order function', () => {
+  const { findings } = analyze(`
+    function apply(fn, val) { return fn(val); }
+    function toHtml(s) { return '<div>' + s + '</div>'; }
+    document.body.innerHTML = apply(toHtml, location.hash);
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: higher-order function with sanitizer', () => {
+  const { findings } = analyze(`
+    function apply(fn, val) { return fn(val); }
+    document.body.innerHTML = apply(DOMPurify.sanitize, location.hash);
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('taint through param mutation back to caller', () => {
+  const { findings } = analyze(`
+    function loadData(config) {
+      config.html = location.hash;
+    }
+    var cfg = {};
+    loadData(cfg);
+    document.body.innerHTML = cfg.html;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('taint through class constructor to method', () => {
+  const { findings } = analyze(`
+    class Widget {
+      constructor(html) { this.html = html; }
+      render() { document.body.innerHTML = this.html; }
+    }
+    var w = new Widget(location.hash);
+    w.render();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: class method sanitizes before sink', () => {
+  const { findings } = analyze(`
+    class Widget {
+      constructor(html) { this.html = html; }
+      render() { document.body.innerHTML = DOMPurify.sanitize(this.html); }
+    }
+    var w = new Widget(location.hash);
+    w.render();
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ─── Advanced: logical operator edge cases ─────────────
+console.log('\n--- Advanced: logical operator edge cases ---');
+
+test('&&= with tainted RHS and truthy LHS', () => {
+  const { findings } = analyze(`
+    var data = "initial";
+    data &&= location.hash;
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('||= with tainted RHS and falsy LHS', () => {
+  const { findings } = analyze(`
+    var data = "";
+    data ||= location.hash;
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('??= with tainted RHS and nullish LHS', () => {
+  const { findings } = analyze(`
+    var data = null;
+    data ??= location.hash;
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: &&= with falsy LHS stays falsy', () => {
+  const { findings } = analyze(`
+    var data = "";
+    data &&= location.hash;
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: ||= with truthy LHS keeps original', () => {
+  const { findings } = analyze(`
+    var data = "safe";
+    data ||= location.hash;
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('SAFE: ??= with non-nullish LHS keeps original', () => {
+  const { findings } = analyze(`
+    var data = "safe";
+    data ??= location.hash;
+    document.body.innerHTML = data;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+// ─── Advanced: optional chaining ───────────────────────
+console.log('\n--- Advanced: optional chaining ---');
+
+test('optional chaining member access propagates taint', () => {
+  const { findings } = analyze(`
+    var obj = { html: location.hash };
+    document.body.innerHTML = obj?.html;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('optional chaining method call propagates taint', () => {
+  const { findings } = analyze(`
+    var obj = { get: function() { return location.hash; } };
+    document.body.innerHTML = obj?.get();
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── Advanced: element-type-aware sinks ────────────────
+console.log('\n--- Advanced: element-type-aware sinks ---');
+
+test('script.src = tainted → XSS', () => {
+  const { findings } = analyze(`
+    var s = document.createElement('script');
+    s.src = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('iframe.src = tainted → XSS', () => {
+  const { findings } = analyze(`
+    var f = document.createElement('iframe');
+    f.src = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: img.src = tainted (images are not script sinks)', () => {
+  const { findings } = analyze(`
+    var img = document.createElement('img');
+    img.src = location.hash;
+  `);
+  expect(findings).toBeEmpty();
+});
+
+test('a.href = tainted → XSS (javascript: URI)', () => {
+  const { findings } = analyze(`
+    var a = document.createElement('a');
+    document.body.appendChild(a);
+    a.href = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('embed.src = tainted → XSS', () => {
+  const { findings } = analyze(`
+    var e = document.createElement('embed');
+    e.src = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+test('object.data = tainted → XSS', () => {
+  const { findings } = analyze(`
+    var o = document.createElement('object');
+    o.data = location.hash;
+  `);
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── Advanced: cross-file multi-step patterns ──────────
+console.log('\n--- Advanced: cross-file analysis patterns ---');
+
+test('cross-file: taint through shared module function', () => {
+  const findings = analyzeMultiple([
+    { source: `function getHash() { return location.hash; }`, file: 'utils.js' },
+    { source: `document.body.innerHTML = getHash();`, file: 'app.js' },
+  ]);
+  expect(findings).toHaveType('XSS');
+});
+
+test('cross-file: SAFE when sanitized in pipeline', () => {
+  const findings = analyzeMultiple([
+    { source: `function clean(html) { return DOMPurify.sanitize(html); }`, file: 'sanitize.js' },
+    { source: `document.body.innerHTML = clean(location.hash);`, file: 'app.js' },
+  ]);
+  expect(findings).toBeEmpty();
+});
+
+test('cross-file: taint via global object property', () => {
+  const findings = analyzeMultiple([
+    { source: `window.appState = { html: location.hash };`, file: 'init.js' },
+    { source: `document.body.innerHTML = window.appState.html;`, file: 'render.js' },
   ]);
   expect(findings).toHaveType('XSS');
 });

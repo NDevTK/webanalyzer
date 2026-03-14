@@ -113,12 +113,7 @@ export const CALL_SINKS = {
   'Element.prototype.insertAdjacentHTML': { type: 'XSS', taintedArgs: [1] },
   'DOMParser.prototype.parseFromString': { type: 'XSS', taintedArgs: [0] },
   'Range.prototype.createContextualFragment': { type: 'XSS', taintedArgs: [0] },
-  // jQuery
-  '$.html': { type: 'XSS', taintedArgs: [0] },
-  'jQuery.html': { type: 'XSS', taintedArgs: [0] },
-  '$.append': { type: 'XSS', taintedArgs: [0] },
-  'jQuery.append': { type: 'XSS', taintedArgs: [0] },
-  '$.prepend': { type: 'XSS', taintedArgs: [0] },
+  // jQuery sinks removed — detected via interprocedural tracing through actual library code
   // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
   'location.assign': { type: 'XSS', taintedArgs: [0], navigation: true },
   'location.replace': { type: 'XSS', taintedArgs: [0], navigation: true },
@@ -126,7 +121,7 @@ export const CALL_SINKS = {
   'window.location.assign': { type: 'XSS', taintedArgs: [0], navigation: true },
   'window.location.replace': { type: 'XSS', taintedArgs: [0], navigation: true },
   // Script injection
-  'document.createElement': { type: 'Script Injection', taintedArgs: [0], checkValue: 'script' },
+  'document.createElement': { type: 'XSS', taintedArgs: [0], checkValue: 'script' },
   // Fetch with tainted URL (SSRF-like in browser context, but mainly for data exfil)
 };
 

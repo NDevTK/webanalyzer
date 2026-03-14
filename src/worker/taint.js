@@ -370,7 +370,8 @@ class AnalysisContext {
     this.returnedFuncNode = null;  // tracks function nodes returned from calls
     this.returnedMethods = null;   // tracks { name → funcNode } for returned objects
     this.scriptElements = new Set(); // tracks variables holding createElement('script') results
-    this.elementTypes = new Map(); // tracks variable name → element tag name from createElement
+    this.elementTypes = new Map(); // tracks variable name → element tag name from createElement/querySelector
+    this.domAttached = new Set(); // tracks variables holding DOM-attached elements
     this.thrownTaint = TaintSet.empty(); // tracks taint from ThrowStatement for catch param
     this.generatorTaint = new Map(); // maps generator function key → TaintSet from yield expressions
     this.eventListeners = new Map(); // eventName → [{callback, env}] for custom event dispatch tracking
@@ -378,6 +379,7 @@ class AnalysisContext {
     this.superClassMap = new Map(); // className → parentClassName
     this.protoMethodMap = new Map(); // "ClassName" → [{methodName, funcNode}]
     this._findingKeys = new Set(); // dedup key set for findings (prevents duplicates from back-edge re-iteration)
+    this._thisAliases = null; // Set<string> of variable names aliased to `this` (e.g., var a = this)
   }
 }
 
@@ -559,6 +561,19 @@ function applyBranchCondition(testNode, polarity, env) {
         if (origin) env.schemeCheckedVars.add(origin);
         continue;
       }
+      // Allowlist check: val === 'a' || val === 'b' || val === 'c'
+      // When all operands test the same variable against string literals, the variable
+      // is constrained to one of those safe values → clear its taint
+      const allowlistVar = extractAllowlistVar(node);
+      if (allowlistVar) {
+        env.set(allowlistVar, TaintSet.empty());
+        env.set(`global:${allowlistVar}`, TaintSet.empty());
+        const suffix = `:${allowlistVar}`;
+        for (const [key] of env.entries()) {
+          if (key.endsWith(suffix)) env.set(key, TaintSet.empty());
+        }
+        continue;
+      }
       stack.push({ node: node.left, positive: true });
       stack.push({ node: node.right, positive: true });
       continue;
@@ -601,6 +616,40 @@ function applyBranchCondition(testNode, polarity, env) {
   }
 }
 
+// Detect allowlist pattern: x === 'a' || x === 'b' || x === 'c'
+// Returns the variable name if all operands in an || chain test the same Identifier against string literals.
+function extractAllowlistVar(node) {
+  // Flatten the || chain
+  const comparisons = [];
+  const stack = [node];
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (n.type === 'LogicalExpression' && n.operator === '||') {
+      stack.push(n.left);
+      stack.push(n.right);
+    } else if (n.type === 'BinaryExpression' && (n.operator === '===' || n.operator === '==')) {
+      comparisons.push(n);
+    } else {
+      return null; // non-comparison operand → not an allowlist
+    }
+  }
+  if (comparisons.length < 2) return null;
+  let varName = null;
+  for (const cmp of comparisons) {
+    let identSide, litSide;
+    if (cmp.left.type === 'Identifier' && isStringLiteral(cmp.right)) {
+      identSide = cmp.left; litSide = cmp.right;
+    } else if (cmp.right.type === 'Identifier' && isStringLiteral(cmp.left)) {
+      identSide = cmp.right; litSide = cmp.left;
+    } else {
+      return null; // not identifier === literal
+    }
+    if (varName === null) varName = identSide.name;
+    else if (varName !== identSide.name) return null; // different variables
+  }
+  return varName;
+}
+
 // Extract condition discriminant and value from a branch condition AST node.
 // e.g. e.data.type === 'init' → { discriminant: 'e.data.type', propName: 'type', value: 'init' }
 // Returns null if the condition isn't a simple equality check we can use for multi-step PoCs.
@@ -618,10 +667,9 @@ function extractConditionInfo(testNode, polarity) {
     const isEq = op === '===' || op === '==';
     const isNeq = op === '!==' || op === '!=';
     if (!isEq && !isNeq) return null;
-    // !== with positive polarity means the value must NOT equal → skip
+    // !== with positive polarity means the value must NOT equal
     // !== with negative polarity (inside negated branch) means it MUST equal
     const mustEqual = isEq ? pos : !pos;
-    if (!mustEqual) return null;
 
     let memberSide, literalSide;
     if (isLiteral(node.right) && !isLiteral(node.left)) {
@@ -636,7 +684,7 @@ function extractConditionInfo(testNode, polarity) {
     const parts = discriminant.split('.');
     const propName = parts[parts.length - 1];
     const value = literalSide.value;
-    return { discriminant, propName, value };
+    return { discriminant, propName, value, negated: !mustEqual };
   }
   return null;
 }
@@ -1142,6 +1190,8 @@ function processNode(node, env, ctx) {
 
     case 'FunctionDeclaration':
       if (node.id) {
+        node._closureEnv = env;
+        node._closureFuncMap = ctx.funcMap;
         const key = resolveId(node.id, ctx);
         ctx.funcMap.set(key, node);
         // Also store by raw name for cross-file resolution
@@ -1444,6 +1494,149 @@ function isCreateScriptElement(node, env) {
   return getCreateElementTag(node, env) === 'script';
 }
 
+// ── Check if a node is a DOM query (querySelector, getElementById, etc.) ──
+// Returns { method, tag } where tag is extracted from selector if possible
+const DOM_QUERY_METHODS = new Set(['querySelector', 'querySelectorAll', 'getElementById',
+  'getElementsByClassName', 'getElementsByTagName', 'getElementsByTagNameNS']);
+const VALID_HTML_TAGS = new Set(['a','abbr','address','area','article','aside','audio','b','base','bdi',
+  'bdo','blockquote','body','br','button','canvas','caption','cite','code','col','colgroup','data',
+  'datalist','dd','del','details','dfn','dialog','div','dl','dt','em','embed','fieldset','figcaption',
+  'figure','footer','form','h1','h2','h3','h4','h5','h6','head','header','hgroup','hr','html','i',
+  'iframe','img','input','ins','kbd','label','legend','li','link','main','map','mark','menu','meta',
+  'meter','nav','noscript','object','ol','optgroup','option','output','p','picture','pre','progress',
+  'q','rp','rt','ruby','s','samp','script','search','section','select','slot','small','source','span',
+  'strong','style','sub','summary','sup','table','tbody','td','template','textarea','tfoot','th',
+  'thead','time','title','tr','track','u','ul','var','video','wbr']);
+
+function getDOMQueryInfo(node, env) {
+  if (node.type !== 'CallExpression') return null;
+  const callee = node.callee;
+  if (!callee || callee.type !== 'MemberExpression' || callee.computed) return null;
+  const method = callee.property?.name;
+  if (!method || !DOM_QUERY_METHODS.has(method)) return null;
+  // Verify the object is document or an element
+  const obj = callee.object;
+  const objName = obj.type === 'Identifier' ? obj.name : nodeToString(obj);
+
+  let tag = null;
+  const arg = node.arguments?.[0];
+  if (arg && isStringLiteral(arg)) {
+    const selector = stringLiteralValue(arg);
+    if (method === 'getElementsByTagName' || method === 'getElementsByTagNameNS') {
+      // getElementsByTagName('script') → tag = 'script'
+      const t = selector.toLowerCase();
+      if (VALID_HTML_TAGS.has(t)) tag = t;
+    } else if (method === 'querySelector' || method === 'querySelectorAll') {
+      // Extract leading tag name from CSS selector: 'script.external' → 'script'
+      const m = selector.match(/^([a-zA-Z][a-zA-Z0-9]*)/);
+      if (m) {
+        const t = m[1].toLowerCase();
+        if (VALID_HTML_TAGS.has(t)) tag = t;
+      }
+    }
+    // getElementById / getElementsByClassName → can't determine tag from args
+  }
+  return { method, tag, isDomAttached: true };
+}
+
+// ── Per-property propagation helper ──
+// When assigning `target = source`, propagate source's per-property taints and funcMap entries
+// to the target. Resolves the source expression to a prefix in env/funcMap.
+function propagatePerPropertyEntries(sourceExpr, targetName, env, ctx) {
+  // Unwrap common wrapper expressions to find the meaningful source
+  // LogicalExpression: arguments[0] || {} → try left side first
+  if (sourceExpr.type === 'LogicalExpression') {
+    propagatePerPropertyEntries(sourceExpr.left, targetName, env, ctx);
+    return;
+  }
+  // ConditionalExpression: cond ? a : b → try both branches
+  if (sourceExpr.type === 'ConditionalExpression') {
+    propagatePerPropertyEntries(sourceExpr.consequent, targetName, env, ctx);
+    propagatePerPropertyEntries(sourceExpr.alternate, targetName, env, ctx);
+    return;
+  }
+
+  // Determine the source prefix in env/funcMap
+  let srcPrefix = null;
+  if (sourceExpr.type === 'Identifier') {
+    const name = sourceExpr.name;
+    const key = resolveId(sourceExpr, ctx);
+    // Check if this identifier has per-property entries
+    if (env.getTaintedWithPrefix(`${key}.`).size > 0) srcPrefix = key;
+    else if (key !== name && env.getTaintedWithPrefix(`${name}.`).size > 0) srcPrefix = name;
+  } else if (sourceExpr.type === 'MemberExpression' && sourceExpr.computed) {
+    const objStr = nodeToString(sourceExpr.object);
+    if (objStr) {
+      // Try constant resolution for the index
+      let litKey = null;
+      if (isStringLiteral(sourceExpr.property)) litKey = stringLiteralValue(sourceExpr.property);
+      else if (isNumericLit(sourceExpr.property)) litKey = String(sourceExpr.property.value);
+      else {
+        const resolved = resolveToConstant(sourceExpr.property, env, ctx);
+        if (resolved !== undefined) litKey = String(resolved);
+      }
+      if (litKey !== null) {
+        // Exact index: try obj.#idx_N then obj.N
+        const idxPrefix = `${objStr}.#idx_${litKey}`;
+        if (env.getTaintedWithPrefix(`${idxPrefix}.`).size > 0) srcPrefix = idxPrefix;
+        else {
+          const dotPrefix = `${objStr}.${litKey}`;
+          if (env.getTaintedWithPrefix(`${dotPrefix}.`).size > 0) srcPrefix = dotPrefix;
+        }
+      }
+      // Dynamic index on arguments: merge all arguments.#idx_N.* entries
+      if (!srcPrefix && objStr === 'arguments') {
+        // Collect all per-property entries from any arguments.#idx_N.*
+        const allArgProps = new Map(); // propName → taint
+        const allArgFuncs = new Map(); // propName → funcNode
+        for (const [key, taint] of env.entries()) {
+          const m = key.match(/^arguments\.#idx_\d+\.(.+)$/);
+          if (m && !m[1].startsWith('#')) {
+            const propName = m[1];
+            if (!allArgProps.has(propName)) allArgProps.set(propName, taint);
+            else allArgProps.set(propName, allArgProps.get(propName).clone().merge(taint));
+          }
+        }
+        for (const [key, val] of ctx.funcMap) {
+          const m = key.match(/^arguments\.#idx_\d+\.(.+)$/);
+          if (m) allArgFuncs.set(m[1], val);
+        }
+        // Propagate to target
+        for (const [propName, taint] of allArgProps) {
+          env.set(`${targetName}.${propName}`, taint);
+        }
+        for (const [propName, funcNode] of allArgFuncs) {
+          ctx.funcMap.set(`${targetName}.${propName}`, funcNode);
+          if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, funcNode);
+        }
+        return; // already propagated
+      }
+    }
+  } else if (sourceExpr.type === 'MemberExpression' && !sourceExpr.computed) {
+    const fullStr = nodeToString(sourceExpr);
+    if (fullStr && env.getTaintedWithPrefix(`${fullStr}.`).size > 0) srcPrefix = fullStr;
+  }
+  if (!srcPrefix) return;
+
+  // Copy per-property taints
+  for (const [key, taint] of env.getTaintedWithPrefix(`${srcPrefix}.`)) {
+    const propName = key.slice(srcPrefix.length + 1);
+    if (propName && !propName.startsWith('#')) {
+      env.set(`${targetName}.${propName}`, taint);
+    }
+  }
+  // Copy funcMap entries
+  for (const [key, val] of ctx.funcMap) {
+    if (key.startsWith(`${srcPrefix}.`)) {
+      const propName = key.slice(srcPrefix.length + 1);
+      if (propName) {
+        ctx.funcMap.set(`${targetName}.${propName}`, val);
+        if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+      }
+    }
+  }
+}
+
 // ── Variable declaration ──
 function processVarDeclarator(node, env, ctx) {
   if (!node.init) {
@@ -1459,10 +1652,17 @@ function processVarDeclarator(node, env, ctx) {
   ctx.returnedMethods = null;
   ctx._blockScopedDecl = !!node._blockScoped;
 
+  // Track `this` aliases: var a = this → mark 'a' as a this alias
+  if (node.id.type === 'Identifier' && node.init && node.init.type === 'ThisExpression') {
+    if (!ctx._thisAliases) ctx._thisAliases = new Set();
+    ctx._thisAliases.add(node.id.name);
+  }
+
   // Register function expressions in funcMap so they can be called later
   if (node.id.type === 'Identifier' && node.init &&
       (node.init.type === 'FunctionExpression' || node.init.type === 'ArrowFunctionExpression')) {
     node.init._closureEnv = env;
+    node.init._closureFuncMap = ctx.funcMap;
     const key = resolveId(node.id, ctx);
     ctx.funcMap.set(key, node.init);
     ctx.funcMap.set(node.id.name, node.init);
@@ -1486,6 +1686,7 @@ function processVarDeclarator(node, env, ctx) {
           const val = prop.value;
           if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
             val._closureEnv = env;
+            val._closureFuncMap = ctx.funcMap;
             ctx.funcMap.set(`${prefix}.${propName}`, val);
             if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
           }
@@ -1513,6 +1714,7 @@ function processVarDeclarator(node, env, ctx) {
           if (!propName) propName = propKeyName(prop.key);
           if (propName) {
             prop._closureEnv = env;
+            prop._closureFuncMap = ctx.funcMap;
             // Register getters/setters with special prefix so they can be invoked on property access/assignment
             const accessorPrefix = prop.kind === 'get' ? 'getter:' : (prop.kind === 'set' ? 'setter:' : '');
             ctx.funcMap.set(`${accessorPrefix}${prefix}.${propName}`, prop);
@@ -1568,9 +1770,28 @@ function processVarDeclarator(node, env, ctx) {
         ctx.scriptElements.add(node.id.name);
       }
     }
+    // Track DOM query results: querySelector, getElementById, etc.
+    const domInfo = getDOMQueryInfo(node.init, env);
+    if (domInfo) {
+      const key = resolveId(node.id, ctx);
+      if (domInfo.isDomAttached) {
+        ctx.domAttached.add(key);
+        ctx.domAttached.add(node.id.name);
+      }
+      if (domInfo.tag) {
+        ctx.elementTypes.set(key, domInfo.tag);
+        ctx.elementTypes.set(node.id.name, domInfo.tag);
+        if (domInfo.tag === 'script') {
+          ctx.scriptElements.add(key);
+          ctx.scriptElements.add(node.id.name);
+        }
+      }
+    }
   }
 
   const taint = evaluateExpr(node.init, env, ctx);
+  // If init evaluation triggered IP suspension, skip assignment — node will be re-processed
+  if (ctx._ipSuspended) return;
 
   // For ObjectPattern destructuring, resolve per-property taint from the source
   if (node.id.type === 'ObjectPattern') {
@@ -1783,6 +2004,27 @@ function processVarDeclarator(node, env, ctx) {
         }
       }
     }
+    // Handle FunctionExpression branches: var fn = cond ? function(x){...} : function(x){...}
+    // When condition is unknown, register either branch so the variable is callable
+    if (selectedBranch && isFuncExpr(selectedBranch)) {
+      selectedBranch._closureEnv = env;
+      selectedBranch._closureFuncMap = ctx.funcMap;
+      const key = resolveId(node.id, ctx);
+      if (!ctx.funcMap.has(key)) ctx.funcMap.set(key, selectedBranch);
+      if (!ctx.funcMap.has(node.id.name)) ctx.funcMap.set(node.id.name, selectedBranch);
+    }
+    if (!selectedBranch) {
+      // Unknown condition: if both branches are functions, register the alternate (or consequent) as fallback
+      const con = node.init.consequent, alt = node.init.alternate;
+      const picked = isFuncExpr(alt) ? alt : isFuncExpr(con) ? con : null;
+      if (picked) {
+        picked._closureEnv = env;
+        picked._closureFuncMap = ctx.funcMap;
+        const key = resolveId(node.id, ctx);
+        ctx.funcMap.set(key, picked);
+        ctx.funcMap.set(node.id.name, picked);
+      }
+    }
   }
   // Also: var search = location.search (MemberExpression alias)
   if (node.id.type === 'Identifier' && (node.init.type === 'MemberExpression' || node.init.type === 'OptionalMemberExpression')) {
@@ -1838,6 +2080,12 @@ function processVarDeclarator(node, env, ctx) {
     ctx.returnPropertyTaints = null;
   }
 
+  // Propagate per-property taints and funcMap entries from source expression to target variable
+  // Handles: var options = arguments[i], var cfg = baseConfig, var x = obj.data, etc.
+  if (node.id.type === 'Identifier' && node.init.type !== 'ObjectExpression' && node.init.type !== 'ArrayExpression') {
+    propagatePerPropertyEntries(node.init, node.id.name, env, ctx);
+  }
+
   // For `new Constructor()` — propagate this.* taint to instance.*
   if (node.init.type === 'NewExpression' && node.id.type === 'Identifier') {
     // Extract constructor name from AST: new Widget() → 'Widget', new ns.Widget() → 'ns.Widget'
@@ -1857,6 +2105,12 @@ function processAssignment(node, env, ctx) {
   ctx.returnedFuncNode = null;
   ctx.returnedMethods = null;
 
+  // Track `this` aliases: a = this → mark 'a' as a this alias
+  if (node.operator === '=' && node.left.type === 'Identifier' && node.right.type === 'ThisExpression') {
+    if (!ctx._thisAliases) ctx._thisAliases = new Set();
+    ctx._thisAliases.add(node.left.name);
+  }
+
   // Track document.createElement element types in assignments
   if (node.operator === '=' && node.left.type === 'Identifier') {
     const tag = getCreateElementTag(node.right, env);
@@ -1869,9 +2123,29 @@ function processAssignment(node, env, ctx) {
         ctx.scriptElements.add(node.left.name);
       }
     }
+    // Track DOM query results in assignments
+    const domInfo = getDOMQueryInfo(node.right, env);
+    if (domInfo) {
+      const key = resolveId(node.left, ctx);
+      if (domInfo.isDomAttached) {
+        ctx.domAttached.add(key);
+        ctx.domAttached.add(node.left.name);
+      }
+      if (domInfo.tag) {
+        ctx.elementTypes.set(key, domInfo.tag);
+        ctx.elementTypes.set(node.left.name, domInfo.tag);
+        if (domInfo.tag === 'script') {
+          ctx.scriptElements.add(key);
+          ctx.scriptElements.add(node.left.name);
+        }
+      }
+    }
   }
 
   const rhsTaint = evaluateExpr(node.right, env, ctx);
+  // If RHS evaluation triggered IP suspension, the result is a placeholder (empty).
+  // Skip assignment and sink checks — the node will be re-processed after the inner frame completes.
+  if (ctx._ipSuspended) return;
   checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
   checkElementPropertySink(node.left, rhsTaint, node.right, env, ctx);
   // Pre-compute key taint for PP check (avoid evaluateExpr inside check function)
@@ -1907,6 +2181,38 @@ function processAssignment(node, env, ctx) {
       if (setterFunc) {
         const synthCall = { type: 'CallExpression', callee: node.left, arguments: [node.right], loc: node.loc };
         analyzeCalledFunction(synthCall, `setter:${leftStr}`, [rhsTaint], env, ctx);
+      }
+    }
+  }
+
+  // For-in static property enumeration: when target[key] = value and key is a for-in
+  // variable iterating over an object with known properties, enumerate each property
+  // and do individual target.prop = source.prop assignments and funcMap copies.
+  if (node.operator === '=' && node.left.type === 'MemberExpression' && node.left.computed &&
+      node.left.property?.type === 'Identifier' && ctx._forInEnumeration) {
+    const keyVarName = node.left.property.name;
+    const enumInfo = ctx._forInEnumeration.get(keyVarName);
+    if (enumInfo) {
+      const targetStr = nodeToString(node.left.object);
+      if (targetStr) {
+        // If target is a `this` alias, also mirror writes to `this.*`
+        const isThisAlias = ctx._thisAliases?.has(targetStr);
+        for (const propName of enumInfo.properties) {
+          // Copy per-property taints from source to target
+          const srcKey = `${enumInfo.sourceName}.${propName}`;
+          const srcTaint = env.get(srcKey);
+          if (srcTaint) {
+            env.set(`${targetStr}.${propName}`, srcTaint);
+            if (isThisAlias) env.set(`this.${propName}`, srcTaint);
+          }
+          // Copy funcMap entries from source to target
+          const srcFunc = ctx.funcMap.get(srcKey);
+          if (srcFunc) {
+            ctx.funcMap.set(`${targetStr}.${propName}`, srcFunc);
+            if (isThisAlias) ctx.funcMap.set(`this.${propName}`, srcFunc);
+            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, srcFunc);
+          }
+        }
       }
     }
   }
@@ -2008,6 +2314,12 @@ function processAssignment(node, env, ctx) {
   }
   registerReturnedFunctions(node.left, ctx);
 
+  // Propagate per-property taints from source to target on assignment
+  if (node.operator === '=' && node.left.type === 'Identifier' &&
+      node.right.type !== 'ObjectExpression' && node.right.type !== 'ArrayExpression') {
+    propagatePerPropertyEntries(node.right, node.left.name, env, ctx);
+  }
+
   // Track CustomEvent type: var ev = new CustomEvent('type', ...) → map ev → type
   if (ctx._pendingCustomEventType) {
     const evName = node.left.type === 'Identifier' ? node.left.name : nodeToString(node.left);
@@ -2030,6 +2342,7 @@ function processAssignment(node, env, ctx) {
   if (node.operator === '=' &&
       (node.right.type === 'FunctionExpression' || node.right.type === 'ArrowFunctionExpression')) {
     node.right._closureEnv = env;
+    node.right._closureFuncMap = ctx.funcMap;
     const leftStr = nodeToString(node.left);
     if (leftStr) {
       ctx.funcMap.set(leftStr, node.right);
@@ -2070,6 +2383,74 @@ function processAssignment(node, env, ctx) {
     }
   }
 
+  // Register function-valued properties from object literal assigned to a named target:
+  // X.prototype = { render: function(){} }   → register X.prototype.render in funcMap
+  // X.fn = { html: function(){} }            → register X.fn.html in funcMap
+  // Also handles chained assignment: X.fn = X.prototype = { ... }
+  if (node.operator === '=') {
+    // Determine the prefix name for method registration
+    const leftStr = nodeToString(node.left);
+    if (leftStr) {
+      // Find the ultimate ObjectExpression RHS (unwrap assignment chains)
+      let rhsObj = node.right;
+      while (rhsObj && rhsObj.type === 'AssignmentExpression') rhsObj = rhsObj.right;
+      if (rhsObj && rhsObj.type === 'ObjectExpression') {
+        const romStack = [{objExpr: rhsObj, prefix: leftStr}];
+        while (romStack.length > 0) {
+          const {objExpr, prefix} = romStack.pop();
+          for (const prop of objExpr.properties) {
+            if (isObjectProp(prop) && prop.key) {
+              let propName;
+              if (prop.computed) {
+                const resolved = resolveToConstant(prop.key, env, ctx);
+                if (typeof resolved === 'string') propName = resolved;
+              }
+              if (!propName) propName = propKeyName(prop.key);
+              const val = prop.value;
+              if (propName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
+                val._closureEnv = env;
+                val._closureFuncMap = ctx.funcMap;
+                ctx.funcMap.set(`${prefix}.${propName}`, val);
+                if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+              }
+              if (propName && val && val.type === 'Identifier') {
+                const refFunc = ctx.funcMap.get(resolveId(val, ctx)) || ctx.funcMap.get(val.name);
+                if (refFunc) {
+                  ctx.funcMap.set(`${prefix}.${propName}`, refFunc);
+                  if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, refFunc);
+                }
+              }
+              if (propName && val && val.type === 'ObjectExpression') {
+                romStack.push({objExpr: val, prefix: `${prefix}.${propName}`});
+              }
+            }
+            if (prop.type === 'ObjectMethod' && prop.key) {
+              let propName;
+              if (prop.computed) {
+                const resolved = resolveToConstant(prop.key, env, ctx);
+                if (typeof resolved === 'string') propName = resolved;
+              }
+              if (!propName) propName = propKeyName(prop.key);
+              if (propName) {
+                prop._closureEnv = env;
+                prop._closureFuncMap = ctx.funcMap;
+                const accessorPrefix = prop.kind === 'get' ? 'getter:' : (prop.kind === 'set' ? 'setter:' : '');
+                ctx.funcMap.set(`${accessorPrefix}${prefix}.${propName}`, prop);
+                if (!ctx.funcMap.has(`${accessorPrefix}${propName}`)) ctx.funcMap.set(`${accessorPrefix}${propName}`, prop);
+                if (accessorPrefix) {
+                  ctx.funcMap.set(`${prefix}.${propName}`, prop);
+                  if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, prop);
+                }
+              }
+            }
+          }
+        }
+        // Also store per-property taints for the object
+        storeObjectPropertyTaints(leftStr, rhsObj, env, ctx);
+      }
+    }
+  }
+
   // Identifier assignment of function ref: handler = existingFunc
   if (node.operator === '=' && node.right.type === 'Identifier' && node.left.type === 'Identifier') {
     const refFunc = ctx.funcMap.get(node.right.name) || ctx.funcMap.get(resolveId(node.right, ctx));
@@ -2102,8 +2483,9 @@ function processAssignment(node, env, ctx) {
       if (leftStr) {
         ctx.funcMap.set(leftStr, refFunc);
         // Also register by property name for cross-file method resolution
+        // Always override — later assignments should win (e.g., window.$ = ce overriding var $ = utility)
         const propName = node.left.property?.name;
-        if (propName && !ctx.funcMap.has(propName)) ctx.funcMap.set(propName, refFunc);
+        if (propName) ctx.funcMap.set(propName, refFunc);
       }
     }
     // Track global function alias: obj.fn = eval → env.aliases.set('obj.fn', 'eval')
@@ -2707,7 +3089,14 @@ export function evaluateExpr(node, env, ctx) {
 
               const _mPropName = !_mCur.computed && _mCur.property ? (_mCur.property.name || _mCur.property.value) : null;
               if (_mPropName && (NUMERIC_PROPS.has(_mPropName) || _mPropName === 'constructor' || _mPropName === 'prototype')) {
-                V.push(TaintSet.empty());
+                // If the object might have side effects (assignment), evaluate it first
+                if (_mCur.object && (_mCur.object.type === 'AssignmentExpression' ||
+                    (_mCur.object.type === 'ParenthesizedExpression' && _mCur.object.expression?.type === 'AssignmentExpression'))) {
+                  W.push({ kind: W_CONTINUATION, label: C_MEMBER_EXPR, subtype: 'root', outerProps: [], env: _e, ctx: _c });
+                  W.push({ kind: W_EVAL_EXPR, node: _mCur.object, env: _e, ctx: _c });
+                } else {
+                  V.push(TaintSet.empty());
+                }
                 _mResolved = true;
                 break;
               }
@@ -2977,9 +3366,9 @@ export function evaluateExpr(node, env, ctx) {
             if (specifierTaint.tainted) {
               const loc = getNodeLoc(item.node);
               pushFinding(item.ctx, {
-                type: 'Script Injection',
+                type: 'XSS',
                 severity: 'critical',
-                title: 'Script Injection: tainted data flows to dynamic import()',
+                title: 'XSS: tainted data flows to dynamic import()',
                 sink: makeSinkInfo('import()', item.ctx, loc),
                 source: formatSources(specifierTaint),
                 path: buildTaintPath(specifierTaint, 'import()'),
@@ -3378,6 +3767,19 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
   const sinkInfo = checkCallSink(calleeStr, methodName);
   if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
 
+  // DOM attachment tracking: parent.appendChild(child), parent.append(child), etc.
+  if (methodName === 'appendChild' || methodName === 'append' || methodName === 'prepend' ||
+      methodName === 'insertBefore' || methodName === 'replaceChild' || methodName === 'insertAdjacentElement' ||
+      methodName === 'after' || methodName === 'before' || methodName === 'replaceWith') {
+    for (const arg of (node.arguments || [])) {
+      if (arg.type === 'Identifier') {
+        const key = resolveId(arg, ctx);
+        ctx.domAttached.add(key);
+        ctx.domAttached.add(arg.name);
+      }
+    }
+  }
+
   // .constructor.constructor(code) — resolves to Function(code), equivalent to eval
   // Works with any base: x.constructor.constructor, "".constructor.constructor, [].constructor.constructor
   if (methodName === 'constructor') {
@@ -3431,9 +3833,9 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
         if (attrName === 'src' && objName && (ctx.scriptElements.has(objKey) || ctx.scriptElements.has(objName))) {
           const loc = getNodeLoc(node);
           pushFinding(ctx, {
-            type: 'Script Injection',
+            type: 'XSS',
             severity: 'critical',
-            title: 'Script Injection: tainted data flows to script element src',
+            title: 'XSS: tainted data flows to script element src',
             sink: makeSinkInfo(`${objName}.setAttribute('src')`, ctx, loc),
             source: formatSources(srcTaint),
             path: buildTaintPath(srcTaint, `${objName}.setAttribute('src')`),
@@ -3443,7 +3845,14 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
         const DANGEROUS_ATTRS = new Set(['onclick', 'onload', 'onerror', 'onmouseover', 'onfocus', 'onblur',
           'onchange', 'oninput', 'onsubmit', 'onkeydown', 'onkeyup', 'onkeypress',
           'href', 'action', 'formaction', 'srcdoc', 'src', 'data', 'style']);
-        if (DANGEROUS_ATTRS.has(attrName)) {
+        // Skip 'src'/'data' on safe elements (img, video, audio, source, picture)
+        let skipAttr = false;
+        if ((attrName === 'src' || attrName === 'data') && objName) {
+          const tag = ctx.elementTypes.get(objKey) || ctx.elementTypes.get(objName);
+          const SAFE_SRC_TAGS = new Set(['img', 'video', 'audio', 'source', 'picture', 'track']);
+          if (tag && SAFE_SRC_TAGS.has(tag)) skipAttr = true;
+        }
+        if (DANGEROUS_ATTRS.has(attrName) && !skipAttr) {
           const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
           const isCss = attrName === 'style';
           const type = isCss ? 'CSS Injection' : 'XSS';
@@ -4004,7 +4413,7 @@ function _evaluateNewExprBody(node, constructorName, argTaints, env, ctx) {
   // new Worker(url) / new SharedWorker(url) — tainted URL is script injection
   if ((isGlobalRef(node.callee, 'Worker', env) || isGlobalRef(node.callee, 'SharedWorker', env)) && argTaints[0]) {
     const ctorName = isGlobalRef(node.callee, 'Worker', env) ? 'Worker' : 'SharedWorker';
-    checkSinkCall(node, { type: 'Script Injection', taintedArgs: [0] }, argTaints, `new ${ctorName}()`, env, ctx);
+    checkSinkCall(node, { type: 'XSS', taintedArgs: [0] }, argTaints, `new ${ctorName}()`, env, ctx);
   }
 
   // new Blob([content], ...) — propagate taint from array content
@@ -5242,7 +5651,7 @@ function _finalizeFrame(frame) {
   if (innerCtx.returnElementTaints) callerCtx.returnElementTaints = innerCtx.returnElementTaints;
   if (innerCtx.returnPropertyTaints) callerCtx.returnPropertyTaints = innerCtx.returnPropertyTaints;
 
-  // Propagate funcMap entries: array callbacks, this.*, global objects
+  // Propagate funcMap entries: array callbacks, this.*, global objects, plain method names
   // COW: only iterate new entries (overlay), not the entire inherited map
   const newFuncEntries = innerCtx.funcMap.newEntries ? innerCtx.funcMap.newEntries() : innerCtx.funcMap;
   for (const [key, val] of newFuncEntries) {
@@ -5250,6 +5659,10 @@ function _finalizeFrame(frame) {
     if (key.length > 2 && key[key.length - 1] === ']' && key[key.length - 2] === '[') {
       callerCtx.funcMap.set(key, val);
     } else if (key.charCodeAt(0) === 116 && key.startsWith('this.')) { // 't'
+      callerCtx.funcMap.set(key, val);
+    } else if (key.indexOf('.') === -1 && !(key.charCodeAt(0) >= 48 && key.charCodeAt(0) <= 57)) {
+      // Plain method name (no dots, not scope-resolved like "2:varName") — used as fallback
+      // for method resolution in ACF (e.g., result.html() resolves to funcMap['html'])
       callerCtx.funcMap.set(key, val);
     } else {
       for (const prefix of _GLOBAL_OBJ_PREFIXES) {
@@ -5609,7 +6022,11 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     if (fullPath && ctx.funcMap.has(fullPath)) funcNode = ctx.funcMap.get(fullPath);
     if (!funcNode) {
       const methodName = callNode.callee.property?.name;
-      if (methodName && ctx.funcMap.has(methodName)) funcNode = ctx.funcMap.get(methodName);
+      if (methodName) {
+        if (ctx.funcMap.has(methodName)) funcNode = ctx.funcMap.get(methodName);
+        // Also try this.methodName — methods registered on prototypes (e.g., this.html from jQuery)
+        if (!funcNode && ctx.funcMap.has(`this.${methodName}`)) funcNode = ctx.funcMap.get(`this.${methodName}`);
+      }
     }
     // Computed member call: obj[method](args) — resolve method name to dot-path
     if (!funcNode && callNode.callee.computed) {
@@ -5641,7 +6058,23 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   const locSuffix = (!calleeStr && funcNode.loc) ? `:${funcNode.loc.start.line}:${funcNode.loc.start.column}` : '';
   let taintBits = 0;
   for (let i = 0; i < argTaints.length; i++) if (argTaints[i].tainted) taintBits |= (1 << i);
-  const callSig = `${calleeStr || 'anon'}:${taintBits}${superSuffix}${locSuffix}`;
+  // When arguments include ObjectExpressions, include property names in signature
+  // so that calls like extend({html: fn}) and extend({data: fn}) are analyzed separately
+  let objArgSuffix = '';
+  if (callNode.arguments) {
+    for (let i = 0; i < callNode.arguments.length; i++) {
+      const arg = callNode.arguments[i];
+      if (arg && arg.type === 'ObjectExpression' && arg.properties && arg.properties.length > 0) {
+        const keys = [];
+        for (let j = 0; j < arg.properties.length && j < 8; j++) {
+          const p = arg.properties[j];
+          if (p.key) keys.push(p.key.name || p.key.value || '');
+        }
+        if (keys.length) objArgSuffix += `:obj${i}=${keys.join(',')}`;
+      }
+    }
+  }
+  const callSig = `${calleeStr || 'anon'}:${taintBits}${superSuffix}${locSuffix}${objArgSuffix}`;
   if (ctx.analyzedCalls.has(callSig)) {
     const cached = ctx.analyzedCalls.get(callSig);
     if (cached && cached._returnedFuncNode) ctx.returnedFuncNode = cached._returnedFuncNode;
@@ -5738,6 +6171,12 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
   // Store function expression arguments in funcMap so they can be called inside the body
   const innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
+  // Merge closure-captured funcMap entries so inner-scope functions (e.g., M inside jQuery IIFE) are accessible
+  if (funcNode._closureFuncMap) {
+    for (const [key, val] of funcNode._closureFuncMap) {
+      if (!innerFuncMap.has(key)) innerFuncMap.set(key, val);
+    }
+  }
 
   // Proxy apply trap: bind target function to 1st param name so t() resolves inside trap body
   if (funcNode._isProxyApplyTrap && funcNode._proxyTargetFunc && funcNode._proxyTargetParam) {
@@ -5760,17 +6199,23 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       const argNode = callNode.arguments[i];
       if (argNode.type === 'FunctionExpression' || argNode.type === 'ArrowFunctionExpression') {
         argNode._closureEnv = env;
+        argNode._closureFuncMap = ctx.funcMap;
         innerFuncMap.set(param.name, argNode);
         const paramKey = resolveId(param, ctx);
         innerFuncMap.set(paramKey, argNode);
       }
       if (argNode.type === 'Identifier') {
         const refKey = resolveId(argNode, ctx);
-        const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(argNode.name);
-        if (refFunc) {
-          innerFuncMap.set(param.name, refFunc);
-          const paramKey = resolveId(param, ctx);
-          innerFuncMap.set(paramKey, refFunc);
+        // Only register as function reference if the argument isn't a tainted value
+        // (a tainted variable like `data = location.hash` should pass taint, not register as function)
+        const argTaintCheck = argTaints[i];
+        if (!argTaintCheck || !argTaintCheck.tainted) {
+          const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(argNode.name);
+          if (refFunc) {
+            innerFuncMap.set(param.name, refFunc);
+            const paramKey = resolveId(param, ctx);
+            innerFuncMap.set(paramKey, refFunc);
+          }
         }
       }
       if (argNode.type === 'ObjectExpression') {
@@ -5780,6 +6225,7 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
             const val = prop.value;
             if (pName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
               val._closureEnv = env;
+              val._closureFuncMap = ctx.funcMap;
               innerFuncMap.set(`${param.name}.${pName}`, val);
             }
           }
@@ -5870,6 +6316,45 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   if (argsMerged.tainted) {
     childEnv.set('arguments', argsMerged);
     childEnv.set('global:arguments', argsMerged);
+  }
+  // Per-index arguments tracking: arguments.#idx_0, arguments.#idx_1, etc.
+  // Enables arguments[n] to resolve individual arg taints and per-property taints
+  for (let ai = 0; ai < argTaints.length; ai++) {
+    childEnv.set(`arguments.#idx_${ai}`, argTaints[ai]);
+  }
+  // For ObjectExpression arguments, propagate per-property taints and funcMap entries
+  // so that code like `options = arguments[0]; for (k in options) { this[k] = options[k] }` works
+  for (let ai = 0; ai < callNode.arguments.length; ai++) {
+    const argNode = callNode.arguments[ai];
+    if (argNode.type === 'ObjectExpression') {
+      const argPrefix = `arguments.#idx_${ai}`;
+      // Store per-property taints in childEnv (evaluate in caller's env context)
+      for (const prop of argNode.properties) {
+        if (prop.type === 'SpreadElement') continue;
+        if ((isObjectProp(prop) || prop.type === 'ObjectMethod') && prop.key) {
+          let propName;
+          if (prop.computed) {
+            const resolved = resolveToConstant(prop.key, env, ctx);
+            if (typeof resolved === 'string') propName = resolved;
+          }
+          if (!propName) propName = propKeyName(prop.key);
+          if (propName) {
+            const val = prop.type === 'ObjectMethod' ? prop : prop.value;
+            if (val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
+              val._closureEnv = env;
+              val._closureFuncMap = ctx.funcMap;
+              innerFuncMap.set(`${argPrefix}.${propName}`, val);
+            } else if (val && val.type === 'Identifier') {
+              const refFunc = ctx.funcMap.get(val.name);
+              if (refFunc) innerFuncMap.set(`${argPrefix}.${propName}`, refFunc);
+            }
+            // Evaluate prop value taint in caller context
+            const propTaint = evaluateExpr(val || prop.key, env, ctx);
+            childEnv.set(`${argPrefix}.${propName}`, propTaint);
+          }
+        }
+      }
+    }
   }
 
   const savedFuncMap = ctx.funcMap;
@@ -6077,6 +6562,39 @@ function processForBinding(node, env, ctx) {
         keyTaint = iterableTaint;
       }
     }
+    // Extract loop variable name
+    let forInVarName = null;
+    if (node.left.type === 'VariableDeclaration' && node.left.declarations[0]?.id?.type === 'Identifier') {
+      forInVarName = node.left.declarations[0].id.name;
+    } else if (node.left.type === 'Identifier') {
+      forInVarName = node.left.name;
+    }
+
+    // Static property enumeration: if the iterable has known per-property entries or funcMap entries,
+    // record the known properties so computed assignments target[key]=source[key] can be resolved
+    if (forInVarName) {
+      const iterStr = nodeToString(node.right);
+      if (iterStr) {
+        const knownProps = new Set();
+        // Check env for per-property entries
+        for (const [key] of env.getTaintedWithPrefix(`${iterStr}.`)) {
+          const propName = key.slice(iterStr.length + 1);
+          if (propName && !propName.startsWith('#')) knownProps.add(propName);
+        }
+        // Check funcMap for function-valued properties
+        for (const [key] of ctx.funcMap) {
+          if (key.startsWith(`${iterStr}.`) && key.length > iterStr.length + 1) {
+            const propName = key.slice(iterStr.length + 1);
+            if (propName && !propName.includes('.')) knownProps.add(propName);
+          }
+        }
+        if (knownProps.size > 0) {
+          if (!ctx._forInEnumeration) ctx._forInEnumeration = new Map();
+          ctx._forInEnumeration.set(forInVarName, { sourceName: iterStr, properties: [...knownProps] });
+        }
+      }
+    }
+
     if (node.left.type === 'VariableDeclaration') {
       for (const decl of node.left.declarations) assignToPattern(decl.id, keyTaint, env, ctx);
     } else {
@@ -6249,13 +6767,13 @@ function checkElementPropertySink(leftNode, rhsTaint, rhsNode, env, ctx) {
   const loc = getNodeLoc(leftNode);
   const sinkExpr = `${objName}.${propName}`;
 
-  // script element: .src → Script Injection, .textContent/.text → Script Injection
+  // script element: .src → XSS (loads attacker JS), .textContent/.text → XSS (inline attacker JS)
   if (tag === 'script') {
     if (propName === 'src' || propName === 'textContent' || propName === 'text') {
       pushFinding(ctx, {
-        type: 'Script Injection',
+        type: 'XSS',
         severity: 'critical',
-        title: `Script Injection: tainted data flows to script element ${propName}`,
+        title: `XSS: tainted data flows to script element ${propName}`,
         sink: makeSinkInfo(sinkExpr, ctx, loc),
         source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
         path: buildTaintPath(rhsTaint, sinkExpr),
@@ -6301,6 +6819,23 @@ function checkElementPropertySink(leftNode, rhsTaint, rhsNode, env, ctx) {
 
 function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
   if (!rhsTaint.tainted) return;
+
+  // el.style.* = tainted → CSS Injection
+  if (leftNode.type === 'MemberExpression' && !leftNode.computed &&
+      leftNode.object?.type === 'MemberExpression' && !leftNode.object.computed &&
+      leftNode.object.property?.name === 'style') {
+    const loc = getNodeLoc(leftNode);
+    const leftStr = nodeToString(leftNode);
+    pushFinding(ctx, {
+      type: 'CSS Injection',
+      severity: 'high',
+      title: `CSS Injection: tainted data flows to ${leftStr || 'element.style'}`,
+      sink: makeSinkInfo(leftStr || 'element.style', ctx, loc),
+      source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+      path: buildTaintPath(rhsTaint, leftStr || 'element.style'),
+    });
+    return;
+  }
 
   const leftStr = nodeToString(leftNode);
   let propName = null;
@@ -6518,10 +7053,12 @@ function buildTaintPath(taintSet, sinkExpr) {
 function sinkPayload(sinkExpr, findingType) {
   if (findingType === 'Prototype Pollution') return '{"__proto__":{"polluted":true}}';
   if (findingType === 'CSS Injection') return 'color:red;background:url(//attacker.com/steal)';
-  if (findingType === 'Open Redirect') return 'https://attacker.com/phish';
-  if (findingType === 'Script Injection') return 'https://attacker.com/xss.js';
+  if (findingType === 'Open Redirect') return 'https://evil.com/phish';
   // XSS: depends on sink type
   const s = sinkExpr || '';
+  if (/\bimport\b/i.test(s)) return 'data:text/javascript,alert(1)';
+  if (/Worker/i.test(s)) return 'data:text/javascript,alert(1)';
+  if (/\.src\b/i.test(s)) return 'data:text/javascript,alert(1)';
   if (/\blocation\b|\.href|\.assign|\.replace|window\.open/i.test(s)) return 'javascript:alert(1)';
   if (/\beval\b|\bFunction\b|\bsetTimeout\b|\bsetInterval\b/i.test(s)) return 'alert(1)';
   if (/setAttribute.*on\w+/i.test(s)) return 'alert(1)';
@@ -6747,7 +7284,7 @@ function wrapDelivery(sourceType, value, pageUrl, sourceKey, propertyChain) {
     case 'url.hashchange':
       return { vector: `location.hash = ${JSON.stringify('#' + value)}`, description: 'Trigger hashchange event with crafted hash' };
     case 'url.document.referrer':
-      return { vector: `// Navigate from: https://attacker.com/redirect?to=${encodeURIComponent(page)}\n// Referrer header will contain attacker-controlled URL`, description: 'Control document.referrer via navigation from attacker page' };
+      return { vector: `// Navigate from: https://evil.com/redirect?to=${encodeURIComponent(page)}\n// Referrer header will contain attacker-controlled URL`, description: 'Control document.referrer via navigation from attacker page' };
     case 'url.constructed':
       return { vector: `new URL(${JSON.stringify(value)})`, description: 'Constructed URL object carries taint from input' };
     default:
@@ -6777,7 +7314,12 @@ function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
     const msgObj = {};
     // Set the condition discriminant (e.g., type: 'init')
     if (store.condition) {
-      msgObj[store.condition.propName] = store.condition.value;
+      if (store.condition.negated) {
+        // Negated condition: mode !== 'display' → use any OTHER value
+        msgObj[store.condition.propName] = `not_${store.condition.value}`;
+      } else {
+        msgObj[store.condition.propName] = store.condition.value;
+      }
     }
     // Add the payload under the property chain (skip 'data' as it's the postMessage root)
     const dataProps = propertyChain.filter(p => p !== 'data');
@@ -6788,7 +7330,12 @@ function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
       msgObj._raw = rawInput;
     }
     const msgData = msgObj._raw !== undefined ? JSON.stringify(msgObj._raw) : JSON.stringify(msgObj);
-    lines.push(`// Step ${i + 1}: store payload via ${store.condition ? `${store.condition.discriminant} === ${JSON.stringify(store.condition.value)}` : 'handler'}`);
+    const condDesc = store.condition
+      ? (store.condition.negated
+        ? `${store.condition.discriminant} !== ${JSON.stringify(store.condition.value)}`
+        : `${store.condition.discriminant} === ${JSON.stringify(store.condition.value)}`)
+      : 'handler';
+    lines.push(`// Step ${i + 1}: store payload via ${condDesc}`);
     lines.push(`setTimeout(() => w.postMessage(${msgData}, '*'), ${delay});`);
     delay += 1000;
   }
@@ -6800,8 +7347,15 @@ function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
       lines.push(`// Step ${storeSteps.length + i + 1}: wait ${timerDelay}ms for timer callback to fire and trigger sink`);
     } else if (sink.condition) {
       const triggerObj = {};
-      triggerObj[sink.condition.propName] = sink.condition.value;
-      lines.push(`// Step ${storeSteps.length + i + 1}: trigger sink via ${sink.condition.discriminant} === ${JSON.stringify(sink.condition.value)}`);
+      if (sink.condition.negated) {
+        triggerObj[sink.condition.propName] = `not_${sink.condition.value}`;
+      } else {
+        triggerObj[sink.condition.propName] = sink.condition.value;
+      }
+      const condDesc = sink.condition.negated
+        ? `${sink.condition.discriminant} !== ${JSON.stringify(sink.condition.value)}`
+        : `${sink.condition.discriminant} === ${JSON.stringify(sink.condition.value)}`;
+      lines.push(`// Step ${storeSteps.length + i + 1}: trigger sink via ${condDesc}`);
       lines.push(`setTimeout(() => w.postMessage(${JSON.stringify(triggerObj)}, '*'), ${delay});`);
       delay += 1000;
     }
