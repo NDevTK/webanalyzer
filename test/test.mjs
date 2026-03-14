@@ -44199,6 +44199,235 @@ test('cross-file: taint via global object property', () => {
   expect(findings).toHaveType('XSS');
 });
 
+// ─── DOM Catalog: HTML-aware element type resolution ────────────────
+console.log('\n--- DOM Catalog: HTML-aware element type resolution ---');
+
+test('DOM catalog: getElementById resolves iframe type → XSS on .src', () => {
+  const { findings } = analyze(`
+    var frame = document.getElementById('frame');
+    frame.src = location.hash;
+  `, { domCatalog: { elements: new Map([['frame', 'iframe']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('DOM catalog: getElementById resolves script type → XSS on .src', () => {
+  const { findings } = analyze(`
+    var s = document.getElementById('loader');
+    s.src = location.hash;
+  `, { domCatalog: { elements: new Map([['loader', 'script']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: DOM catalog: getElementById resolves img type → no finding on .src', () => {
+  const { findings } = analyze(`
+    var img = document.getElementById('avatar');
+    img.src = location.hash;
+  `, { domCatalog: { elements: new Map([['avatar', 'img']]) } });
+  expect(findings).toBeEmpty();
+});
+
+test('DOM catalog: bare identifier from element ID → iframe.src XSS', () => {
+  const { findings } = analyze(`
+    frame.src = location.hash;
+  `, { domCatalog: { elements: new Map([['frame', 'iframe']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: DOM catalog: bare identifier img element → no finding on .src', () => {
+  const { findings } = analyze(`
+    photo.src = location.hash;
+  `, { domCatalog: { elements: new Map([['photo', 'img']]) } });
+  expect(findings).toBeEmpty();
+});
+
+test('DOM catalog: bare identifier script element → .textContent is XSS', () => {
+  const { findings } = analyze(`
+    myScript.textContent = location.hash;
+  `, { domCatalog: { elements: new Map([['myScript', 'script']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('DOM catalog: querySelector with #id resolves from catalog', () => {
+  const { findings } = analyze(`
+    var el = document.querySelector('#widget');
+    el.src = location.hash;
+  `, { domCatalog: { elements: new Map([['widget', 'iframe']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('DOM catalog: assignment to getElementById result', () => {
+  const { findings } = analyze(`
+    var el;
+    el = document.getElementById('embed');
+    el.src = location.hash;
+  `, { domCatalog: { elements: new Map([['embed', 'embed']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: DOM catalog: div element .src is not a sink', () => {
+  const { findings } = analyze(`
+    var el = document.getElementById('container');
+    el.src = location.hash;
+  `, { domCatalog: { elements: new Map([['container', 'div']]) } });
+  expect(findings).toBeEmpty();
+});
+
+test('DOM catalog: a.href = tainted → XSS', () => {
+  const { findings } = analyze(`
+    var link = document.getElementById('nav');
+    link.href = location.hash;
+  `, { domCatalog: { elements: new Map([['nav', 'a']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('DOM catalog: multiple elements, only dangerous one flags', () => {
+  const { findings } = analyze(`
+    var img = document.getElementById('pic');
+    img.src = location.hash;
+    var frame = document.getElementById('embed');
+    frame.src = location.hash;
+  `, { domCatalog: { elements: new Map([['pic', 'img'], ['embed', 'iframe']]) } });
+  expect(findings).toHaveCount(1);
+  expect(findings).toHaveType('XSS');
+});
+
+test('DOM catalog seeded elements are DOM-attached', () => {
+  // Elements from HTML are always in the DOM — checkElementPropertySink should treat them as attached
+  const { findings } = analyze(`
+    var s = document.getElementById('loader');
+    s.src = location.hash;
+  `, { domCatalog: { elements: new Map([['loader', 'script']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('DOM catalog: object.data = tainted → XSS', () => {
+  const { findings } = analyze(`
+    var obj = document.getElementById('plugin');
+    obj.data = location.hash;
+  `, { domCatalog: { elements: new Map([['plugin', 'object']]) } });
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: DOM catalog without matching ID has no effect', () => {
+  const { findings } = analyze(`
+    var el = document.getElementById('unknown');
+    el.src = location.hash;
+  `, { domCatalog: { elements: new Map([['frame', 'iframe']]) } });
+  // Unknown element — falls through to generic sink check (innerHTML would flag, but .src doesn't)
+  expect(findings).toBeEmpty();
+});
+
+// ─── DOM Catalog: clobber paths (form.childName → element type) ─────
+console.log('\n--- DOM Catalog: clobber paths ---');
+
+test('DOM clobber path: form.action child is iframe → .src is XSS', () => {
+  const { findings } = analyze(`
+    var x = myform.child;
+    x.src = location.hash;
+  `, { domCatalog: {
+    elements: new Map([['myform', 'form']]),
+    clobberPaths: [{ id: 'myform', tag: 'form', name: 'child', childTag: 'iframe' }]
+  }});
+  expect(findings).toHaveType('XSS');
+});
+
+test('SAFE: DOM clobber path: form.child is img → .src is safe', () => {
+  const { findings } = analyze(`
+    var x = myform.pic;
+    x.src = location.hash;
+  `, { domCatalog: {
+    elements: new Map([['myform', 'form']]),
+    clobberPaths: [{ id: 'myform', tag: 'form', name: 'pic', childTag: 'img' }]
+  }});
+  expect(findings).toBeEmpty();
+});
+
+test('DOM clobber path: direct access form.child.src = tainted', () => {
+  const { findings } = analyze(`
+    myform.embed.src = location.hash;
+  `, { domCatalog: {
+    elements: new Map([['myform', 'form']]),
+    clobberPaths: [{ id: 'myform', tag: 'form', name: 'embed', childTag: 'embed' }]
+  }});
+  expect(findings).toHaveType('XSS');
+});
+
+test('DOM clobber path: script child .textContent = tainted → XSS', () => {
+  const { findings } = analyze(`
+    myform.loader.textContent = location.hash;
+  `, { domCatalog: {
+    elements: new Map([['myform', 'form']]),
+    clobberPaths: [{ id: 'myform', tag: 'form', name: 'loader', childTag: 'script' }]
+  }});
+  expect(findings).toHaveType('XSS');
+});
+
+// ─── DOM Clobbering as vulnerability class ──────────────────────────
+console.log('\n--- DOM Clobbering: vulnerability detection ---');
+
+test('DOM clobbering: bare identifier used as URL is clobberable', () => {
+  // If HTML has <a id="defaultUrl" href="evil.com">, JS reading defaultUrl gets the element
+  // defaultUrl.href or defaultUrl.toString() returns the href attribute value
+  const { findings } = analyze(`
+    location.href = defaultUrl;
+  `, { domCatalog: { elements: new Map([['defaultUrl', 'a']]) } });
+  expect(findings).toHaveType('DOM Clobbering');
+});
+
+test('DOM clobbering: form.action clobbers expected config property', () => {
+  // <form id="config"><input name="url" value="evil.com">
+  // config.url in JS returns the input element, which clobbers the expected value
+  const { findings } = analyze(`
+    location.href = config.url;
+  `, { domCatalog: {
+    elements: new Map([['config', 'form']]),
+    clobberPaths: [{ id: 'config', tag: 'form', name: 'url', childTag: 'input' }]
+  }});
+  expect(findings).toHaveType('DOM Clobbering');
+});
+
+test('SAFE: DOM clobbering: variable declared in JS scope shadows DOM element', () => {
+  // If the variable is explicitly declared, DOM clobbering can't affect it
+  const { findings } = analyze(`
+    var defaultUrl = "https://safe.example.com";
+    location.href = defaultUrl;
+  `, { domCatalog: { elements: new Map([['defaultUrl', 'a']]) } });
+  expect(findings).toBeEmpty();
+});
+
+test('DOM clobbering: bare identifier flows to innerHTML', () => {
+  const { findings } = analyze(`
+    document.body.innerHTML = template;
+  `, { domCatalog: { elements: new Map([['template', 'div']]) } });
+  expect(findings).toHaveType('DOM Clobbering');
+});
+
+test('SAFE: DOM clobbering: let/const declaration shadows element', () => {
+  const { findings } = analyze(`
+    let template = "<p>safe</p>";
+    document.body.innerHTML = template;
+  `, { domCatalog: { elements: new Map([['template', 'div']]) } });
+  expect(findings).toBeEmpty();
+});
+
+test('DOM clobbering: getElementById result used as trusted value', () => {
+  // Even getElementById can be clobbered if attacker controls the HTML
+  // But this is different — getElementById explicitly reads DOM. The vulnerability
+  // is about bare identifiers shadowing expected globals
+  const { findings } = analyze(`
+    location.href = settings;
+  `, { domCatalog: { elements: new Map([['settings', 'a']]) } });
+  expect(findings).toHaveType('DOM Clobbering');
+});
+
+test('DOM clobbering: clobbered value flows through function call', () => {
+  const { findings } = analyze(`
+    function redirect(url) { location.href = url; }
+    redirect(defaultUrl);
+  `, { domCatalog: { elements: new Map([['defaultUrl', 'a']]) } });
+  expect(findings).toHaveType('DOM Clobbering');
+});
+
 // ═══════════════════════════════════════════════════════
 console.log(`\n${'='.repeat(50)}`);
 console.log(`RESULTS: ${passed} passed, ${failed} failed out of ${passed + failed}`);

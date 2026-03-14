@@ -54,6 +54,9 @@ export class PageContext {
 
     // Hashes of scripts already analyzed
     this.analyzedHashes = new Set();
+
+    // DOM catalog from HTML parsing: { elements: Map<id, tag>, inlineHandlers: [], clobberPaths: [] }
+    this.domCatalog = null;
   }
 
   addScript(scriptInfo) {

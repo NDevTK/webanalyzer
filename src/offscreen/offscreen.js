@@ -123,7 +123,7 @@ function ensureWorker() {
 // Listen for messages from the service worker
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!sender.url?.startsWith(`chrome-extension://${chrome.runtime.id}/`)) return;
-  if (msg.type === 'analyzeScript' || msg.type === 'analyzeHTML' || msg.type === 'resetPage') {
+  if (msg.type === 'analyzeScript' || msg.type === 'analyzeHTML' || msg.type === 'resetPage' || msg.type === 'domCatalog') {
     const w = ensureWorker();
     w.postMessage(msg);
   } else if (msg.type === 'clearFindings') {

@@ -39,6 +39,10 @@ self.onmessage = function (e) {
       handleHTML(msg.tabId, msg.origin, msg.pageUrl, msg.html);
       break;
 
+    case 'domCatalog':
+      handleDOMCatalog(msg.tabId, msg.origin, msg.pageUrl, msg.catalog);
+      break;
+
     case 'resetPage':
       moduleGraph.resetPage(msg.tabId);
       break;
@@ -112,11 +116,34 @@ async function handleScript(tabId, origin, pageUrl, script) {
   scheduleCrossFileAnalysis(tabId);
 }
 
+// ── Handle DOM catalog from Debugger API ──
+function handleDOMCatalog(tabId, origin, pageUrl, catalog) {
+  const page = moduleGraph.getPage(tabId);
+  page.origin = origin;
+  page.pageUrl = pageUrl;
+  // Convert elements array back to Map (serialized as array of [id, tag] pairs)
+  if (catalog && catalog.elements) {
+    if (Array.isArray(catalog.elements)) {
+      catalog.elements = new Map(catalog.elements);
+    } else if (!(catalog.elements instanceof Map)) {
+      catalog.elements = new Map(Object.entries(catalog.elements));
+    }
+  }
+  page.domCatalog = catalog;
+}
+
 // ── Handle HTML (extract event handler attributes) ──
 async function handleHTML(tabId, origin, pageUrl, html) {
   const page = moduleGraph.getPage(tabId);
   page.origin = origin;
   page.pageUrl = pageUrl;
+
+  // Build DOM catalog from HTML source (element IDs → tag names)
+  // This provides element type resolution before the Debugger API catalog arrives
+  if (!page.domCatalog) {
+    const catalog = extractDOMCatalogFromHTML(html.source);
+    if (catalog) page.domCatalog = catalog;
+  }
 
   // Extract inline event handlers from HTML attributes
   // We parse HTML manually to find on* attributes and javascript: URLs
@@ -186,7 +213,7 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
 
   // 6. Run taint analysis with scope info (isWorker suppresses message handler taint)
   // checkPrototypePollution is called inline during CFG analysis (taint.js:1178)
-  const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker);
+  const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker, pageCtx.domCatalog);
 
   // 7. For non-module scripts, propagate final env back to global
   if (!isModule) {
@@ -321,6 +348,26 @@ async function runCrossFileAnalysis(tabId) {
       postFindings(tabId, novel);
     }
   }
+}
+
+// ── Extract DOM catalog (element IDs → tag names) from HTML source ──
+function extractDOMCatalogFromHTML(html) {
+  const elements = new Map();
+  // Match opening tags with id attributes: <tagname ... id="value" ...>
+  const tagRe = /<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>/g;
+  let m;
+  while ((m = tagRe.exec(html)) !== null) {
+    const tag = m[1].toLowerCase();
+    const attrs = m[2];
+    // Extract id attribute value
+    const idMatch = attrs.match(/\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))/i);
+    if (idMatch) {
+      const id = idMatch[1] ?? idMatch[2] ?? idMatch[3];
+      if (id) elements.set(id, tag);
+    }
+  }
+  if (elements.size === 0) return null;
+  return { elements };
 }
 
 // ── Extract inline event handlers from HTML ──

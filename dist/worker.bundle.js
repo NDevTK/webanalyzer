@@ -15304,7 +15304,7 @@ ${trace}`);
       exports.isJSXText = isJSXText;
       exports.isLVal = isLVal;
       exports.isLabeledStatement = isLabeledStatement;
-      exports.isLiteral = isLiteral;
+      exports.isLiteral = isLiteral2;
       exports.isLogicalExpression = isLogicalExpression;
       exports.isLoop = isLoop;
       exports.isMemberExpression = isMemberExpression;
@@ -17351,7 +17351,7 @@ ${trace}`);
         }
         return opts == null || (0, _shallowEqual.default)(node, opts);
       }
-      function isLiteral(node, opts) {
+      function isLiteral2(node, opts) {
         if (!node) return false;
         switch (node.type) {
           case "StringLiteral":
@@ -30115,7 +30115,7 @@ Expected ${val.length + 1} quasis but got ${node.quasis.length}`);
         isFunctionDeclaration,
         isIdentifier,
         isImportDeclaration,
-        isLiteral,
+        isLiteral: isLiteral2,
         isMemberExpression,
         isMethod,
         isModuleSpecifier,
@@ -30159,7 +30159,7 @@ Expected ${val.length + 1} quasis but got ${node.quasis.length}`);
               }
             } else if (isModuleSpecifier(node)) {
               gatherNodeParts(node.local, parts);
-            } else if (isLiteral(node) && !isNullLiteral(node) && !isRegExpLiteral(node) && !isTemplateLiteral(node)) {
+            } else if (isLiteral2(node) && !isNullLiteral(node) && !isRegExpLiteral(node) && !isTemplateLiteral(node)) {
               parts.push(node.value);
             }
             break;
@@ -33358,7 +33358,7 @@ Expected ${val.length + 1} quasis but got ${node.quasis.length}`);
       var _index = require_node();
       var {
         isCallExpression,
-        isLiteral,
+        isLiteral: isLiteral2,
         isMemberExpression,
         isNewExpression,
         isPattern
@@ -33470,7 +33470,7 @@ Expected ${val.length + 1} quasis but got ${node.quasis.length}`);
         if (!computed && isMemberExpression(property)) {
           throw new TypeError("Got a MemberExpression for MemberExpression property");
         }
-        if (isLiteral(property) && typeof property.value === "number") {
+        if (isLiteral2(property) && typeof property.value === "number") {
           computed = true;
         }
         if (optional) {
@@ -33586,7 +33586,7 @@ Expected ${val.length + 1} quasis but got ${node.quasis.length}`);
           throw new TypeError("Got a MemberExpression for MemberExpression property");
         }
         let computed = node.computed;
-        if (isLiteral(node.property) && typeof node.property.value === "number") {
+        if (isLiteral2(node.property) && typeof node.property.value === "number") {
           computed = true;
         }
         if (computed) {
@@ -41567,7 +41567,7 @@ ${rootStack}`;
         isBlockStatement,
         isExpression,
         isIdentifier,
-        isLiteral,
+        isLiteral: isLiteral2,
         isStringLiteral: isStringLiteral2,
         isType,
         matchesPattern: _matchesPattern
@@ -41843,7 +41843,7 @@ ${rootStack}`;
           return this.get("expression").resolve(dangerous, resolved);
         } else if (dangerous && this.isMemberExpression()) {
           const targetKey = this.toComputedKey();
-          if (!isLiteral(targetKey)) return;
+          if (!isLiteral2(targetKey)) return;
           const targetName = targetKey.value;
           const target = this.get("object").resolve(dangerous, resolved);
           if (target.isObjectExpression()) {
@@ -43719,12 +43719,7 @@ ${rootStack}`;
     "Element.prototype.insertAdjacentHTML": { type: "XSS", taintedArgs: [1] },
     "DOMParser.prototype.parseFromString": { type: "XSS", taintedArgs: [0] },
     "Range.prototype.createContextualFragment": { type: "XSS", taintedArgs: [0] },
-    // jQuery
-    "$.html": { type: "XSS", taintedArgs: [0] },
-    "jQuery.html": { type: "XSS", taintedArgs: [0] },
-    "$.append": { type: "XSS", taintedArgs: [0] },
-    "jQuery.append": { type: "XSS", taintedArgs: [0] },
-    "$.prepend": { type: "XSS", taintedArgs: [0] },
+    // jQuery sinks removed — detected via interprocedural tracing through actual library code
     // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
     "location.assign": { type: "XSS", taintedArgs: [0], navigation: true },
     "location.replace": { type: "XSS", taintedArgs: [0], navigation: true },
@@ -43732,7 +43727,7 @@ ${rootStack}`;
     "window.location.assign": { type: "XSS", taintedArgs: [0], navigation: true },
     "window.location.replace": { type: "XSS", taintedArgs: [0], navigation: true },
     // Script injection
-    "document.createElement": { type: "Script Injection", taintedArgs: [0], checkValue: "script" }
+    "document.createElement": { type: "XSS", taintedArgs: [0], checkValue: "script" }
     // Fetch with tainted URL (SSRF-like in browser context, but mainly for data exfil)
   };
   var CALL_SINKS_BY_METHOD = /* @__PURE__ */ new Map();
@@ -43855,6 +43850,7 @@ ${rootStack}`;
       this.description = description;
       this.transforms = transforms || _NO_TRANSFORMS;
       this.sourceKey = sourceKey || null;
+      this.stateSteps = null;
     }
     get id() {
       return `${this.sourceType}@${this.file}:${this.line}:${this.col}`;
@@ -43869,6 +43865,20 @@ ${rootStack}`;
         this.transforms === _NO_TRANSFORMS ? [op] : [...this.transforms, op]
       );
       l.sourceKey = this.sourceKey;
+      l.stateSteps = this.stateSteps;
+      return l;
+    }
+    addStateStep(step) {
+      const l = new _TaintLabel(
+        this.sourceType,
+        this.file,
+        this.line,
+        this.col,
+        this.description,
+        this.transforms === _NO_TRANSFORMS ? [] : [...this.transforms]
+      );
+      l.sourceKey = this.sourceKey;
+      l.stateSteps = this.stateSteps ? [...this.stateSteps, step] : [step];
       return l;
     }
   };
@@ -43923,6 +43933,16 @@ ${rootStack}`;
       if (this.labels === null || this.labels.size === 0) return this;
       const newLabels = /* @__PURE__ */ new Map();
       for (const [id, label] of this.labels) newLabels.set(id, label.withTransform(op));
+      return new _TaintSet(newLabels);
+    }
+    // Create a new TaintSet with a state step appended to all labels
+    withStateStep(step) {
+      if (this.labels === null || this.labels.size === 0) return this;
+      const newLabels = /* @__PURE__ */ new Map();
+      for (const [id, label] of this.labels) {
+        const nl = label.addStateStep(step);
+        newLabels.set(nl.id, nl);
+      }
       return new _TaintSet(newLabels);
     }
   };
@@ -44146,14 +44166,34 @@ ${rootStack}`;
       this.returnedMethods = null;
       this.scriptElements = /* @__PURE__ */ new Set();
       this.elementTypes = /* @__PURE__ */ new Map();
+      this.domAttached = /* @__PURE__ */ new Set();
       this.thrownTaint = TaintSet.empty();
       this.generatorTaint = /* @__PURE__ */ new Map();
       this.eventListeners = /* @__PURE__ */ new Map();
       this.classBodyMap = /* @__PURE__ */ new Map();
       this.superClassMap = /* @__PURE__ */ new Map();
       this.protoMethodMap = /* @__PURE__ */ new Map();
+      this._findingKeys = /* @__PURE__ */ new Set();
+      this._thisAliases = null;
+      this.domCatalog = null;
     }
   };
+  function pushFinding(ctx, finding) {
+    if (finding.source) {
+      const sources = Array.isArray(finding.source) ? finding.source : [finding.source];
+      const allClobber = sources.length > 0 && sources.every((s) => s?.type === "dom-clobbering");
+      if (allClobber) {
+        finding.type = "DOM Clobbering";
+        finding.severity = "high";
+        finding.title = `DOM Clobbering: ${finding.sink?.expression || "element value"} controlled via named DOM element`;
+      }
+    }
+    const key = `${finding.type}:${finding.sink?.expression}:${finding.sink?.file}:${finding.sink?.line}:${finding.sink?.col}`;
+    if (!ctx._findingKeys) ctx._findingKeys = /* @__PURE__ */ new Set();
+    if (ctx._findingKeys.has(key)) return;
+    ctx._findingKeys.add(key);
+    ctx.findings.push(finding);
+  }
   function propKeyName(key) {
     if (!key) return null;
     const name = key.name || key.value;
@@ -44166,11 +44206,33 @@ ${rootStack}`;
     }
     return `global:${node.name}`;
   }
-  function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker) {
+  function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker, domCatalog) {
     const findings = [];
     const _originalFuncMap = funcMap instanceof Map ? funcMap : null;
     const ctx = new AnalysisContext(file, funcMap, findings, globalEnv || new TaintEnv(), scopeInfo);
     ctx.isWorker = !!isWorker;
+    if (domCatalog) {
+      ctx.domCatalog = domCatalog;
+      if (domCatalog.elements) {
+        for (const [id, tag] of domCatalog.elements) {
+          ctx.elementTypes.set(id, tag);
+          ctx.elementTypes.set(`global:${id}`, tag);
+          ctx.domAttached.add(id);
+          ctx.domAttached.add(`global:${id}`);
+          if (tag === "script") {
+            ctx.scriptElements.add(id);
+            ctx.scriptElements.add(`global:${id}`);
+          }
+        }
+      }
+      if (domCatalog.clobberPaths) {
+        for (const cp of domCatalog.clobberPaths) {
+          const key = `${cp.id}.${cp.name}`;
+          ctx.elementTypes.set(key, cp.childTag);
+          ctx.domAttached.add(key);
+        }
+      }
+    }
     const blockEnvs = /* @__PURE__ */ new Map();
     blockEnvs.set(cfg.entry.id, env.clone());
     const worklist = [cfg.entry];
@@ -44222,6 +44284,32 @@ ${rootStack}`;
     if (block.branchCondition) {
       applyBranchCondition(block.branchCondition, block.branchPolarity, env);
     }
+    const prevBranch = ctx._currentBranchCondition;
+    if (block.branchCondition) {
+      ctx._currentBranchCondition = { node: block.branchCondition, polarity: block.branchPolarity };
+    } else if (block.nodes.length > 0 && block.nodes[0].type === "_Test" && block.nodes[0].test) {
+      const testNode = block.nodes[0].test;
+      let switchDiscriminant = null;
+      for (const pred of block.predecessors) {
+        if (pred.nodes.length > 0 && pred.successors.length > 1) {
+          const lastNode = pred.nodes[pred.nodes.length - 1];
+          if (lastNode.type !== "_Test") {
+            switchDiscriminant = lastNode;
+            break;
+          }
+        }
+      }
+      if (switchDiscriminant && (testNode.type === "StringLiteral" || testNode.type === "NumericLiteral" || testNode.type === "Literal" && (typeof testNode.value === "string" || typeof testNode.value === "number"))) {
+        ctx._currentBranchCondition = {
+          node: { type: "BinaryExpression", operator: "===", left: switchDiscriminant, right: testNode },
+          polarity: true
+        };
+      } else {
+        ctx._currentBranchCondition = null;
+      }
+    } else {
+      ctx._currentBranchCondition = null;
+    }
     const startIdx = ctx._resumeNodeIdx || 0;
     ctx._resumeNodeIdx = 0;
     for (let i = startIdx; i < block.nodes.length; i++) {
@@ -44233,6 +44321,7 @@ ${rootStack}`;
         break;
       }
     }
+    ctx._currentBranchCondition = prevBranch;
     return env;
   }
   function applyBranchCondition(testNode, polarity, env) {
@@ -44260,6 +44349,16 @@ ${rootStack}`;
           env.schemeCheckedVars.add(leftVar);
           const origin = env.urlConstructorOrigins.get(leftVar);
           if (origin) env.schemeCheckedVars.add(origin);
+          continue;
+        }
+        const allowlistVar = extractAllowlistVar(node);
+        if (allowlistVar) {
+          env.set(allowlistVar, TaintSet.empty());
+          env.set(`global:${allowlistVar}`, TaintSet.empty());
+          const suffix = `:${allowlistVar}`;
+          for (const [key] of env.entries()) {
+            if (key.endsWith(suffix)) env.set(key, TaintSet.empty());
+          }
           continue;
         }
         stack.push({ node: node.left, positive: true });
@@ -44292,6 +44391,71 @@ ${rootStack}`;
         }
       }
     }
+  }
+  function extractAllowlistVar(node) {
+    const comparisons = [];
+    const stack = [node];
+    while (stack.length > 0) {
+      const n = stack.pop();
+      if (n.type === "LogicalExpression" && n.operator === "||") {
+        stack.push(n.left);
+        stack.push(n.right);
+      } else if (n.type === "BinaryExpression" && (n.operator === "===" || n.operator === "==")) {
+        comparisons.push(n);
+      } else {
+        return null;
+      }
+    }
+    if (comparisons.length < 2) return null;
+    let varName = null;
+    for (const cmp of comparisons) {
+      let identSide, litSide;
+      if (cmp.left.type === "Identifier" && isStringLiteral(cmp.right)) {
+        identSide = cmp.left;
+        litSide = cmp.right;
+      } else if (cmp.right.type === "Identifier" && isStringLiteral(cmp.left)) {
+        identSide = cmp.right;
+        litSide = cmp.left;
+      } else {
+        return null;
+      }
+      if (varName === null) varName = identSide.name;
+      else if (varName !== identSide.name) return null;
+    }
+    return varName;
+  }
+  function extractConditionInfo(testNode, polarity) {
+    let node = testNode;
+    let pos = polarity;
+    while (node.type === "UnaryExpression" && node.operator === "!") {
+      pos = !pos;
+      node = node.argument;
+    }
+    if (node.type === "BinaryExpression") {
+      const op = node.operator;
+      const isEq = op === "===" || op === "==";
+      const isNeq = op === "!==" || op === "!=";
+      if (!isEq && !isNeq) return null;
+      const mustEqual = isEq ? pos : !pos;
+      let memberSide, literalSide;
+      if (isLiteral(node.right) && !isLiteral(node.left)) {
+        memberSide = node.left;
+        literalSide = node.right;
+      } else if (isLiteral(node.left) && !isLiteral(node.right)) {
+        memberSide = node.right;
+        literalSide = node.left;
+      } else return null;
+      const discriminant = nodeToString(memberSide);
+      if (!discriminant) return null;
+      const parts = discriminant.split(".");
+      const propName = parts[parts.length - 1];
+      const value = literalSide.value;
+      return { discriminant, propName, value, negated: !mustEqual };
+    }
+    return null;
+  }
+  function isLiteral(node) {
+    return node.type === "StringLiteral" || node.type === "NumericLiteral" || node.type === "Literal" && (typeof node.value === "string" || typeof node.value === "number");
   }
   function extractSchemeCheck(node, positive) {
     if (node.type === "CallExpression" && positive) {
@@ -44451,8 +44615,32 @@ ${rootStack}`;
       file: l.file,
       line: l.line,
       transforms: l.transforms.length > 0 ? l.transforms : void 0,
-      sourceKey: l.sourceKey || void 0
+      sourceKey: l.sourceKey || void 0,
+      stateSteps: l.stateSteps || void 0
     }));
+  }
+  function annotateSinkSteps(taint, ctx) {
+    if (!taint.tainted) return taint;
+    const hasStore = taint.toArray().some((l) => l.stateSteps && l.stateSteps.some((s) => s.action === "store"));
+    if (!hasStore) return taint;
+    if (ctx._currentBranchCondition) {
+      const cond = extractConditionInfo(ctx._currentBranchCondition.node, ctx._currentBranchCondition.polarity);
+      if (cond) {
+        return taint.withStateStep({
+          action: "sink",
+          condition: cond,
+          handler: ctx._handlerContext?.type || null
+        });
+      }
+    }
+    if (ctx._handlerContext?.type === "timer") {
+      return taint.withStateStep({
+        action: "sink",
+        handler: "timer",
+        delay: ctx._handlerContext.delay || 0
+      });
+    }
+    return taint;
   }
   function makeSinkInfo(expression, ctx, loc) {
     return { expression, file: ctx.file, line: loc.line || 0, col: loc.column || 0 };
@@ -44699,6 +44887,8 @@ ${rootStack}`;
         break;
       case "FunctionDeclaration":
         if (node.id) {
+          node._closureEnv = env;
+          node._closureFuncMap = ctx.funcMap;
           const key = resolveId(node.id, ctx);
           ctx.funcMap.set(key, node);
           ctx.funcMap.set(node.id.name, node);
@@ -44755,11 +44945,22 @@ ${rootStack}`;
             }
           }
           if (!hasConstructor) {
+            const synthBody = [];
+            if (superName) {
+              synthBody.push({
+                type: "ExpressionStatement",
+                expression: {
+                  type: "CallExpression",
+                  callee: { type: "Super" },
+                  arguments: []
+                }
+              });
+            }
             const synth = {
               type: "ClassMethod",
               key: { name: "constructor" },
-              params: [],
-              body: { type: "BlockStatement", body: [] }
+              params: [{ type: "RestElement", argument: { type: "Identifier", name: "_args" } }],
+              body: { type: "BlockStatement", body: synthBody }
             };
             if (superName) {
               synth._superClass = superName;
@@ -44780,9 +44981,7 @@ ${rootStack}`;
         if (node.param) {
           const savedBlockScoped = ctx._blockScopedDecl;
           ctx._blockScopedDecl = true;
-          if (ctx.thrownTaint.tainted || ctx._thrownProperties) {
-            assignToPattern(node.param, ctx.thrownTaint.tainted ? ctx.thrownTaint.clone() : TaintSet.empty(), env, ctx);
-          }
+          assignToPattern(node.param, ctx.thrownTaint.tainted ? ctx.thrownTaint.clone() : TaintSet.empty(), env, ctx);
           if (ctx._thrownProperties && node.param.type === "Identifier") {
             const catchName = node.param.name;
             for (const [suffix, propTaint] of ctx._thrownProperties) {
@@ -44933,6 +45132,243 @@ ${rootStack}`;
     if (arg && isStringLiteral(arg)) return stringLiteralValue(arg).toLowerCase();
     return null;
   }
+  var DOM_QUERY_METHODS = /* @__PURE__ */ new Set([
+    "querySelector",
+    "querySelectorAll",
+    "getElementById",
+    "getElementsByClassName",
+    "getElementsByTagName",
+    "getElementsByTagNameNS"
+  ]);
+  var VALID_HTML_TAGS = /* @__PURE__ */ new Set([
+    "a",
+    "abbr",
+    "address",
+    "area",
+    "article",
+    "aside",
+    "audio",
+    "b",
+    "base",
+    "bdi",
+    "bdo",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "canvas",
+    "caption",
+    "cite",
+    "code",
+    "col",
+    "colgroup",
+    "data",
+    "datalist",
+    "dd",
+    "del",
+    "details",
+    "dfn",
+    "dialog",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hgroup",
+    "hr",
+    "html",
+    "i",
+    "iframe",
+    "img",
+    "input",
+    "ins",
+    "kbd",
+    "label",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "map",
+    "mark",
+    "menu",
+    "meta",
+    "meter",
+    "nav",
+    "noscript",
+    "object",
+    "ol",
+    "optgroup",
+    "option",
+    "output",
+    "p",
+    "picture",
+    "pre",
+    "progress",
+    "q",
+    "rp",
+    "rt",
+    "ruby",
+    "s",
+    "samp",
+    "script",
+    "search",
+    "section",
+    "select",
+    "slot",
+    "small",
+    "source",
+    "span",
+    "strong",
+    "style",
+    "sub",
+    "summary",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "template",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "time",
+    "title",
+    "tr",
+    "track",
+    "u",
+    "ul",
+    "var",
+    "video",
+    "wbr"
+  ]);
+  function getDOMQueryInfo(node, env, ctx) {
+    if (node.type !== "CallExpression") return null;
+    const callee = node.callee;
+    if (!callee || callee.type !== "MemberExpression" || callee.computed) return null;
+    const method = callee.property?.name;
+    if (!method || !DOM_QUERY_METHODS.has(method)) return null;
+    const obj = callee.object;
+    const objName = obj.type === "Identifier" ? obj.name : nodeToString(obj);
+    let tag = null;
+    const arg = node.arguments?.[0];
+    if (arg && isStringLiteral(arg)) {
+      const selector = stringLiteralValue(arg);
+      if (method === "getElementsByTagName" || method === "getElementsByTagNameNS") {
+        const t = selector.toLowerCase();
+        if (VALID_HTML_TAGS.has(t)) tag = t;
+      } else if (method === "querySelector" || method === "querySelectorAll") {
+        const m = selector.match(/^([a-zA-Z][a-zA-Z0-9]*)/);
+        if (m) {
+          const t = m[1].toLowerCase();
+          if (VALID_HTML_TAGS.has(t)) tag = t;
+        }
+        if (!tag && ctx?.domCatalog?.elements) {
+          const idMatch = selector.match(/^#([a-zA-Z_][a-zA-Z0-9_-]*)/);
+          if (idMatch && ctx.domCatalog.elements.has(idMatch[1])) {
+            tag = ctx.domCatalog.elements.get(idMatch[1]);
+          }
+        }
+      } else if (method === "getElementById") {
+        if (ctx?.domCatalog?.elements?.has(selector)) {
+          tag = ctx.domCatalog.elements.get(selector);
+        }
+      }
+    }
+    return { method, tag, isDomAttached: true };
+  }
+  function propagatePerPropertyEntries(sourceExpr, targetName, env, ctx) {
+    if (sourceExpr.type === "LogicalExpression") {
+      propagatePerPropertyEntries(sourceExpr.left, targetName, env, ctx);
+      return;
+    }
+    if (sourceExpr.type === "ConditionalExpression") {
+      propagatePerPropertyEntries(sourceExpr.consequent, targetName, env, ctx);
+      propagatePerPropertyEntries(sourceExpr.alternate, targetName, env, ctx);
+      return;
+    }
+    let srcPrefix = null;
+    if (sourceExpr.type === "Identifier") {
+      const name = sourceExpr.name;
+      const key = resolveId(sourceExpr, ctx);
+      if (env.getTaintedWithPrefix(`${key}.`).size > 0) srcPrefix = key;
+      else if (key !== name && env.getTaintedWithPrefix(`${name}.`).size > 0) srcPrefix = name;
+    } else if (sourceExpr.type === "MemberExpression" && sourceExpr.computed) {
+      const objStr = nodeToString(sourceExpr.object);
+      if (objStr) {
+        let litKey = null;
+        if (isStringLiteral(sourceExpr.property)) litKey = stringLiteralValue(sourceExpr.property);
+        else if (isNumericLit(sourceExpr.property)) litKey = String(sourceExpr.property.value);
+        else {
+          const resolved = resolveToConstant(sourceExpr.property, env, ctx);
+          if (resolved !== void 0) litKey = String(resolved);
+        }
+        if (litKey !== null) {
+          const idxPrefix = `${objStr}.#idx_${litKey}`;
+          if (env.getTaintedWithPrefix(`${idxPrefix}.`).size > 0) srcPrefix = idxPrefix;
+          else {
+            const dotPrefix = `${objStr}.${litKey}`;
+            if (env.getTaintedWithPrefix(`${dotPrefix}.`).size > 0) srcPrefix = dotPrefix;
+          }
+        }
+        if (!srcPrefix && objStr === "arguments") {
+          const allArgProps = /* @__PURE__ */ new Map();
+          const allArgFuncs = /* @__PURE__ */ new Map();
+          for (const [key, taint] of env.entries()) {
+            const m = key.match(/^arguments\.#idx_\d+\.(.+)$/);
+            if (m && !m[1].startsWith("#")) {
+              const propName = m[1];
+              if (!allArgProps.has(propName)) allArgProps.set(propName, taint);
+              else allArgProps.set(propName, allArgProps.get(propName).clone().merge(taint));
+            }
+          }
+          for (const [key, val] of ctx.funcMap) {
+            const m = key.match(/^arguments\.#idx_\d+\.(.+)$/);
+            if (m) allArgFuncs.set(m[1], val);
+          }
+          for (const [propName, taint] of allArgProps) {
+            env.set(`${targetName}.${propName}`, taint);
+          }
+          for (const [propName, funcNode] of allArgFuncs) {
+            ctx.funcMap.set(`${targetName}.${propName}`, funcNode);
+            if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, funcNode);
+          }
+          return;
+        }
+      }
+    } else if (sourceExpr.type === "MemberExpression" && !sourceExpr.computed) {
+      const fullStr = nodeToString(sourceExpr);
+      if (fullStr && env.getTaintedWithPrefix(`${fullStr}.`).size > 0) srcPrefix = fullStr;
+    }
+    if (!srcPrefix) return;
+    for (const [key, taint] of env.getTaintedWithPrefix(`${srcPrefix}.`)) {
+      const propName = key.slice(srcPrefix.length + 1);
+      if (propName && !propName.startsWith("#")) {
+        env.set(`${targetName}.${propName}`, taint);
+      }
+    }
+    for (const [key, val] of ctx.funcMap) {
+      if (key.startsWith(`${srcPrefix}.`)) {
+        const propName = key.slice(srcPrefix.length + 1);
+        if (propName) {
+          ctx.funcMap.set(`${targetName}.${propName}`, val);
+          if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+        }
+      }
+    }
+  }
   function processVarDeclarator(node, env, ctx) {
     if (!node.init) {
       if (node.id?.type === "Identifier") {
@@ -44944,8 +45380,13 @@ ${rootStack}`;
     ctx.returnedFuncNode = null;
     ctx.returnedMethods = null;
     ctx._blockScopedDecl = !!node._blockScoped;
+    if (node.id.type === "Identifier" && node.init && node.init.type === "ThisExpression") {
+      if (!ctx._thisAliases) ctx._thisAliases = /* @__PURE__ */ new Set();
+      ctx._thisAliases.add(node.id.name);
+    }
     if (node.id.type === "Identifier" && node.init && (node.init.type === "FunctionExpression" || node.init.type === "ArrowFunctionExpression")) {
       node.init._closureEnv = env;
+      node.init._closureFuncMap = ctx.funcMap;
       const key = resolveId(node.id, ctx);
       ctx.funcMap.set(key, node.init);
       ctx.funcMap.set(node.id.name, node.init);
@@ -44965,6 +45406,7 @@ ${rootStack}`;
             const val = prop.value;
             if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
               val._closureEnv = env;
+              val._closureFuncMap = ctx.funcMap;
               ctx.funcMap.set(`${prefix}.${propName}`, val);
               if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
             }
@@ -44989,6 +45431,7 @@ ${rootStack}`;
             if (!propName) propName = propKeyName(prop.key);
             if (propName) {
               prop._closureEnv = env;
+              prop._closureFuncMap = ctx.funcMap;
               const accessorPrefix = prop.kind === "get" ? "getter:" : prop.kind === "set" ? "setter:" : "";
               ctx.funcMap.set(`${accessorPrefix}${prefix}.${propName}`, prop);
               if (!ctx.funcMap.has(`${accessorPrefix}${propName}`)) ctx.funcMap.set(`${accessorPrefix}${propName}`, prop);
@@ -45036,8 +45479,44 @@ ${rootStack}`;
           ctx.scriptElements.add(node.id.name);
         }
       }
+      const domInfo = getDOMQueryInfo(node.init, env, ctx);
+      if (domInfo) {
+        const key = resolveId(node.id, ctx);
+        if (domInfo.isDomAttached) {
+          ctx.domAttached.add(key);
+          ctx.domAttached.add(node.id.name);
+        }
+        if (domInfo.tag) {
+          ctx.elementTypes.set(key, domInfo.tag);
+          ctx.elementTypes.set(node.id.name, domInfo.tag);
+          if (domInfo.tag === "script") {
+            ctx.scriptElements.add(key);
+            ctx.scriptElements.add(node.id.name);
+          }
+        }
+      }
+      if (!tag && !domInfo?.tag && node.init?.type === "MemberExpression") {
+        const initStr = nodeToString(node.init);
+        if (initStr) {
+          const inheritedTag = ctx.elementTypes.get(initStr);
+          if (inheritedTag) {
+            const key = resolveId(node.id, ctx);
+            ctx.elementTypes.set(key, inheritedTag);
+            ctx.elementTypes.set(node.id.name, inheritedTag);
+            if (ctx.domAttached.has(initStr)) {
+              ctx.domAttached.add(key);
+              ctx.domAttached.add(node.id.name);
+            }
+            if (inheritedTag === "script") {
+              ctx.scriptElements.add(key);
+              ctx.scriptElements.add(node.id.name);
+            }
+          }
+        }
+      }
     }
     const taint = evaluateExpr(node.init, env, ctx);
+    if (ctx._ipSuspended) return;
     if (node.id.type === "ObjectPattern") {
       const srcStr = nodeToString(node.init);
       if (srcStr) {
@@ -45276,6 +45755,24 @@ ${rootStack}`;
           }
         }
       }
+      if (selectedBranch && isFuncExpr(selectedBranch)) {
+        selectedBranch._closureEnv = env;
+        selectedBranch._closureFuncMap = ctx.funcMap;
+        const key = resolveId(node.id, ctx);
+        if (!ctx.funcMap.has(key)) ctx.funcMap.set(key, selectedBranch);
+        if (!ctx.funcMap.has(node.id.name)) ctx.funcMap.set(node.id.name, selectedBranch);
+      }
+      if (!selectedBranch) {
+        const con = node.init.consequent, alt = node.init.alternate;
+        const picked = isFuncExpr(alt) ? alt : isFuncExpr(con) ? con : null;
+        if (picked) {
+          picked._closureEnv = env;
+          picked._closureFuncMap = ctx.funcMap;
+          const key = resolveId(node.id, ctx);
+          ctx.funcMap.set(key, picked);
+          ctx.funcMap.set(node.id.name, picked);
+        }
+      }
     }
     if (node.id.type === "Identifier" && (node.init.type === "MemberExpression" || node.init.type === "OptionalMemberExpression")) {
       const prop = node.init.property?.name || node.init.property?.value;
@@ -45320,6 +45817,9 @@ ${rootStack}`;
       }
       ctx.returnPropertyTaints = null;
     }
+    if (node.id.type === "Identifier" && node.init.type !== "ObjectExpression" && node.init.type !== "ArrayExpression") {
+      propagatePerPropertyEntries(node.init, node.id.name, env, ctx);
+    }
     if (node.init.type === "NewExpression" && node.id.type === "Identifier") {
       ctx._lastNewCallee = node.init.callee.type === "Identifier" ? node.init.callee.name : nodeToString(node.init.callee);
       propagateThisToInstance(node.id.name, env, ctx);
@@ -45333,6 +45833,10 @@ ${rootStack}`;
   function processAssignment(node, env, ctx) {
     ctx.returnedFuncNode = null;
     ctx.returnedMethods = null;
+    if (node.operator === "=" && node.left.type === "Identifier" && node.right.type === "ThisExpression") {
+      if (!ctx._thisAliases) ctx._thisAliases = /* @__PURE__ */ new Set();
+      ctx._thisAliases.add(node.left.name);
+    }
     if (node.operator === "=" && node.left.type === "Identifier") {
       const tag = getCreateElementTag(node.right, env);
       if (tag) {
@@ -45344,11 +45848,38 @@ ${rootStack}`;
           ctx.scriptElements.add(node.left.name);
         }
       }
+      const domInfo = getDOMQueryInfo(node.right, env, ctx);
+      if (domInfo) {
+        const key = resolveId(node.left, ctx);
+        if (domInfo.isDomAttached) {
+          ctx.domAttached.add(key);
+          ctx.domAttached.add(node.left.name);
+        }
+        if (domInfo.tag) {
+          ctx.elementTypes.set(key, domInfo.tag);
+          ctx.elementTypes.set(node.left.name, domInfo.tag);
+          if (domInfo.tag === "script") {
+            ctx.scriptElements.add(key);
+            ctx.scriptElements.add(node.left.name);
+          }
+        }
+      }
     }
     const rhsTaint = evaluateExpr(node.right, env, ctx);
+    if (ctx._ipSuspended) return;
     checkSinkAssignment(node.left, rhsTaint, node.right, env, ctx);
     checkElementPropertySink(node.left, rhsTaint, node.right, env, ctx);
-    checkPrototypePollution(node, env, ctx);
+    {
+      const left = node.left;
+      if (left.type === "MemberExpression") {
+        const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
+        let outerKeyTaint = TaintSet.empty();
+        if (left.computed && left.object.type === "MemberExpression" && left.object.computed) {
+          outerKeyTaint = evaluateExpr(left.object.property, env, ctx);
+        }
+        checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, outerKeyTaint);
+      }
+    }
     if (node.operator === "=" && node.left.type === "MemberExpression") {
       let leftStr = null;
       if (!node.left.computed) {
@@ -45365,6 +45896,30 @@ ${rootStack}`;
         if (setterFunc) {
           const synthCall = { type: "CallExpression", callee: node.left, arguments: [node.right], loc: node.loc };
           analyzeCalledFunction(synthCall, `setter:${leftStr}`, [rhsTaint], env, ctx);
+        }
+      }
+    }
+    if (node.operator === "=" && node.left.type === "MemberExpression" && node.left.computed && node.left.property?.type === "Identifier" && ctx._forInEnumeration) {
+      const keyVarName = node.left.property.name;
+      const enumInfo = ctx._forInEnumeration.get(keyVarName);
+      if (enumInfo) {
+        const targetStr = nodeToString(node.left.object);
+        if (targetStr) {
+          const isThisAlias = ctx._thisAliases?.has(targetStr);
+          for (const propName of enumInfo.properties) {
+            const srcKey = `${enumInfo.sourceName}.${propName}`;
+            const srcTaint = env.get(srcKey);
+            if (srcTaint) {
+              env.set(`${targetStr}.${propName}`, srcTaint);
+              if (isThisAlias) env.set(`this.${propName}`, srcTaint);
+            }
+            const srcFunc = ctx.funcMap.get(srcKey);
+            if (srcFunc) {
+              ctx.funcMap.set(`${targetStr}.${propName}`, srcFunc);
+              if (isThisAlias) ctx.funcMap.set(`this.${propName}`, srcFunc);
+              if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, srcFunc);
+            }
+          }
         }
       }
     }
@@ -45431,9 +45986,23 @@ ${rootStack}`;
         assignToPattern(pat, i < elemTaints.length ? elemTaints[i] : TaintSet.empty(), env, ctx);
       }
     } else {
+      if (ctx._handlerContext && ctx._currentBranchCondition && finalTaint.tainted && node.left.type === "MemberExpression") {
+        const cond = extractConditionInfo(ctx._currentBranchCondition.node, ctx._currentBranchCondition.polarity);
+        if (cond) {
+          finalTaint = finalTaint.withStateStep({
+            action: "store",
+            variable: nodeToString(node.left) || "",
+            condition: cond,
+            handler: ctx._handlerContext.type
+          });
+        }
+      }
       assignToPattern(node.left, finalTaint, env, ctx);
     }
     registerReturnedFunctions(node.left, ctx);
+    if (node.operator === "=" && node.left.type === "Identifier" && node.right.type !== "ObjectExpression" && node.right.type !== "ArrayExpression") {
+      propagatePerPropertyEntries(node.right, node.left.name, env, ctx);
+    }
     if (ctx._pendingCustomEventType) {
       const evName = node.left.type === "Identifier" ? node.left.name : nodeToString(node.left);
       if (evName) {
@@ -45448,6 +46017,7 @@ ${rootStack}`;
     }
     if (node.operator === "=" && (node.right.type === "FunctionExpression" || node.right.type === "ArrowFunctionExpression")) {
       node.right._closureEnv = env;
+      node.right._closureFuncMap = ctx.funcMap;
       const leftStr = nodeToString(node.left);
       if (leftStr) {
         ctx.funcMap.set(leftStr, node.right);
@@ -45476,6 +46046,66 @@ ${rootStack}`;
         const key = resolveId(node.left, ctx);
         ctx.funcMap.set(key, node.right);
         ctx.funcMap.set(node.left.name, node.right);
+      }
+    }
+    if (node.operator === "=") {
+      const leftStr = nodeToString(node.left);
+      if (leftStr) {
+        let rhsObj = node.right;
+        while (rhsObj && rhsObj.type === "AssignmentExpression") rhsObj = rhsObj.right;
+        if (rhsObj && rhsObj.type === "ObjectExpression") {
+          const romStack = [{ objExpr: rhsObj, prefix: leftStr }];
+          while (romStack.length > 0) {
+            const { objExpr, prefix } = romStack.pop();
+            for (const prop of objExpr.properties) {
+              if (isObjectProp(prop) && prop.key) {
+                let propName;
+                if (prop.computed) {
+                  const resolved = resolveToConstant(prop.key, env, ctx);
+                  if (typeof resolved === "string") propName = resolved;
+                }
+                if (!propName) propName = propKeyName(prop.key);
+                const val = prop.value;
+                if (propName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
+                  val._closureEnv = env;
+                  val._closureFuncMap = ctx.funcMap;
+                  ctx.funcMap.set(`${prefix}.${propName}`, val);
+                  if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+                }
+                if (propName && val && val.type === "Identifier") {
+                  const refFunc = ctx.funcMap.get(resolveId(val, ctx)) || ctx.funcMap.get(val.name);
+                  if (refFunc) {
+                    ctx.funcMap.set(`${prefix}.${propName}`, refFunc);
+                    if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, refFunc);
+                  }
+                }
+                if (propName && val && val.type === "ObjectExpression") {
+                  romStack.push({ objExpr: val, prefix: `${prefix}.${propName}` });
+                }
+              }
+              if (prop.type === "ObjectMethod" && prop.key) {
+                let propName;
+                if (prop.computed) {
+                  const resolved = resolveToConstant(prop.key, env, ctx);
+                  if (typeof resolved === "string") propName = resolved;
+                }
+                if (!propName) propName = propKeyName(prop.key);
+                if (propName) {
+                  prop._closureEnv = env;
+                  prop._closureFuncMap = ctx.funcMap;
+                  const accessorPrefix = prop.kind === "get" ? "getter:" : prop.kind === "set" ? "setter:" : "";
+                  ctx.funcMap.set(`${accessorPrefix}${prefix}.${propName}`, prop);
+                  if (!ctx.funcMap.has(`${accessorPrefix}${propName}`)) ctx.funcMap.set(`${accessorPrefix}${propName}`, prop);
+                  if (accessorPrefix) {
+                    ctx.funcMap.set(`${prefix}.${propName}`, prop);
+                    if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, prop);
+                  }
+                }
+              }
+            }
+          }
+          storeObjectPropertyTaints(leftStr, rhsObj, env, ctx);
+        }
       }
     }
     if (node.operator === "=" && node.right.type === "Identifier" && node.left.type === "Identifier") {
@@ -45531,7 +46161,7 @@ ${rootStack}`;
         if (leftStr) {
           ctx.funcMap.set(leftStr, refFunc);
           const propName = node.left.property?.name;
-          if (propName && !ctx.funcMap.has(propName)) ctx.funcMap.set(propName, refFunc);
+          if (propName) ctx.funcMap.set(propName, refFunc);
         }
       }
       const rhsName = node.right.name;
@@ -45601,12 +46231,12 @@ ${rootStack}`;
         if (rhsTaint2.tainted) {
           const propName = node.left.property.name;
           const loc = getNodeLoc(node);
-          ctx.findings.push({
+          pushFinding(ctx, {
             type: "XSS",
             severity: "high",
             title: `XSS: tainted data assigned to event handler property .${propName}`,
             sink: makeSinkInfo(`.${propName}`, ctx, loc),
-            source: formatSources(rhsTaint2),
+            source: formatSources(annotateSinkSteps(rhsTaint2, ctx)),
             path: buildTaintPath(rhsTaint2, `.${propName}`)
           });
         }
@@ -45631,10 +46261,50 @@ ${rootStack}`;
               const label = new TaintLabel("postMessage.data", ctx.file, loc.line || 0, loc.column || 0, desc);
               assignToPattern(handler.params[0], TaintSet.from(label), childEnv, ctx);
               childEnv.set(`${paramName}.data`, TaintSet.from(label));
+              const prevHandler = ctx._handlerContext;
+              ctx._handlerContext = { type: "message", param: paramName };
+              handler._isEventHandler = true;
+              if (!handler._closureEnv) handler._closureEnv = env;
               if (handler.body.type === "BlockStatement") {
                 analyzeInlineFunction(handler, childEnv, ctx);
               } else {
                 evaluateExpr(handler.body, childEnv, ctx);
+              }
+              ctx._handlerContext = prevHandler;
+            }
+          }
+        }
+      }
+    }
+    if (node.operator === "=") {
+      const isOnhashchange = node.left.type === "Identifier" && node.left.name === "onhashchange" || node.left.type === "MemberExpression" && !node.left.computed && node.left.property?.name === "onhashchange" && node.left.object?.type === "Identifier" && (node.left.object.name === "window" || node.left.object.name === "self" || node.left.object.name === "globalThis");
+      if (isOnhashchange) {
+        let handler = node.right;
+        if (handler.type === "Identifier") {
+          const refKey = resolveId(handler, ctx);
+          handler = ctx.funcMap.get(refKey) || ctx.funcMap.get(handler.name) || handler;
+        }
+        if (handler.type === "ArrowFunctionExpression" || handler.type === "FunctionExpression" || handler.type === "FunctionDeclaration") {
+          if (handler.params[0]) {
+            const paramName = handler.params[0].type === "Identifier" ? handler.params[0].name : null;
+            if (paramName) {
+              const evtSource = EVENT_SOURCES["hashchange"];
+              if (evtSource) {
+                const childEnv = env.child();
+                const loc = getNodeLoc(handler);
+                const label = new TaintLabel(evtSource.label, ctx.file, loc.line || 0, loc.column || 0, `${paramName}.${evtSource.property}`);
+                childEnv.set(`${paramName}.${evtSource.property}`, TaintSet.from(label));
+                assignToPattern(handler.params[0], TaintSet.from(label), childEnv, ctx);
+                const prevHandler = ctx._handlerContext;
+                ctx._handlerContext = { type: "hashchange", param: paramName };
+                handler._isEventHandler = true;
+                if (!handler._closureEnv) handler._closureEnv = env;
+                if (handler.body.type === "BlockStatement") {
+                  analyzeInlineFunction(handler, childEnv, ctx);
+                } else {
+                  evaluateExpr(handler.body, childEnv, ctx);
+                }
+                ctx._handlerContext = prevHandler;
               }
             }
           }
@@ -45682,7 +46352,16 @@ ${rootStack}`;
                   env.set(`${objStr}.#idx_${resolved}`, taint);
                 }
               } else {
-                if (taint.tainted) env.set(objStr, env.get(objStr).clone().merge(taint));
+                if (taint.tainted) {
+                  env.set(objStr, env.get(objStr).clone().merge(taint));
+                  if (pattern.object.type === "Identifier") {
+                    const scopeKey = resolveId(pattern.object, ctx);
+                    if (scopeKey !== objStr) {
+                      env.set(scopeKey, env.get(scopeKey).clone().merge(taint));
+                    }
+                    env.set(`global:${pattern.object.name}`, env.get(`global:${pattern.object.name}`).clone().merge(taint));
+                  }
+                }
               }
             }
           }
@@ -45785,6 +46464,10 @@ ${rootStack}`;
   var C_COND_TEST = 10;
   var C_COND_BRANCH = 11;
   var C_COND_FINAL = 12;
+  var C_TAGGED_TEMPLATE = 13;
+  var C_MEMBER_EXPR = 14;
+  var C_CALL_ARGS = 15;
+  var C_NEW_ARGS = 16;
   var COMPARISON_OPS = /* @__PURE__ */ new Set(["===", "==", "!==", "!=", ">", "<", ">=", "<=", "instanceof", "in"]);
   var ARITHMETIC_OPS = /* @__PURE__ */ new Set(["-", "*", "/", "%", "**", "|", "&", "^", "<<", ">>", ">>>"]);
   function binaryStep(accum, parts, index, bn, env, ctx, W, V) {
@@ -45897,6 +46580,20 @@ ${rootStack}`;
                 V.push(globalTaint.clone());
                 break;
               }
+              if (_c.domCatalog?.elements?.has(_n.name) && !_e.has(key)) {
+                const loc = getNodeLoc(_n);
+                const clobberLabel = new TaintLabel(
+                  "dom-clobbering",
+                  _c.file,
+                  loc?.line || 0,
+                  loc?.col || 0,
+                  `DOM element #${_n.name} (${_c.domCatalog.elements.get(_n.name)}) used as value`
+                );
+                const ts = new TaintSet();
+                ts.add(clobberLabel);
+                V.push(ts);
+                break;
+              }
               V.push(TaintSet.empty());
               break;
             }
@@ -45918,22 +46615,225 @@ ${rootStack}`;
               _n._closureEnv = _e;
               V.push(TaintSet.empty());
               break;
-            // ── Stage 6: MemberExpression ──
+            // ── Stage 6: MemberExpression (iterative chain walk) ──
             case "MemberExpression":
-            case "OptionalMemberExpression":
-              V.push(evaluateMemberExpr(_n, _e, _c));
+            case "OptionalMemberExpression": {
+              const _mFullPath = nodeToString(_n);
+              if (_mFullPath && (_mFullPath === "arguments.callee" || _mFullPath.startsWith("arguments.callee."))) {
+                V.push(TaintSet.empty());
+                break;
+              }
+              let _mCur = _n;
+              const _mOuterProps = [];
+              let _mResolved = false;
+              while (_mCur.type === "MemberExpression" || _mCur.type === "OptionalMemberExpression") {
+                let _mSourceLabel = checkMemberSource(_mCur);
+                if (!_mSourceLabel && _mCur.computed && _mCur.property) {
+                  const _mResConst = resolveToConstant(_mCur.property, _e, _c);
+                  if (typeof _mResConst === "string") {
+                    const _mObjStr = nodeToString(_mCur.object);
+                    if (_mObjStr) {
+                      const _mSynthPath = `${_mObjStr}.${_mResConst}`;
+                      if (MEMBER_SOURCES[_mSynthPath]) _mSourceLabel = MEMBER_SOURCES[_mSynthPath];
+                    }
+                  }
+                }
+                if (_mSourceLabel) {
+                  const _mLoc = getNodeLoc(_mCur);
+                  V.push(_applyOuterProps(TaintSet.from(new TaintLabel(_mSourceLabel, _c.file, _mLoc.line || 0, _mLoc.column || 0, nodeToString(_mCur))), _mOuterProps));
+                  _mResolved = true;
+                  break;
+                }
+                const _mFullStr = nodeToString(_mCur);
+                if (_mFullStr) {
+                  const _mResolvedStr = resolveAliasedPath(_mFullStr, _e);
+                  if (_mResolvedStr !== _mFullStr && MEMBER_SOURCES[_mResolvedStr]) {
+                    const _mLoc = getNodeLoc(_mCur);
+                    V.push(_applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[_mResolvedStr], _c.file, _mLoc.line || 0, _mLoc.column || 0, _mResolvedStr)), _mOuterProps));
+                    _mResolved = true;
+                    break;
+                  }
+                }
+                if (!_mCur.computed && _mCur.object?.type === "Identifier") {
+                  const _mAlias = _e.aliases.get(_mCur.object.name);
+                  if (_mAlias && _mCur.property) {
+                    const _mDeepPath = `${_mAlias}.${_mCur.property.name || _mCur.property.value}`;
+                    if (MEMBER_SOURCES[_mDeepPath]) {
+                      const _mLoc = getNodeLoc(_mCur);
+                      V.push(_applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[_mDeepPath], _c.file, _mLoc.line || 0, _mLoc.column || 0, _mDeepPath)), _mOuterProps));
+                      _mResolved = true;
+                      break;
+                    }
+                  }
+                }
+                const _mFP = _mFullStr;
+                if (_mFP) {
+                  if (_e.has(_mFP)) {
+                    V.push(_applyOuterProps(_e.get(_mFP).clone(), _mOuterProps));
+                    _mResolved = true;
+                    break;
+                  }
+                }
+                if (!_mCur.computed && _mCur.object?.type === "Identifier" && _mCur.property) {
+                  const _mResolvedObjKey = resolveId(_mCur.object, _c);
+                  const _mMemberProp = _mCur.property.name || _mCur.property.value;
+                  if (_mMemberProp) {
+                    const _mScopedPath = `${_mResolvedObjKey}.${_mMemberProp}`;
+                    if (_e.has(_mScopedPath)) {
+                      V.push(_applyOuterProps(_e.get(_mScopedPath).clone(), _mOuterProps));
+                      _mResolved = true;
+                      break;
+                    }
+                  }
+                }
+                if (_mFP) {
+                  const _mGetterFunc = _c.funcMap.get(`getter:${_mFP}`);
+                  if (_mGetterFunc && _mGetterFunc.body) {
+                    const _mChildEnv = (_mGetterFunc._closureEnv || _e).child();
+                    const _mGetterTaint = analyzeInlineFunction(_mGetterFunc, _mChildEnv, _c);
+                    if (_mGetterTaint.tainted) {
+                      V.push(_applyOuterProps(_mGetterTaint, _mOuterProps));
+                      _mResolved = true;
+                      break;
+                    }
+                  }
+                }
+                const _mPropName = !_mCur.computed && _mCur.property ? _mCur.property.name || _mCur.property.value : null;
+                if (_mPropName && (NUMERIC_PROPS.has(_mPropName) || _mPropName === "constructor" || _mPropName === "prototype")) {
+                  if (_mCur.object && (_mCur.object.type === "AssignmentExpression" || _mCur.object.type === "ParenthesizedExpression" && _mCur.object.expression?.type === "AssignmentExpression")) {
+                    W.push({ kind: W_CONTINUATION, label: C_MEMBER_EXPR, subtype: "root", outerProps: [], env: _e, ctx: _c });
+                    W.push({ kind: W_EVAL_EXPR, node: _mCur.object, env: _e, ctx: _c });
+                  } else {
+                    V.push(TaintSet.empty());
+                  }
+                  _mResolved = true;
+                  break;
+                }
+                if (_mCur.computed) {
+                  W.push({ kind: W_CONTINUATION, label: C_MEMBER_EXPR, subtype: "computed", node: _mCur, outerProps: _mOuterProps.slice(), env: _e, ctx: _c });
+                  W.push({ kind: W_EVAL_EXPR, node: _mCur.property, env: _e, ctx: _c });
+                  W.push({ kind: W_EVAL_EXPR, node: _mCur.object, env: _e, ctx: _c });
+                  _mResolved = true;
+                  break;
+                }
+                if (_mPropName) _mOuterProps.push(_mPropName);
+                _mCur = _mCur.object;
+              }
+              if (!_mResolved) {
+                W.push({ kind: W_CONTINUATION, label: C_MEMBER_EXPR, subtype: "root", outerProps: _mOuterProps.slice(), env: _e, ctx: _c });
+                W.push({ kind: W_EVAL_EXPR, node: _mCur, env: _e, ctx: _c });
+              }
               break;
-            // ── Stage 7: CallExpression / NewExpression ──
+            }
+            // ── Stage 7: CallExpression (iterative arg + callee evaluation) ──
             case "CallExpression":
-            case "OptionalCallExpression":
-              V.push(evaluateCallExpr(_n, _e, _c));
+            case "OptionalCallExpression": {
+              if (_n.callee.type === "Import" && _n.arguments.length > 0) {
+                W.push({ kind: W_CONTINUATION, label: C_IMPORT_EXPR, node: _n, ctx: _c });
+                W.push({ kind: W_EVAL_EXPR, node: _n.arguments[0], env: _e, ctx: _c });
+                break;
+              }
+              let _cCalleeStr = nodeToString(_n.callee);
+              let _cMethodName = "";
+              if (_n.callee.type === "MemberExpression" || _n.callee.type === "OptionalMemberExpression") {
+                if (_n.callee.computed) {
+                  const resolved = resolveToConstant(_n.callee.property, _e, _c);
+                  if (resolved) _cMethodName = resolved;
+                } else {
+                  _cMethodName = _n.callee.property?.name || "";
+                }
+              }
+              if (_cCalleeStr && _n.callee.type === "Identifier") {
+                const alias = _e.aliases.get(_cCalleeStr);
+                if (alias) _cCalleeStr = alias;
+              }
+              if (_cCalleeStr && (_n.callee.type === "MemberExpression" || _n.callee.type === "OptionalMemberExpression")) {
+                const memberAlias = _e.aliases.get(_cCalleeStr);
+                if (memberAlias) _cCalleeStr = memberAlias;
+              }
+              if (!_cCalleeStr && _n.callee.type === "SequenceExpression") {
+                const last = _n.callee.expressions[_n.callee.expressions.length - 1];
+                if (last) {
+                  const lastStr = nodeToString(last);
+                  if (lastStr) _cCalleeStr = lastStr;
+                }
+              }
+              if (!_cCalleeStr && _n.callee.type === "LogicalExpression") {
+                const leftStr = nodeToString(_n.callee.left);
+                const rightStr = nodeToString(_n.callee.right);
+                const leftConst = resolveToConstant(_n.callee.left, _e, _c);
+                if (_n.callee.operator === "??") {
+                  if (leftConst === null || leftConst === void 0) _cCalleeStr = rightStr;
+                  else if (leftConst !== void 0) _cCalleeStr = leftStr;
+                  else _cCalleeStr = rightStr || leftStr;
+                } else if (_n.callee.operator === "||") {
+                  if (leftConst !== void 0 && !leftConst) _cCalleeStr = rightStr;
+                  else if (leftConst !== void 0 && leftConst) _cCalleeStr = leftStr;
+                  else _cCalleeStr = rightStr || leftStr;
+                } else if (_n.callee.operator === "&&") {
+                  if (leftConst !== void 0 && leftConst) _cCalleeStr = rightStr;
+                  else if (leftConst !== void 0 && !leftConst) _cCalleeStr = leftStr;
+                  else _cCalleeStr = rightStr || leftStr;
+                }
+                if (_cCalleeStr) {
+                  const parts = _cCalleeStr.split(".");
+                  _cMethodName = parts[parts.length - 1];
+                }
+              }
+              const _cNeedCalleeEval = _n.callee.type === "CallExpression" || _n.callee.type === "OptionalCallExpression" || _n.callee.type === "NewExpression" || _n.callee.type === "ConditionalExpression";
+              const _cHasObjEval = !!(_n.callee?.object && (_n.callee.type === "MemberExpression" || _n.callee.type === "OptionalMemberExpression"));
+              W.push({
+                kind: W_CONTINUATION,
+                label: C_CALL_ARGS,
+                node: _n,
+                calleeStr: _cCalleeStr,
+                methodName: _cMethodName,
+                argCount: _n.arguments.length,
+                hasCalleeEval: _cNeedCalleeEval,
+                hasObjEval: _cHasObjEval,
+                env: _e,
+                ctx: _c
+              });
+              for (let i = _n.arguments.length - 1; i >= 0; i--) {
+                W.push({ kind: W_EVAL_EXPR, node: _n.arguments[i], env: _e, ctx: _c });
+              }
+              if (_cHasObjEval) {
+                W.push({ kind: W_EVAL_EXPR, node: _n.callee.object, env: _e, ctx: _c });
+              }
+              if (_cNeedCalleeEval) {
+                W.push({ kind: W_EVAL_EXPR, node: _n.callee, env: _e, ctx: _c });
+              }
               break;
-            case "NewExpression":
-              V.push(evaluateNewExpr(_n, _e, _c));
+            }
+            case "NewExpression": {
+              let _nCtorName = nodeToString(_n.callee);
+              if (_nCtorName && _n.callee.type === "Identifier") {
+                const alias = _e.aliases.get(_nCtorName);
+                if (alias) _nCtorName = alias;
+              }
+              W.push({
+                kind: W_CONTINUATION,
+                label: C_NEW_ARGS,
+                node: _n,
+                constructorName: _nCtorName,
+                argCount: _n.arguments.length,
+                env: _e,
+                ctx: _c
+              });
+              for (let i = _n.arguments.length - 1; i >= 0; i--) {
+                W.push({ kind: W_EVAL_EXPR, node: _n.arguments[i], env: _e, ctx: _c });
+              }
               break;
-            case "TaggedTemplateExpression":
-              V.push(evaluateTaggedTemplate(_n, _e, _c));
+            }
+            case "TaggedTemplateExpression": {
+              const exprs = _n.quasi.expressions;
+              W.push({ kind: W_CONTINUATION, label: C_TAGGED_TEMPLATE, count: exprs.length, node: _n, env: _e, ctx: _c });
+              for (let i = exprs.length - 1; i >= 0; i--) {
+                W.push({ kind: W_EVAL_EXPR, node: exprs[i], env: _e, ctx: _c });
+              }
+              if (exprs.length === 0) V.push(TaintSet.empty());
               break;
+            }
             // ── Stage 5: AssignmentExpression ──
             case "AssignmentExpression":
               processAssignment(_n, _e, _c);
@@ -46069,10 +46969,10 @@ ${rootStack}`;
               const specifierTaint = V.pop();
               if (specifierTaint.tainted) {
                 const loc = getNodeLoc(item.node);
-                item.ctx.findings.push({
-                  type: "Script Injection",
+                pushFinding(item.ctx, {
+                  type: "XSS",
                   severity: "critical",
-                  title: "Script Injection: tainted data flows to dynamic import()",
+                  title: "XSS: tainted data flows to dynamic import()",
                   sink: makeSinkInfo("import()", item.ctx, loc),
                   source: formatSources(specifierTaint),
                   path: buildTaintPath(specifierTaint, "import()")
@@ -46191,6 +47091,44 @@ ${rootStack}`;
               V.push(result);
               break;
             }
+            case C_TAGGED_TEMPLATE: {
+              const exprTaints = [];
+              if (item.count === 0) {
+                V.pop();
+              } else {
+                for (let i = 0; i < item.count; i++) exprTaints.push(V.pop());
+                exprTaints.reverse();
+              }
+              V.push(_evaluateTaggedTemplateBody(item.node, exprTaints, item.env, item.ctx));
+              break;
+            }
+            case C_MEMBER_EXPR: {
+              if (item.subtype === "root") {
+                const rootTaint = V.pop();
+                V.push(_applyOuterProps(rootTaint, item.outerProps));
+              } else if (item.subtype === "computed") {
+                const keyTaint = V.pop();
+                const objTaint = V.pop();
+                V.push(_applyOuterProps(_evaluateComputedMemberBody(item.node, objTaint, keyTaint, item.env, item.ctx), item.outerProps));
+              }
+              break;
+            }
+            case C_CALL_ARGS: {
+              const argTaints = [];
+              for (let i = 0; i < item.argCount; i++) argTaints.push(V.pop());
+              argTaints.reverse();
+              const objTaint = item.hasObjEval ? V.pop() : TaintSet.empty();
+              if (item.hasCalleeEval) V.pop();
+              V.push(_evaluateCallExprBody(item.node, item.calleeStr, item.methodName, argTaints, objTaint, item.env, item.ctx));
+              break;
+            }
+            case C_NEW_ARGS: {
+              const argTaints = [];
+              for (let i = 0; i < item.argCount; i++) argTaints.push(V.pop());
+              argTaints.reverse();
+              V.push(_evaluateNewExprBody(item.node, item.constructorName, argTaints, item.env, item.ctx));
+              break;
+            }
           }
           break;
         }
@@ -46198,8 +47136,7 @@ ${rootStack}`;
     }
     return V.pop() || TaintSet.empty();
   }
-  function evaluateTaggedTemplate(node, env, ctx) {
-    const exprTaints = node.quasi.expressions.map((e) => evaluateExpr(e, env, ctx));
+  function _evaluateTaggedTemplateBody(node, exprTaints, env, ctx) {
     const stringsArg = TaintSet.empty();
     const allArgTaints = [stringsArg, ...exprTaints];
     const tagCallee = node.tag;
@@ -46221,91 +47158,15 @@ ${rootStack}`;
     for (const et of exprTaints) t.merge(et);
     return t;
   }
-  function evaluateMemberExpr(node, env, ctx) {
-    const fullPath = nodeToString(node);
-    if (fullPath && (fullPath === "arguments.callee" || fullPath.startsWith("arguments.callee."))) {
-      return TaintSet.empty();
+  function _applyOuterProps(taint, outerProps) {
+    if (!taint.tainted || outerProps.length === 0) return taint;
+    let result = taint;
+    for (let i = outerProps.length - 1; i >= 0; i--) {
+      result = result.withTransform({ op: "property", args: [outerProps[i]] });
     }
-    let cur = node;
-    const outerProps = [];
-    const applyOuterProps = (taint) => {
-      if (!taint.tainted || outerProps.length === 0) return taint;
-      let result = taint;
-      for (let i = outerProps.length - 1; i >= 0; i--) {
-        result = result.withTransform({ op: "property", args: [outerProps[i]] });
-      }
-      return result;
-    };
-    while (cur.type === "MemberExpression" || cur.type === "OptionalMemberExpression") {
-      let sourceLabel = checkMemberSource(cur);
-      if (!sourceLabel && cur.computed && cur.property) {
-        const resolved = resolveToConstant(cur.property, env, ctx);
-        if (typeof resolved === "string") {
-          const objStr = nodeToString(cur.object);
-          if (objStr) {
-            const synthPath = `${objStr}.${resolved}`;
-            if (MEMBER_SOURCES[synthPath]) sourceLabel = MEMBER_SOURCES[synthPath];
-          }
-        }
-      }
-      if (sourceLabel) {
-        const loc = getNodeLoc(cur);
-        return applyOuterProps(TaintSet.from(new TaintLabel(sourceLabel, ctx.file, loc.line || 0, loc.column || 0, nodeToString(cur))));
-      }
-      const fullStr = nodeToString(cur);
-      if (fullStr) {
-        const resolvedStr = resolveAliasedPath(fullStr, env);
-        if (resolvedStr !== fullStr && MEMBER_SOURCES[resolvedStr]) {
-          const loc = getNodeLoc(cur);
-          return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[resolvedStr], ctx.file, loc.line || 0, loc.column || 0, resolvedStr)));
-        }
-      }
-      if (!cur.computed && cur.object?.type === "Identifier") {
-        const alias = env.aliases.get(cur.object.name);
-        if (alias && cur.property) {
-          const deepPath = `${alias}.${cur.property.name || cur.property.value}`;
-          if (MEMBER_SOURCES[deepPath]) {
-            const loc = getNodeLoc(cur);
-            return applyOuterProps(TaintSet.from(new TaintLabel(MEMBER_SOURCES[deepPath], ctx.file, loc.line || 0, loc.column || 0, deepPath)));
-          }
-        }
-      }
-      const fullPath2 = fullStr;
-      if (fullPath2) {
-        if (env.has(fullPath2)) return applyOuterProps(env.get(fullPath2).clone());
-      }
-      if (!cur.computed && cur.object?.type === "Identifier" && cur.property) {
-        const resolvedObjKey = resolveId(cur.object, ctx);
-        const memberProp = cur.property.name || cur.property.value;
-        if (memberProp) {
-          const scopedPath = `${resolvedObjKey}.${memberProp}`;
-          if (env.has(scopedPath)) return applyOuterProps(env.get(scopedPath).clone());
-        }
-      }
-      if (fullPath2) {
-        const getterFunc = ctx.funcMap.get(`getter:${fullPath2}`);
-        if (getterFunc && getterFunc.body) {
-          const childEnv = (getterFunc._closureEnv || env).child();
-          const getterTaint = analyzeInlineFunction(getterFunc, childEnv, ctx);
-          if (getterTaint.tainted) return applyOuterProps(getterTaint);
-        }
-      }
-      const propName = !cur.computed && cur.property ? cur.property.name || cur.property.value : null;
-      if (propName && (NUMERIC_PROPS.has(propName) || propName === "constructor" || propName === "prototype")) {
-        return TaintSet.empty();
-      }
-      if (cur.computed) {
-        const objTaint = evaluateExpr(cur.object, env, ctx);
-        return applyOuterProps(evaluateComputedMember(cur, objTaint, env, ctx));
-      }
-      if (propName) outerProps.push(propName);
-      cur = cur.object;
-    }
-    const rootTaint = evaluateExpr(cur, env, ctx);
-    return applyOuterProps(rootTaint);
+    return result;
   }
-  function evaluateComputedMember(node, objTaint, env, ctx) {
-    const keyTaint = evaluateExpr(node.property, env, ctx);
+  function _evaluateComputedMemberBody(node, objTaint, keyTaint, env, ctx) {
     let litKey = null;
     if (isStringLiteral(node.property)) {
       litKey = stringLiteralValue(node.property);
@@ -46532,94 +47393,32 @@ ${rootStack}`;
     "readyState",
     "nodeType"
   ]);
-  function evaluateCallExpr(node, env, ctx) {
-    let calleeStr = nodeToString(node.callee);
-    let methodName = "";
-    if (node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression") {
-      if (node.callee.computed) {
-        const resolved = resolveToConstant(node.callee.property, env, ctx);
-        if (resolved) methodName = resolved;
-      } else {
-        methodName = node.callee.property?.name || "";
-      }
-    }
-    if (calleeStr && node.callee.type === "Identifier") {
-      const alias = env.aliases.get(calleeStr);
-      if (alias) calleeStr = alias;
-    }
-    if (calleeStr && (node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression")) {
-      const memberAlias = env.aliases.get(calleeStr);
-      if (memberAlias) calleeStr = memberAlias;
-    }
-    if (!calleeStr && node.callee.type === "SequenceExpression") {
-      const last = node.callee.expressions[node.callee.expressions.length - 1];
-      if (last) {
-        const lastStr = nodeToString(last);
-        if (lastStr) calleeStr = lastStr;
-      }
-    }
-    if (node.callee.type === "Import" && node.arguments.length > 0) {
-      const specifierTaint = evaluateExpr(node.arguments[0], env, ctx);
-      if (specifierTaint.tainted) {
-        const loc = node.loc?.start || { line: 0, column: 0 };
-        ctx.findings.push({
-          type: "Script Injection",
-          severity: "critical",
-          title: "Script Injection: tainted data flows to dynamic import()",
-          sink: makeSinkInfo("import()", ctx, loc),
-          source: formatSources(specifierTaint),
-          path: buildTaintPath(specifierTaint, "import()")
-        });
-      }
-      return TaintSet.empty();
-    }
-    if (node.callee.type === "CallExpression" || node.callee.type === "OptionalCallExpression") {
-      evaluateExpr(node.callee, env, ctx);
-    }
-    if (node.callee.type === "NewExpression") {
-      evaluateExpr(node.callee, env, ctx);
-    }
-    if (node.callee.type === "ConditionalExpression") {
-      evaluateExpr(node.callee, env, ctx);
-    }
-    if (!calleeStr && node.callee.type === "LogicalExpression") {
-      const leftStr = nodeToString(node.callee.left);
-      const rightStr = nodeToString(node.callee.right);
-      const leftConst = resolveToConstant(node.callee.left, env, ctx);
-      if (node.callee.operator === "??") {
-        if (leftConst === null || leftConst === void 0) {
-          calleeStr = rightStr;
-        } else if (leftConst !== void 0) {
-          calleeStr = leftStr;
-        } else {
-          calleeStr = rightStr || leftStr;
-        }
-      } else if (node.callee.operator === "||") {
-        if (leftConst !== void 0 && !leftConst) {
-          calleeStr = rightStr;
-        } else if (leftConst !== void 0 && leftConst) {
-          calleeStr = leftStr;
-        } else {
-          calleeStr = rightStr || leftStr;
-        }
-      } else if (node.callee.operator === "&&") {
-        if (leftConst !== void 0 && leftConst) {
-          calleeStr = rightStr;
-        } else if (leftConst !== void 0 && !leftConst) {
-          calleeStr = leftStr;
-        } else {
-          calleeStr = rightStr || leftStr;
-        }
-      }
-      if (calleeStr) {
-        const parts = calleeStr.split(".");
-        methodName = parts[parts.length - 1];
-      }
-    }
-    const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
+  function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint, env, ctx) {
     if (isSanitizer(calleeStr, methodName)) return TaintSet.empty();
     const sinkInfo = checkCallSink(calleeStr, methodName);
     if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
+    if (methodName === "appendChild" || methodName === "append" || methodName === "prepend" || methodName === "insertBefore" || methodName === "replaceChild" || methodName === "insertAdjacentElement" || methodName === "after" || methodName === "before" || methodName === "replaceWith") {
+      for (const arg of node.arguments || []) {
+        if (arg.type === "Identifier") {
+          const key = resolveId(arg, ctx);
+          ctx.domAttached.add(key);
+          ctx.domAttached.add(arg.name);
+        }
+      }
+    }
+    if (methodName === "constructor") {
+      const callee = node.callee;
+      let isDoubleConstructor = false;
+      if (calleeStr && calleeStr.endsWith(".constructor.constructor")) {
+        isDoubleConstructor = true;
+      } else if (callee.type === "MemberExpression" && !callee.computed && callee.property?.name === "constructor" && callee.object?.type === "MemberExpression" && !callee.object.computed && callee.object.property?.name === "constructor") {
+        isDoubleConstructor = true;
+      }
+      if (isDoubleConstructor) {
+        const allArgIndices = argTaints.map((_, i) => i);
+        checkSinkCall(node, { type: "XSS", taintedArgs: allArgIndices }, argTaints, "Function()", env, ctx);
+      }
+    }
     if (methodName === "setAttribute" && node.arguments.length >= 2) {
       const attrArg = node.arguments[0];
       let attrName = null;
@@ -46633,7 +47432,7 @@ ${rootStack}`;
       if (attrNameTaint && attrNameTaint.tainted && node.callee?.object) {
         const objName = nodeToString(node.callee.object);
         const loc = getNodeLoc(node);
-        ctx.findings.push({
+        pushFinding(ctx, {
           type: "XSS",
           severity: "high",
           title: "XSS: attacker-controlled attribute name in setAttribute",
@@ -46649,10 +47448,10 @@ ${rootStack}`;
           const objKey = node.callee.object.type === "Identifier" ? resolveId(node.callee.object, ctx) : objName;
           if (attrName === "src" && objName && (ctx.scriptElements.has(objKey) || ctx.scriptElements.has(objName))) {
             const loc = getNodeLoc(node);
-            ctx.findings.push({
-              type: "Script Injection",
+            pushFinding(ctx, {
+              type: "XSS",
               severity: "critical",
-              title: "Script Injection: tainted data flows to script element src",
+              title: "XSS: tainted data flows to script element src",
               sink: makeSinkInfo(`${objName}.setAttribute('src')`, ctx, loc),
               source: formatSources(srcTaint),
               path: buildTaintPath(srcTaint, `${objName}.setAttribute('src')`)
@@ -46679,12 +47478,18 @@ ${rootStack}`;
             "data",
             "style"
           ]);
-          if (DANGEROUS_ATTRS.has(attrName)) {
+          let skipAttr = false;
+          if ((attrName === "src" || attrName === "data") && objName) {
+            const tag = ctx.elementTypes.get(objKey) || ctx.elementTypes.get(objName);
+            const SAFE_SRC_TAGS = /* @__PURE__ */ new Set(["img", "video", "audio", "source", "picture", "track"]);
+            if (tag && SAFE_SRC_TAGS.has(tag)) skipAttr = true;
+          }
+          if (DANGEROUS_ATTRS.has(attrName) && !skipAttr) {
             const isEventHandler = EVENT_HANDLER_ATTRS.has(attrName);
             const isCss = attrName === "style";
             const type = isCss ? "CSS Injection" : "XSS";
             const loc = getNodeLoc(node);
-            ctx.findings.push({
+            pushFinding(ctx, {
               type,
               severity: isCss ? "high" : isEventHandler ? "critical" : "high",
               title: `${type}: tainted data flows to setAttribute('${attrName}')`,
@@ -46704,11 +47509,15 @@ ${rootStack}`;
       }
       if (callback.type === "ArrowFunctionExpression" || callback.type === "FunctionExpression" || callback.type === "FunctionDeclaration") {
         const childEnv = (callback._closureEnv || env).child();
+        const prevHandler = ctx._handlerContext;
+        const timerDelay = node.arguments[1] ? resolveToConstant(node.arguments[1], env, ctx) : null;
+        ctx._handlerContext = { type: "timer", delay: typeof timerDelay === "number" ? timerDelay : 0 };
         if (callback.body.type === "BlockStatement") {
           analyzeInlineFunction(callback, childEnv, ctx);
         } else {
           evaluateExpr(callback.body, childEnv, ctx);
         }
+        ctx._handlerContext = prevHandler;
       }
     }
     if (isCalleeMatch(node, "Array", "from", env) || isCalleeMatch(node, "Array", "of", env)) {
@@ -46720,7 +47529,7 @@ ${rootStack}`;
       const protoTaint = argTaints[1];
       if (protoTaint && protoTaint.tainted) {
         const loc = getNodeLoc(node);
-        ctx.findings.push({
+        pushFinding(ctx, {
           type: "Prototype Pollution",
           severity: "critical",
           title: "Prototype Pollution: tainted data passed to Object.setPrototypeOf",
@@ -46759,6 +47568,19 @@ ${rootStack}`;
       const objNode = node.arguments[0];
       const propNode = node.arguments[1];
       const descNode = node.arguments[2];
+      const propKeyTaint = evaluateExpr(propNode, env, ctx);
+      if (propKeyTaint.tainted) {
+        const loc = getNodeLoc(node);
+        const objStr = nodeToString(objNode) || "obj";
+        pushFinding(ctx, {
+          type: "Prototype Pollution",
+          severity: "critical",
+          title: `Prototype Pollution: attacker controls property key in Object.defineProperty`,
+          sink: makeSinkInfo(`Object.defineProperty(${objStr}, taintedKey)`, ctx, loc),
+          source: formatSources(propKeyTaint),
+          path: buildTaintPath(propKeyTaint, `Object.defineProperty(${objStr}, taintedKey)`)
+        });
+      }
       if (objNode && propNode && descNode && descNode.type === "ObjectExpression") {
         const objStr = nodeToString(objNode);
         const propName = isStringLiteral(propNode) ? stringLiteralValue(propNode) : null;
@@ -46772,6 +47594,17 @@ ${rootStack}`;
                 if (objNode.type === "Identifier") {
                   const key = resolveId(objNode, ctx);
                   env.set(`${key}.${propName}`, valTaint);
+                }
+                if (propName === "__proto__" || propName === "prototype") {
+                  const loc = getNodeLoc(node);
+                  pushFinding(ctx, {
+                    type: "Prototype Pollution",
+                    severity: "critical",
+                    title: `Prototype Pollution: tainted data set via Object.defineProperty on ${propName}`,
+                    sink: makeSinkInfo(`Object.defineProperty(${objStr}, "${propName}")`, ctx, loc),
+                    source: formatSources(valTaint),
+                    path: buildTaintPath(valTaint, `Object.defineProperty(${objStr}, "${propName}")`)
+                  });
                 }
               }
             }
@@ -46871,12 +47704,62 @@ ${rootStack}`;
       const argsNode = node.arguments[1];
       const synthArgs = argsNode.type === "ArrayExpression" ? argsNode.elements.filter(Boolean) : [];
       const synthNew = { ...node, type: "NewExpression", callee: targetNode, arguments: synthArgs };
-      return evaluateNewExpr(synthNew, env, ctx);
+      let rCtorName = nodeToString(targetNode);
+      if (rCtorName && targetNode.type === "Identifier") {
+        const alias = env.aliases.get(rCtorName);
+        if (alias) rCtorName = alias;
+      }
+      const rArgTaints = synthArgs.map((a) => evaluateExpr(a, env, ctx));
+      return _evaluateNewExprBody(synthNew, rCtorName, rArgTaints, env, ctx);
+    }
+    if (isCalleeMatch(node, "Reflect", "set", env) && node.arguments.length >= 3) {
+      const propNode = node.arguments[1];
+      const valTaint = argTaints[2] || TaintSet.empty();
+      const propResolved = resolveToConstant(propNode, env, ctx);
+      if (typeof propResolved === "string" && (propResolved === "__proto__" || propResolved === "prototype")) {
+        if (valTaint.tainted) {
+          const loc = getNodeLoc(node);
+          const objStr = nodeToString(node.arguments[0]) || "obj";
+          pushFinding(ctx, {
+            type: "Prototype Pollution",
+            severity: "critical",
+            title: `Prototype Pollution: tainted data set via Reflect.set on ${propResolved}`,
+            sink: makeSinkInfo(`Reflect.set(${objStr}, "${propResolved}")`, ctx, loc),
+            source: formatSources(valTaint),
+            path: buildTaintPath(valTaint, `Reflect.set(${objStr}, "${propResolved}")`)
+          });
+        }
+      }
+      const propTaint = argTaints[1] || TaintSet.empty();
+      if (propTaint.tainted) {
+        const loc = getNodeLoc(node);
+        const objStr = nodeToString(node.arguments[0]) || "obj";
+        pushFinding(ctx, {
+          type: "Prototype Pollution",
+          severity: "critical",
+          title: "Prototype Pollution: attacker controls property key in Reflect.set",
+          sink: makeSinkInfo(`Reflect.set(${objStr}, taintedKey)`, ctx, loc),
+          source: formatSources(propTaint),
+          path: buildTaintPath(propTaint, `Reflect.set(${objStr}, taintedKey)`)
+        });
+      }
     }
     if (isCalleeMatch(node, "Object", "freeze", env) || isCalleeMatch(node, "Object", "seal", env) || isCalleeMatch(node, "Object", "preventExtensions", env)) {
       return argTaints[0]?.clone() || TaintSet.empty();
     }
-    if (isCalleeMatch(node, "Object", "keys", env)) return TaintSet.empty();
+    if (isCalleeMatch(node, "Object", "keys", env)) {
+      const argNode = node.arguments[0];
+      if (argNode) {
+        if (argNode.type === "ObjectExpression") return TaintSet.empty();
+        if (argNode.type === "Identifier") {
+          const initNode = resolveInitFromScope(argNode, ctx);
+          if (initNode && initNode.type === "ObjectExpression") return TaintSet.empty();
+        }
+      }
+      const argTaint = argTaints[0] || TaintSet.empty();
+      if (argTaint.tainted) return argTaint.clone();
+      return TaintSet.empty();
+    }
     if (isCalleeMatch(node, "Object", "values", env) || isCalleeMatch(node, "Object", "entries", env)) {
       const argTaint = argTaints[0] || TaintSet.empty();
       if (argTaint.tainted) return argTaint.clone();
@@ -46987,7 +47870,7 @@ ${rootStack}`;
         return analyzeCalledFunction(node, calleeStr, argTaints, env, ctx);
       }
     }
-    const propagated = handleBuiltinMethod(methodName, node, argTaints, env, ctx);
+    const propagated = handleBuiltinMethod(methodName, node, argTaints, objTaint, env, ctx);
     if (propagated !== null) return propagated;
     if (methodName && ctx.returnedMethods && ctx.returnedMethods[methodName] && (node.callee?.type === "MemberExpression" || node.callee?.type === "OptionalMemberExpression") && (node.callee.object?.type === "CallExpression" || node.callee.object?.type === "OptionalCallExpression")) {
       const funcNode = ctx.returnedMethods[methodName];
@@ -47025,13 +47908,7 @@ ${rootStack}`;
       }
     }
   }
-  function evaluateNewExpr(node, env, ctx) {
-    let constructorName = nodeToString(node.callee);
-    if (constructorName && node.callee.type === "Identifier") {
-      const alias = env.aliases.get(constructorName);
-      if (alias) constructorName = alias;
-    }
-    const argTaints = node.arguments.map((arg) => evaluateExpr(arg, env, ctx));
+  function _evaluateNewExprBody(node, constructorName, argTaints, env, ctx) {
     if (node.callee.type === "ClassExpression" && node.callee.body?.body) {
       const synthName = `__classExpr_${node.loc?.start?.line || 0}_${node.loc?.start?.column || 0}`;
       const classBody = node.callee.body.body;
@@ -47069,7 +47946,7 @@ ${rootStack}`;
     }
     if ((isGlobalRef(node.callee, "Worker", env) || isGlobalRef(node.callee, "SharedWorker", env)) && argTaints[0]) {
       const ctorName = isGlobalRef(node.callee, "Worker", env) ? "Worker" : "SharedWorker";
-      checkSinkCall(node, { type: "Script Injection", taintedArgs: [0] }, argTaints, `new ${ctorName}()`, env, ctx);
+      checkSinkCall(node, { type: "XSS", taintedArgs: [0] }, argTaints, `new ${ctorName}()`, env, ctx);
     }
     if (isGlobalRef(node.callee, "Blob", env) && argTaints[0]) {
       return argTaints[0].clone();
@@ -47261,8 +48138,7 @@ ${rootStack}`;
     }
     return argTaints.reduce((acc, t) => acc.merge(t), TaintSet.empty());
   }
-  function handleBuiltinMethod(methodName, node, argTaints, env, ctx) {
-    const objTaint = node.callee?.object ? evaluateExpr(node.callee.object, env, ctx) : TaintSet.empty();
+  function handleBuiltinMethod(methodName, node, argTaints, objTaint, env, ctx) {
     switch (methodName) {
       case "slice":
       case "substring":
@@ -47559,7 +48435,7 @@ ${rootStack}`;
           const result = handleBuiltinMethod(method, {
             ...node,
             callee: { ...node.callee, object: node.arguments?.[0] || node.callee.object }
-          }, restArgTaints, env, ctx);
+          }, restArgTaints, thisArgTaint, env, ctx);
           if (result !== null) return thisArgTaint.clone().merge(result);
           const funcRef = calleeObj.type === "Identifier" ? ctx.funcMap.get(resolveId(calleeObj, ctx)) || ctx.funcMap.get(calleeObj.name) : protoMethod && ctx.funcMap.get(protoMethod);
           if (funcRef && funcRef.body) {
@@ -47770,10 +48646,18 @@ ${rootStack}`;
       if (!ctx.eventListeners.has(eventName)) ctx.eventListeners.set(eventName, []);
       ctx.eventListeners.get(eventName).push({ callback, env });
     }
+    const prevHandler = ctx._handlerContext;
+    ctx._handlerContext = { type: eventName || "event", param: callback.params[0]?.name || null };
+    callback._isEventHandler = true;
+    if (!callback._closureEnv) callback._closureEnv = env;
+    let result;
     if (callback.body.type === "BlockStatement") {
-      return analyzeInlineFunction(callback, childEnv, ctx);
+      result = analyzeInlineFunction(callback, childEnv, ctx);
+    } else {
+      result = evaluateExpr(callback.body, childEnv, ctx);
     }
-    return evaluateExpr(callback.body, childEnv, ctx);
+    ctx._handlerContext = prevHandler;
+    return result;
   }
   function isOriginAccess(node) {
     if (!node) return false;
@@ -47981,10 +48865,22 @@ ${rootStack}`;
     const childEnv = env.child();
     if (callback.params[0]) assignToPattern(callback.params[0], objTaint, childEnv, ctx);
     if (callback.params[1]) assignToPattern(callback.params[1], TaintSet.empty(), childEnv, ctx);
+    if (!callback._closureEnv) callback._closureEnv = env;
+    let result;
     if (callback.body.type === "BlockStatement") {
-      return analyzeInlineFunction(callback, childEnv, ctx);
+      result = analyzeInlineFunction(callback, childEnv, ctx);
+    } else {
+      result = evaluateExpr(callback.body, childEnv, ctx);
     }
-    return evaluateExpr(callback.body, childEnv, ctx);
+    for (const [key, taint] of childEnv.entries()) {
+      if (callback.params[0]?.type === "Identifier" && key === callback.params[0].name) continue;
+      if (callback.params[1]?.type === "Identifier" && key === callback.params[1].name) continue;
+      if (key.startsWith("this.") || key === "this") continue;
+      if (taint.tainted) {
+        env.set(key, env.get(key).clone().merge(taint));
+      }
+    }
+    return result;
   }
   function analyzePromiseCallback(node, argTaints, objTaint, env, ctx) {
     const methodName = node.callee?.property?.name || "";
@@ -48036,6 +48932,8 @@ ${rootStack}`;
         callerCtx.funcMap.set(key, val);
       } else if (key.charCodeAt(0) === 116 && key.startsWith("this.")) {
         callerCtx.funcMap.set(key, val);
+      } else if (key.indexOf(".") === -1 && !(key.charCodeAt(0) >= 48 && key.charCodeAt(0) <= 57)) {
+        callerCtx.funcMap.set(key, val);
       } else {
         for (const prefix of _GLOBAL_OBJ_PREFIXES) {
           if (key.length > prefix.length && key.slice(0, prefix.length) === prefix) {
@@ -48055,6 +48953,9 @@ ${rootStack}`;
     if (aifKey && ctx._aifStack.has(aifKey)) return TaintSet.empty();
     if (aifKey) ctx._aifStack.add(aifKey);
     const innerCfg = buildCFG(funcNode.body);
+    if (funcNode._isEventHandler && innerCfg.exit && innerCfg.entry) {
+      innerCfg.exit.connect(innerCfg.entry);
+    }
     const innerCtx = new AnalysisContext(
       ctx.file,
       ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap),
@@ -48069,6 +48970,7 @@ ${rootStack}`;
     innerCtx.protoMethodMap = ctx.protoMethodMap;
     if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
     if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
+    if (ctx._handlerContext) innerCtx._handlerContext = ctx._handlerContext;
     const frame = {
       cfg: innerCfg,
       worklist: [innerCfg.entry],
@@ -48106,9 +49008,33 @@ ${rootStack}`;
       const _origPostProcess = frame.postProcess;
       const _aifCleanupKey = aifKey;
       const _aifCleanupStack = ctx._aifStack;
+      const _closureEnv2 = funcNode._closureEnv;
+      const _frameEnv = env;
+      const _funcParams = funcNode.params || [];
       frame.postProcess = (result) => {
         if (_origPostProcess) _origPostProcess(result);
         if (_aifCleanupKey) _aifCleanupStack.delete(_aifCleanupKey);
+        if (_closureEnv2) {
+          const paramNames = /* @__PURE__ */ new Set();
+          for (const p of _funcParams) {
+            if (p.type === "Identifier") paramNames.add(p.name);
+            else if (p.type === "RestElement" && p.argument?.type === "Identifier") paramNames.add(p.argument.name);
+          }
+          for (const [key, taint] of _frameEnv.entries()) {
+            if (paramNames.has(key)) continue;
+            if (key.startsWith("this.") || key === "this") continue;
+            if (taint.tainted) {
+              _closureEnv2.set(key, _closureEnv2.get(key).clone().merge(taint));
+              if (!key.includes(":") && !key.includes(".")) {
+                for (const [existingKey] of _closureEnv2.entries()) {
+                  if (existingKey.endsWith(":" + key) || existingKey.startsWith(key + ".") && existingKey.length > key.length + 1) {
+                    _closureEnv2.set(existingKey, _closureEnv2.get(existingKey).clone().merge(taint));
+                  }
+                }
+              }
+            }
+          }
+        }
       };
       ctx._ipStack.push(frame);
       ctx._ipSuspended = true;
@@ -48116,6 +49042,28 @@ ${rootStack}`;
     }
     const _result = _runIPLoop([frame]);
     if (aifKey) ctx._aifStack.delete(aifKey);
+    const _closureEnv = funcNode._closureEnv;
+    if (_closureEnv) {
+      const paramNames = /* @__PURE__ */ new Set();
+      for (const p of funcNode.params || []) {
+        if (p.type === "Identifier") paramNames.add(p.name);
+        else if (p.type === "RestElement" && p.argument?.type === "Identifier") paramNames.add(p.argument.name);
+      }
+      for (const [key, taint] of env.entries()) {
+        if (paramNames.has(key)) continue;
+        if (key.startsWith("this.") || key === "this") continue;
+        if (taint.tainted) {
+          _closureEnv.set(key, _closureEnv.get(key).clone().merge(taint));
+          if (!key.includes(":") && !key.includes(".")) {
+            for (const [existingKey] of _closureEnv.entries()) {
+              if (existingKey.endsWith(":" + key) || existingKey.startsWith(key + ".") && existingKey.length > key.length + 1) {
+                _closureEnv.set(existingKey, _closureEnv.get(existingKey).clone().merge(taint));
+              }
+            }
+          }
+        }
+      }
+    }
     return _result;
   }
   function _runIPLoop(ipStack) {
@@ -48289,7 +49237,10 @@ ${rootStack}`;
       if (fullPath && ctx.funcMap.has(fullPath)) funcNode = ctx.funcMap.get(fullPath);
       if (!funcNode) {
         const methodName = callNode.callee.property?.name;
-        if (methodName && ctx.funcMap.has(methodName)) funcNode = ctx.funcMap.get(methodName);
+        if (methodName) {
+          if (ctx.funcMap.has(methodName)) funcNode = ctx.funcMap.get(methodName);
+          if (!funcNode && ctx.funcMap.has(`this.${methodName}`)) funcNode = ctx.funcMap.get(`this.${methodName}`);
+        }
       }
       if (!funcNode && callNode.callee.computed) {
         const objStr = nodeToString(callNode.callee.object);
@@ -48316,7 +49267,21 @@ ${rootStack}`;
     const locSuffix = !calleeStr && funcNode.loc ? `:${funcNode.loc.start.line}:${funcNode.loc.start.column}` : "";
     let taintBits = 0;
     for (let i = 0; i < argTaints.length; i++) if (argTaints[i].tainted) taintBits |= 1 << i;
-    const callSig = `${calleeStr || "anon"}:${taintBits}${superSuffix}${locSuffix}`;
+    let objArgSuffix = "";
+    if (callNode.arguments) {
+      for (let i = 0; i < callNode.arguments.length; i++) {
+        const arg = callNode.arguments[i];
+        if (arg && arg.type === "ObjectExpression" && arg.properties && arg.properties.length > 0) {
+          const keys = [];
+          for (let j = 0; j < arg.properties.length && j < 8; j++) {
+            const p = arg.properties[j];
+            if (p.key) keys.push(p.key.name || p.key.value || "");
+          }
+          if (keys.length) objArgSuffix += `:obj${i}=${keys.join(",")}`;
+        }
+      }
+    }
+    const callSig = `${calleeStr || "anon"}:${taintBits}${superSuffix}${locSuffix}${objArgSuffix}`;
     if (ctx.analyzedCalls.has(callSig)) {
       const cached = ctx.analyzedCalls.get(callSig);
       if (cached && cached._returnedFuncNode) ctx.returnedFuncNode = cached._returnedFuncNode;
@@ -48398,6 +49363,11 @@ ${rootStack}`;
       funcNode._proxyApplyArgTaints = originalArgTaints;
     }
     const innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
+    if (funcNode._closureFuncMap) {
+      for (const [key, val] of funcNode._closureFuncMap) {
+        if (!innerFuncMap.has(key)) innerFuncMap.set(key, val);
+      }
+    }
     if (funcNode._isProxyApplyTrap && funcNode._proxyTargetFunc && funcNode._proxyTargetParam) {
       innerFuncMap.set(funcNode._proxyTargetParam, funcNode._proxyTargetFunc);
     }
@@ -48415,17 +49385,21 @@ ${rootStack}`;
         const argNode = callNode.arguments[i];
         if (argNode.type === "FunctionExpression" || argNode.type === "ArrowFunctionExpression") {
           argNode._closureEnv = env;
+          argNode._closureFuncMap = ctx.funcMap;
           innerFuncMap.set(param.name, argNode);
           const paramKey = resolveId(param, ctx);
           innerFuncMap.set(paramKey, argNode);
         }
         if (argNode.type === "Identifier") {
           const refKey = resolveId(argNode, ctx);
-          const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(argNode.name);
-          if (refFunc) {
-            innerFuncMap.set(param.name, refFunc);
-            const paramKey = resolveId(param, ctx);
-            innerFuncMap.set(paramKey, refFunc);
+          const argTaintCheck = argTaints[i];
+          if (!argTaintCheck || !argTaintCheck.tainted) {
+            const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(argNode.name);
+            if (refFunc) {
+              innerFuncMap.set(param.name, refFunc);
+              const paramKey = resolveId(param, ctx);
+              innerFuncMap.set(paramKey, refFunc);
+            }
           }
         }
         if (argNode.type === "ObjectExpression") {
@@ -48435,6 +49409,7 @@ ${rootStack}`;
               const val = prop.value;
               if (pName && val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
                 val._closureEnv = env;
+                val._closureFuncMap = ctx.funcMap;
                 innerFuncMap.set(`${param.name}.${pName}`, val);
               }
             }
@@ -48521,6 +49496,39 @@ ${rootStack}`;
       childEnv.set("arguments", argsMerged);
       childEnv.set("global:arguments", argsMerged);
     }
+    for (let ai = 0; ai < argTaints.length; ai++) {
+      childEnv.set(`arguments.#idx_${ai}`, argTaints[ai]);
+    }
+    for (let ai = 0; ai < callNode.arguments.length; ai++) {
+      const argNode = callNode.arguments[ai];
+      if (argNode.type === "ObjectExpression") {
+        const argPrefix = `arguments.#idx_${ai}`;
+        for (const prop of argNode.properties) {
+          if (prop.type === "SpreadElement") continue;
+          if ((isObjectProp(prop) || prop.type === "ObjectMethod") && prop.key) {
+            let propName;
+            if (prop.computed) {
+              const resolved = resolveToConstant(prop.key, env, ctx);
+              if (typeof resolved === "string") propName = resolved;
+            }
+            if (!propName) propName = propKeyName(prop.key);
+            if (propName) {
+              const val = prop.type === "ObjectMethod" ? prop : prop.value;
+              if (val && (val.type === "FunctionExpression" || val.type === "ArrowFunctionExpression")) {
+                val._closureEnv = env;
+                val._closureFuncMap = ctx.funcMap;
+                innerFuncMap.set(`${argPrefix}.${propName}`, val);
+              } else if (val && val.type === "Identifier") {
+                const refFunc = ctx.funcMap.get(val.name);
+                if (refFunc) innerFuncMap.set(`${argPrefix}.${propName}`, refFunc);
+              }
+              const propTaint = evaluateExpr(val || prop.key, env, ctx);
+              childEnv.set(`${argPrefix}.${propName}`, propTaint);
+            }
+          }
+        }
+      }
+    }
     const savedFuncMap = ctx.funcMap;
     ctx.funcMap = innerFuncMap;
     const paramNames = /* @__PURE__ */ new Set();
@@ -48554,6 +49562,7 @@ ${rootStack}`;
     innerCtx.protoMethodMap = ctx.protoMethodMap;
     if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
     if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
+    if (ctx._handlerContext) innerCtx._handlerContext = ctx._handlerContext;
     const _callNode = callNode, _callSig = callSig, _childEnv = childEnv, _funcNode = funcNode, _methodObjName2 = _methodObjName, _paramNames = paramNames, _savedFuncMap = savedFuncMap, _savedParamConstants = savedParamConstants, _innerFuncMap = innerFuncMap, _callerEnv = env, _callerCtx = ctx;
     const postProcess = (result) => {
       _callerCtx._paramConstants = _savedParamConstants;
@@ -48655,10 +49664,52 @@ ${rootStack}`;
   }
   function processForBinding(node, env, ctx) {
     if (node._isForIn) {
+      let keyTaint = TaintSet.empty();
+      const iterableTaint2 = evaluateExpr(node.right, env, ctx);
+      if (iterableTaint2.tainted) {
+        const labels = iterableTaint2.toArray();
+        const controlsStructure = labels.some((l) => {
+          if (l.transforms && l.transforms.some((t) => t.op === "JSON.parse")) return true;
+          if (l.description && l.description.includes("postMessage")) return true;
+          if (l.type && l.type.includes("postMessage")) return true;
+          if (l.type && l.type.includes("storage")) return true;
+          if (l.type === "window.name" || l.type === "cookie") return true;
+          return false;
+        });
+        if (controlsStructure) {
+          keyTaint = iterableTaint2;
+        }
+      }
+      let forInVarName = null;
+      if (node.left.type === "VariableDeclaration" && node.left.declarations[0]?.id?.type === "Identifier") {
+        forInVarName = node.left.declarations[0].id.name;
+      } else if (node.left.type === "Identifier") {
+        forInVarName = node.left.name;
+      }
+      if (forInVarName) {
+        const iterStr2 = nodeToString(node.right);
+        if (iterStr2) {
+          const knownProps = /* @__PURE__ */ new Set();
+          for (const [key] of env.getTaintedWithPrefix(`${iterStr2}.`)) {
+            const propName = key.slice(iterStr2.length + 1);
+            if (propName && !propName.startsWith("#")) knownProps.add(propName);
+          }
+          for (const [key] of ctx.funcMap) {
+            if (key.startsWith(`${iterStr2}.`) && key.length > iterStr2.length + 1) {
+              const propName = key.slice(iterStr2.length + 1);
+              if (propName && !propName.includes(".")) knownProps.add(propName);
+            }
+          }
+          if (knownProps.size > 0) {
+            if (!ctx._forInEnumeration) ctx._forInEnumeration = /* @__PURE__ */ new Map();
+            ctx._forInEnumeration.set(forInVarName, { sourceName: iterStr2, properties: [...knownProps] });
+          }
+        }
+      }
       if (node.left.type === "VariableDeclaration") {
-        for (const decl of node.left.declarations) assignToPattern(decl.id, TaintSet.empty(), env, ctx);
+        for (const decl of node.left.declarations) assignToPattern(decl.id, keyTaint, env, ctx);
       } else {
-        assignToPattern(node.left, TaintSet.empty(), env, ctx);
+        assignToPattern(node.left, keyTaint, env, ctx);
       }
       return;
     }
@@ -48794,12 +49845,12 @@ ${rootStack}`;
     const sinkExpr = `${objName}.${propName}`;
     if (tag === "script") {
       if (propName === "src" || propName === "textContent" || propName === "text") {
-        ctx.findings.push({
-          type: "Script Injection",
+        pushFinding(ctx, {
+          type: "XSS",
           severity: "critical",
-          title: `Script Injection: tainted data flows to script element ${propName}`,
+          title: `XSS: tainted data flows to script element ${propName}`,
           sink: makeSinkInfo(sinkExpr, ctx, loc),
-          source: formatSources(rhsTaint),
+          source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
           path: buildTaintPath(rhsTaint, sinkExpr)
         });
       }
@@ -48809,12 +49860,12 @@ ${rootStack}`;
       if (propName === "src" || tag === "object" && propName === "data") {
         const sinkInfo = { navigation: true, type: "XSS" };
         const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
-        ctx.findings.push({
+        pushFinding(ctx, {
           type,
           severity: getSeverity(type),
           title: `${type}: tainted data flows to ${tag} element ${propName}`,
           sink: makeSinkInfo(sinkExpr, ctx, loc),
-          source: formatSources(rhsTaint),
+          source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
           path: buildTaintPath(rhsTaint, sinkExpr)
         });
       }
@@ -48823,12 +49874,12 @@ ${rootStack}`;
     if ((tag === "a" || tag === "area") && propName === "href") {
       const sinkInfo = { navigation: true, type: "XSS" };
       const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
-      ctx.findings.push({
+      pushFinding(ctx, {
         type,
         severity: getSeverity(type),
         title: `${type}: tainted data flows to ${tag} element ${propName}`,
         sink: makeSinkInfo(sinkExpr, ctx, loc),
-        source: formatSources(rhsTaint),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
         path: buildTaintPath(rhsTaint, sinkExpr)
       });
       return;
@@ -48836,6 +49887,19 @@ ${rootStack}`;
   }
   function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
     if (!rhsTaint.tainted) return;
+    if (leftNode.type === "MemberExpression" && !leftNode.computed && leftNode.object?.type === "MemberExpression" && !leftNode.object.computed && leftNode.object.property?.name === "style") {
+      const loc2 = getNodeLoc(leftNode);
+      const leftStr2 = nodeToString(leftNode);
+      pushFinding(ctx, {
+        type: "CSS Injection",
+        severity: "high",
+        title: `CSS Injection: tainted data flows to ${leftStr2 || "element.style"}`,
+        sink: makeSinkInfo(leftStr2 || "element.style", ctx, loc2),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+        path: buildTaintPath(rhsTaint, leftStr2 || "element.style")
+      });
+      return;
+    }
     const leftStr = nodeToString(leftNode);
     let propName = null;
     if (leftNode.type === "MemberExpression" || leftNode.type === "OptionalMemberExpression") {
@@ -48875,12 +49939,12 @@ ${rootStack}`;
     const type = classifyNavigationType(sinkInfo, env, rhsNode, ctx);
     const severity = getSeverity(type);
     const loc = getNodeLoc(leftNode);
-    ctx.findings.push({
+    pushFinding(ctx, {
       type,
       severity,
       title: `${type}: tainted data flows to ${leftStr || propName}`,
       sink: makeSinkInfo(leftStr || propName, ctx, loc),
-      source: formatSources(rhsTaint),
+      source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
       path: buildTaintPath(rhsTaint, leftStr || propName)
     });
   }
@@ -48912,32 +49976,30 @@ ${rootStack}`;
       const type = classifyNavigationType(sinkInfo, env, callNode.arguments[argIdx], ctx);
       const severity = getSeverity(type);
       const loc = getNodeLoc(callNode);
-      ctx.findings.push({
+      pushFinding(ctx, {
         type,
         severity,
         title: `${type}: tainted data flows to ${calleeStr}()`,
         sink: makeSinkInfo(`${calleeStr}(arg${argIdx})`, ctx, loc),
-        source: formatSources(argTaint),
+        source: formatSources(annotateSinkSteps(argTaint, ctx)),
         path: buildTaintPath(argTaint, calleeStr)
       });
     }
   }
-  function checkPrototypePollution(node, env, ctx) {
+  function checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, outerKeyTaint) {
     if (node.type !== "AssignmentExpression") return;
     const left = node.left;
     if (left.type !== "MemberExpression") return;
     if (left.computed && left.object.type === "MemberExpression" && left.object.computed) {
-      const outerKey = evaluateExpr(left.object.property, env, ctx);
-      const innerKey = evaluateExpr(left.property, env, ctx);
-      if (outerKey.tainted && innerKey.tainted) {
+      if (outerKeyTaint.tainted && keyTaint.tainted) {
         const loc = getNodeLoc(node);
-        ctx.findings.push({
+        pushFinding(ctx, {
           type: "Prototype Pollution",
           severity: "critical",
           title: "Prototype Pollution: attacker controls nested property keys",
           sink: makeSinkInfo(nodeToString(left) || "obj[key1][key2]", ctx, loc),
-          source: formatSources(outerKey.clone().merge(innerKey)),
-          path: buildTaintPath(outerKey.clone().merge(innerKey), "obj[key1][key2]")
+          source: formatSources(outerKeyTaint.clone().merge(keyTaint)),
+          path: buildTaintPath(outerKeyTaint.clone().merge(keyTaint), "obj[key1][key2]")
         });
       }
     }
@@ -48946,14 +50008,12 @@ ${rootStack}`;
       if (objProp === "__proto__" || objProp === "prototype") {
         const assignedProp = !left.computed && left.property?.name;
         if (assignedProp === "constructor") return;
-        const rhsTaint = evaluateExpr(node.right, env, ctx);
-        const keyTaint = left.computed ? evaluateExpr(left.property, env, ctx) : TaintSet.empty();
         const combinedTaint = rhsTaint.tainted ? rhsTaint : keyTaint;
         if (combinedTaint.tainted) {
           const loc = getNodeLoc(node);
           const expr = nodeToString(left) || `obj.${objProp}.prop`;
           const title = keyTaint.tainted ? `Prototype Pollution: attacker controls property key on ${objProp}` : `Prototype Pollution: tainted data assigned to ${objProp}`;
-          ctx.findings.push({
+          pushFinding(ctx, {
             type: "Prototype Pollution",
             severity: "critical",
             title,
@@ -48965,11 +50025,10 @@ ${rootStack}`;
       }
     }
     if (left.computed && left.object?.type === "MemberExpression" && !left.object.computed && left.object.property?.name === "prototype" && left.object.object?.type === "MemberExpression" && !left.object.object.computed && left.object.object.property?.name === "constructor") {
-      const keyTaint = evaluateExpr(left.property, env, ctx);
       if (keyTaint.tainted) {
         const loc = getNodeLoc(node);
         const expr = nodeToString(left) || "obj.constructor.prototype[key]";
-        ctx.findings.push({
+        pushFinding(ctx, {
           type: "Prototype Pollution",
           severity: "critical",
           title: "Prototype Pollution: attacker controls property key on constructor.prototype",
@@ -48980,17 +50039,30 @@ ${rootStack}`;
       }
     }
     if (!left.computed && left.property?.name === "__proto__") {
-      const rhsTaint = evaluateExpr(node.right, env, ctx);
       if (rhsTaint.tainted) {
         const loc = getNodeLoc(node);
         const expr = nodeToString(left) || "obj.__proto__";
-        ctx.findings.push({
+        pushFinding(ctx, {
           type: "Prototype Pollution",
           severity: "critical",
           title: "Prototype Pollution: tainted data assigned to __proto__",
           sink: makeSinkInfo(expr, ctx, loc),
-          source: formatSources(rhsTaint),
+          source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
           path: buildTaintPath(rhsTaint, expr)
+        });
+      }
+    }
+    if (left.computed && !(left.object.type === "MemberExpression" && left.object.computed)) {
+      if (keyTaint.tainted && rhsTaint.tainted) {
+        const loc = getNodeLoc(node);
+        const objStr = nodeToString(left.object) || "obj";
+        pushFinding(ctx, {
+          type: "Prototype Pollution",
+          severity: "high",
+          title: "Prototype Pollution: attacker controls property key and value in assignment",
+          sink: makeSinkInfo(`${objStr}[taintedKey]`, ctx, loc),
+          source: formatSources(keyTaint.clone().merge(rhsTaint)),
+          path: buildTaintPath(keyTaint, `${objStr}[taintedKey]`)
         });
       }
     }
@@ -49001,9 +50073,11 @@ ${rootStack}`;
   function sinkPayload(sinkExpr, findingType) {
     if (findingType === "Prototype Pollution") return '{"__proto__":{"polluted":true}}';
     if (findingType === "CSS Injection") return "color:red;background:url(//attacker.com/steal)";
-    if (findingType === "Open Redirect") return "https://attacker.com/phish";
-    if (findingType === "Script Injection") return "https://attacker.com/xss.js";
+    if (findingType === "Open Redirect") return "https://evil.com/phish";
     const s = sinkExpr || "";
+    if (/\bimport\b/i.test(s)) return "data:text/javascript,alert(1)";
+    if (/Worker/i.test(s)) return "data:text/javascript,alert(1)";
+    if (/\.src\b/i.test(s)) return "data:text/javascript,alert(1)";
     if (/\blocation\b|\.href|\.assign|\.replace|window\.open/i.test(s)) return "javascript:alert(1)";
     if (/\beval\b|\bFunction\b|\bsetTimeout\b|\bsetInterval\b/i.test(s)) return "alert(1)";
     if (/setAttribute.*on\w+/i.test(s)) return "alert(1)";
@@ -49219,13 +50293,69 @@ w.location = ${JSON.stringify(page)};
       case "url.hashchange":
         return { vector: `location.hash = ${JSON.stringify("#" + value)}`, description: "Trigger hashchange event with crafted hash" };
       case "url.document.referrer":
-        return { vector: `// Navigate from: https://attacker.com/redirect?to=${encodeURIComponent(page)}
+        return { vector: `// Navigate from: https://evil.com/redirect?to=${encodeURIComponent(page)}
 // Referrer header will contain attacker-controlled URL`, description: "Control document.referrer via navigation from attacker page" };
       case "url.constructed":
         return { vector: `new URL(${JSON.stringify(value)})`, description: "Constructed URL object carries taint from input" };
       default:
         return { vector: value, description: `Inject via ${sourceType}` };
     }
+  }
+  function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
+    const page = "https://victim.com/page";
+    const storeSteps = stateSteps.filter((s) => s.action === "store");
+    const sinkSteps = stateSteps.filter((s) => s.action === "sink");
+    if (storeSteps.length === 0) return null;
+    const isPostMessage = sourceType.startsWith("postMessage");
+    if (!isPostMessage) return null;
+    const lines = [];
+    lines.push(`// Multi-step PoC \u2014 ${storeSteps.length + sinkSteps.length} message(s) required`);
+    lines.push(`var w = window.open(${JSON.stringify(page)});`);
+    let delay = 1e3;
+    for (let i = 0; i < storeSteps.length; i++) {
+      const store = storeSteps[i];
+      const msgObj = {};
+      if (store.condition) {
+        if (store.condition.negated) {
+          msgObj[store.condition.propName] = `not_${store.condition.value}`;
+        } else {
+          msgObj[store.condition.propName] = store.condition.value;
+        }
+      }
+      const dataProps = propertyChain.filter((p) => p !== "data");
+      if (dataProps.length > 0) {
+        msgObj[dataProps[dataProps.length - 1]] = rawInput;
+      } else if (!store.condition) {
+        msgObj._raw = rawInput;
+      }
+      const msgData = msgObj._raw !== void 0 ? JSON.stringify(msgObj._raw) : JSON.stringify(msgObj);
+      const condDesc = store.condition ? store.condition.negated ? `${store.condition.discriminant} !== ${JSON.stringify(store.condition.value)}` : `${store.condition.discriminant} === ${JSON.stringify(store.condition.value)}` : "handler";
+      lines.push(`// Step ${i + 1}: store payload via ${condDesc}`);
+      lines.push(`setTimeout(() => w.postMessage(${msgData}, '*'), ${delay});`);
+      delay += 1e3;
+    }
+    for (let i = 0; i < sinkSteps.length; i++) {
+      const sink = sinkSteps[i];
+      if (sink.handler === "timer") {
+        const timerDelay = sink.delay || 0;
+        lines.push(`// Step ${storeSteps.length + i + 1}: wait ${timerDelay}ms for timer callback to fire and trigger sink`);
+      } else if (sink.condition) {
+        const triggerObj = {};
+        if (sink.condition.negated) {
+          triggerObj[sink.condition.propName] = `not_${sink.condition.value}`;
+        } else {
+          triggerObj[sink.condition.propName] = sink.condition.value;
+        }
+        const condDesc = sink.condition.negated ? `${sink.condition.discriminant} !== ${JSON.stringify(sink.condition.value)}` : `${sink.condition.discriminant} === ${JSON.stringify(sink.condition.value)}`;
+        lines.push(`// Step ${storeSteps.length + i + 1}: trigger sink via ${condDesc}`);
+        lines.push(`setTimeout(() => w.postMessage(${JSON.stringify(triggerObj)}, '*'), ${delay});`);
+        delay += 1e3;
+      }
+    }
+    return {
+      vector: lines.join("\n"),
+      description: `Send ${storeSteps.length + sinkSteps.filter((s) => s.handler !== "timer").length} sequential postMessage(s) to trigger ${storeSteps.length > 0 ? "multi-step " : ""}exploit`
+    };
   }
   var SOURCE_PREFIX_CHAR = {
     "url.location.hash": "#",
@@ -49264,6 +50394,20 @@ w.location = ${JSON.stringify(page)};
     let effectiveSourceType = primarySource.type;
     if (getParamName && (primarySource.type === "url.location.search" || primarySource.type === "url.location.href")) {
       effectiveSourceType = "url.searchParam";
+    }
+    const stateSteps = primarySource.stateSteps;
+    if (stateSteps && stateSteps.length > 0) {
+      const multiStep = buildMultiStepVector(stateSteps, propertyChain, rawInput, effectiveSourceType);
+      if (multiStep) {
+        return {
+          payload,
+          input: rawInput,
+          vector: multiStep.vector,
+          description: multiStep.description,
+          steps,
+          transforms
+        };
+      }
     }
     const delivery = wrapDelivery(effectiveSourceType, rawInput, null, primarySource.sourceKey || getParamName, propertyChain);
     return {
@@ -49314,6 +50458,7 @@ w.location = ${JSON.stringify(page)};
       this.pendingAnalysis = null;
       this.findings = [];
       this.analyzedHashes = /* @__PURE__ */ new Set();
+      this.domCatalog = null;
     }
     addScript(scriptInfo) {
       if (this.analyzedHashes.has(scriptInfo.hash)) return false;
@@ -49597,6 +50742,9 @@ w.location = ${JSON.stringify(page)};
       case "analyzeHTML":
         handleHTML(msg.tabId, msg.origin, msg.pageUrl, msg.html);
         break;
+      case "domCatalog":
+        handleDOMCatalog(msg.tabId, msg.origin, msg.pageUrl, msg.catalog);
+        break;
       case "resetPage":
         moduleGraph.resetPage(msg.tabId);
         break;
@@ -49653,10 +50801,27 @@ w.location = ${JSON.stringify(page)};
     }
     scheduleCrossFileAnalysis(tabId);
   }
+  function handleDOMCatalog(tabId, origin, pageUrl, catalog) {
+    const page = moduleGraph.getPage(tabId);
+    page.origin = origin;
+    page.pageUrl = pageUrl;
+    if (catalog && catalog.elements) {
+      if (Array.isArray(catalog.elements)) {
+        catalog.elements = new Map(catalog.elements);
+      } else if (!(catalog.elements instanceof Map)) {
+        catalog.elements = new Map(Object.entries(catalog.elements));
+      }
+    }
+    page.domCatalog = catalog;
+  }
   async function handleHTML(tabId, origin, pageUrl, html) {
     const page = moduleGraph.getPage(tabId);
     page.origin = origin;
     page.pageUrl = pageUrl;
+    if (!page.domCatalog) {
+      const catalog = extractDOMCatalogFromHTML(html.source);
+      if (catalog) page.domCatalog = catalog;
+    }
     const handlers = extractEventHandlers(html.source, html.url);
     const allFindings = [];
     for (const handler of handlers) {
@@ -49706,7 +50871,7 @@ w.location = ${JSON.stringify(page)};
     }
     const env = isModule ? importEnv : pageCtx.globalEnv.child();
     const cfg = buildCFG(ast.program);
-    const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker);
+    const findings = analyzeCFG(cfg, env, file, funcMap, pageCtx.globalEnv, scopeInfo, isWorker, pageCtx.domCatalog);
     if (!isModule) {
       pageCtx.globalEnv.replaceFrom(env);
     }
@@ -49833,6 +50998,22 @@ w.location = ${JSON.stringify(page)};
         postFindings(tabId, novel);
       }
     }
+  }
+  function extractDOMCatalogFromHTML(html) {
+    const elements = /* @__PURE__ */ new Map();
+    const tagRe = /<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>/g;
+    let m;
+    while ((m = tagRe.exec(html)) !== null) {
+      const tag = m[1].toLowerCase();
+      const attrs = m[2];
+      const idMatch = attrs.match(/\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))/i);
+      if (idMatch) {
+        const id = idMatch[1] ?? idMatch[2] ?? idMatch[3];
+        if (id) elements.set(id, tag);
+      }
+    }
+    if (elements.size === 0) return null;
+    return { elements };
   }
   function extractEventHandlers(html, url) {
     const handlers = [];

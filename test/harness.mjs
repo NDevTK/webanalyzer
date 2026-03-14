@@ -19,7 +19,7 @@ const BABEL_PLUGINS = [
 const WALK_SKIP_KEYS = new Set(['loc', 'start', 'end', 'leadingComments', 'trailingComments', 'innerComments', '_closureEnv']);
 
 // Analyze a single JS source string, return findings
-export function analyze(source, { file = 'test.js', isModule = false, globalEnv = null } = {}) {
+export function analyze(source, { file = 'test.js', isModule = false, globalEnv = null, domCatalog = null } = {}) {
   const ast = parse(source, {
     sourceType: isModule ? 'module' : 'script',
     plugins: BABEL_PLUGINS,
@@ -37,9 +37,7 @@ export function analyze(source, { file = 'test.js', isModule = false, globalEnv 
   const env = globalEnv ? globalEnv.child() : new TaintEnv();
 
   const cfg = buildCFG(ast.program);
-  const findings = analyzeCFG(cfg, env, file, funcMap, globalEnv || new TaintEnv(), scopeInfo);
-
-  // Also scan for prototype pollution (skip — already detected during analyzeCFG via processAssignment)
+  const findings = analyzeCFG(cfg, env, file, funcMap, globalEnv || new TaintEnv(), scopeInfo, false, domCatalog);
 
   // Generate PoCs for all findings (same as worker/index.js postFindings)
   for (const f of findings) {
@@ -50,7 +48,7 @@ export function analyze(source, { file = 'test.js', isModule = false, globalEnv 
 }
 
 // Analyze multiple scripts in order (shared global scope)
-export function analyzeMultiple(scripts) {
+export function analyzeMultiple(scripts, { domCatalog = null } = {}) {
   const globalEnv = new TaintEnv();
   const globalFuncMap = new Map();
   const allFindings = [];
@@ -73,7 +71,7 @@ export function analyzeMultiple(scripts) {
     const env = globalEnv.child();
 
     const cfg = buildCFG(ast.program);
-    const findings = analyzeCFG(cfg, env, file || 'test.js', funcMap, globalEnv, scopeInfo);
+    const findings = analyzeCFG(cfg, env, file || 'test.js', funcMap, globalEnv, scopeInfo, false, domCatalog);
     allFindings.push(...findings);
 
     globalEnv.replaceFrom(env);
@@ -104,4 +102,3 @@ function walkAST(node, visitor) {
     }
   }
 }
-

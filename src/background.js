@@ -112,6 +112,7 @@ async function attachToTab(tabId, url) {
   await chrome.debugger.sendCommand({ tabId }, 'Debugger.enable');
   await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
   await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
+  await chrome.debugger.sendCommand({ tabId }, 'DOM.enable').catch(() => {});
   await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable').catch(() => {});
 
   updateBadge(tabId);
@@ -147,6 +148,8 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
     if ((type === 'worker' || type === 'service_worker' || type === 'shared_worker') && params.sessionId) {
       tabState.workerSessions.add(params.sessionId);
     }
+  } else if (method === 'Page.loadEventFired') {
+    extractDOMCatalog(tabId, tabState).catch(() => {});
   }
 });
 
@@ -219,6 +222,70 @@ async function handleNetworkResponse(tabId, tabState, params) {
     origin: tabState.origin,
     pageUrl: tabState.pageUrl,
     html: { source: body, url: response.url, hash },
+  });
+}
+
+// ── DOM catalog extraction via Debugger API ──
+async function extractDOMCatalog(tabId, tabState) {
+  let doc;
+  try {
+    doc = await chrome.debugger.sendCommand(
+      { tabId }, 'DOM.getFlattenedDocument', { depth: -1 }
+    );
+  } catch { return; }
+
+  if (!doc || !doc.nodes) return;
+
+  // Build element catalog: id → tag, name → tag
+  // Also detect DOM clobbering: form elements with named children
+  const elements = [];       // [id, tag] pairs
+  const clobberPaths = [];   // { id, tag, name?, formId? }
+  const nodeMap = new Map();  // nodeId → node for parent lookups
+
+  for (const node of doc.nodes) {
+    nodeMap.set(node.nodeId, node);
+    if (node.nodeType !== 1) continue; // Element nodes only
+    const tag = (node.nodeName || '').toLowerCase();
+    if (!tag) continue;
+
+    // Parse attributes array: [name1, val1, name2, val2, ...]
+    const attrs = node.attributes || [];
+    let id = null, name = null;
+    for (let i = 0; i < attrs.length; i += 2) {
+      if (attrs[i] === 'id') id = attrs[i + 1];
+      if (attrs[i] === 'name') name = attrs[i + 1];
+    }
+
+    // Elements with IDs become window globals
+    if (id) {
+      elements.push([id, tag]);
+    }
+
+    // Named elements inside forms create clobbering paths: form.name → element
+    if (name && node.parentId) {
+      const parent = nodeMap.get(node.parentId);
+      if (parent && (parent.nodeName || '').toLowerCase() === 'form') {
+        const parentAttrs = parent.attributes || [];
+        let formId = null;
+        for (let i = 0; i < parentAttrs.length; i += 2) {
+          if (parentAttrs[i] === 'id') formId = parentAttrs[i + 1];
+        }
+        if (formId) {
+          clobberPaths.push({ id: formId, tag: 'form', name, childTag: tag });
+        }
+      }
+    }
+  }
+
+  if (elements.length === 0 && clobberPaths.length === 0) return;
+
+  await ensureOffscreen();
+  sendToOffscreen({
+    type: 'domCatalog',
+    tabId,
+    origin: tabState.origin,
+    pageUrl: tabState.pageUrl,
+    catalog: { elements, clobberPaths },
   });
 }
 

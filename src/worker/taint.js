@@ -380,11 +380,22 @@ class AnalysisContext {
     this.protoMethodMap = new Map(); // "ClassName" → [{methodName, funcNode}]
     this._findingKeys = new Set(); // dedup key set for findings (prevents duplicates from back-edge re-iteration)
     this._thisAliases = null; // Set<string> of variable names aliased to `this` (e.g., var a = this)
+    this.domCatalog = null; // DOM catalog from HTML parsing: { elements: Map<id,tag>, inlineHandlers: [], clobberPaths: [] }
   }
 }
 
 // Push a finding with deduplication (prevents duplicates from event handler back-edge re-iteration)
 function pushFinding(ctx, finding) {
+  // Reclassify as DOM Clobbering if all sources are dom-clobbering
+  if (finding.source) {
+    const sources = Array.isArray(finding.source) ? finding.source : [finding.source];
+    const allClobber = sources.length > 0 && sources.every(s => s?.type === 'dom-clobbering');
+    if (allClobber) {
+      finding.type = 'DOM Clobbering';
+      finding.severity = 'high';
+      finding.title = `DOM Clobbering: ${finding.sink?.expression || 'element value'} controlled via named DOM element`;
+    }
+  }
   const key = `${finding.type}:${finding.sink?.expression}:${finding.sink?.file}:${finding.sink?.line}:${finding.sink?.col}`;
   if (!ctx._findingKeys) ctx._findingKeys = new Set();
   if (ctx._findingKeys.has(key)) return;
@@ -410,11 +421,38 @@ function resolveId(node, ctx) {
 }
 
 // ── Main entry: analyze a CFG with initial taint environment ──
-export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker) {
+export function analyzeCFG(cfg, env, file, funcMap, globalEnv, scopeInfo, isWorker, domCatalog) {
   const findings = [];
   const _originalFuncMap = funcMap instanceof Map ? funcMap : null;
   const ctx = new AnalysisContext(file, funcMap, findings, globalEnv || new TaintEnv(), scopeInfo);
   ctx.isWorker = !!isWorker;
+
+  // Seed element type tracking from DOM catalog (HTML-parsed element IDs and tags)
+  if (domCatalog) {
+    ctx.domCatalog = domCatalog;
+    if (domCatalog.elements) {
+      for (const [id, tag] of domCatalog.elements) {
+        ctx.elementTypes.set(id, tag);
+        ctx.elementTypes.set(`global:${id}`, tag);
+        ctx.domAttached.add(id);
+        ctx.domAttached.add(`global:${id}`);
+        if (tag === 'script') {
+          ctx.scriptElements.add(id);
+          ctx.scriptElements.add(`global:${id}`);
+        }
+      }
+    }
+    // Seed clobber paths: form.childName → child element type
+    if (domCatalog.clobberPaths) {
+      for (const cp of domCatalog.clobberPaths) {
+        // cp = { id, tag, name, childTag }
+        // form#id → id.name resolves to childTag element
+        const key = `${cp.id}.${cp.name}`;
+        ctx.elementTypes.set(key, cp.childTag);
+        ctx.domAttached.add(key);
+      }
+    }
+  }
 
   const blockEnvs = new Map();
   blockEnvs.set(cfg.entry.id, env.clone());
@@ -1508,7 +1546,7 @@ const VALID_HTML_TAGS = new Set(['a','abbr','address','area','article','aside','
   'strong','style','sub','summary','sup','table','tbody','td','template','textarea','tfoot','th',
   'thead','time','title','tr','track','u','ul','var','video','wbr']);
 
-function getDOMQueryInfo(node, env) {
+function getDOMQueryInfo(node, env, ctx) {
   if (node.type !== 'CallExpression') return null;
   const callee = node.callee;
   if (!callee || callee.type !== 'MemberExpression' || callee.computed) return null;
@@ -1533,8 +1571,19 @@ function getDOMQueryInfo(node, env) {
         const t = m[1].toLowerCase();
         if (VALID_HTML_TAGS.has(t)) tag = t;
       }
+      // Also try DOM catalog: querySelector('#myId') → look up ID
+      if (!tag && ctx?.domCatalog?.elements) {
+        const idMatch = selector.match(/^#([a-zA-Z_][a-zA-Z0-9_-]*)/);
+        if (idMatch && ctx.domCatalog.elements.has(idMatch[1])) {
+          tag = ctx.domCatalog.elements.get(idMatch[1]);
+        }
+      }
+    } else if (method === 'getElementById') {
+      // Look up element ID in DOM catalog
+      if (ctx?.domCatalog?.elements?.has(selector)) {
+        tag = ctx.domCatalog.elements.get(selector);
+      }
     }
-    // getElementById / getElementsByClassName → can't determine tag from args
   }
   return { method, tag, isDomAttached: true };
 }
@@ -1771,7 +1820,7 @@ function processVarDeclarator(node, env, ctx) {
       }
     }
     // Track DOM query results: querySelector, getElementById, etc.
-    const domInfo = getDOMQueryInfo(node.init, env);
+    const domInfo = getDOMQueryInfo(node.init, env, ctx);
     if (domInfo) {
       const key = resolveId(node.id, ctx);
       if (domInfo.isDomAttached) {
@@ -1784,6 +1833,26 @@ function processVarDeclarator(node, env, ctx) {
         if (domInfo.tag === 'script') {
           ctx.scriptElements.add(key);
           ctx.scriptElements.add(node.id.name);
+        }
+      }
+    }
+    // Propagate element type from member access (e.g. var x = myform.child where myform.child is in elementTypes)
+    if (!tag && !domInfo?.tag && node.init?.type === 'MemberExpression') {
+      const initStr = nodeToString(node.init);
+      if (initStr) {
+        const inheritedTag = ctx.elementTypes.get(initStr);
+        if (inheritedTag) {
+          const key = resolveId(node.id, ctx);
+          ctx.elementTypes.set(key, inheritedTag);
+          ctx.elementTypes.set(node.id.name, inheritedTag);
+          if (ctx.domAttached.has(initStr)) {
+            ctx.domAttached.add(key);
+            ctx.domAttached.add(node.id.name);
+          }
+          if (inheritedTag === 'script') {
+            ctx.scriptElements.add(key);
+            ctx.scriptElements.add(node.id.name);
+          }
         }
       }
     }
@@ -2124,7 +2193,7 @@ function processAssignment(node, env, ctx) {
       }
     }
     // Track DOM query results in assignments
-    const domInfo = getDOMQueryInfo(node.right, env);
+    const domInfo = getDOMQueryInfo(node.right, env, ctx);
     if (domInfo) {
       const key = resolveId(node.left, ctx);
       if (domInfo.isDomAttached) {
@@ -2990,6 +3059,18 @@ export function evaluateExpr(node, env, ctx) {
             if (key !== _n.name && _e.has(key)) { V.push(TaintSet.empty()); break; }
             const globalTaint = _e.get(`global:${_n.name}`);
             if (globalTaint.tainted) { V.push(globalTaint.clone()); break; }
+            // DOM clobbering: bare identifier matching a DOM catalog element ID
+            // with no JS declaration → attacker-controlled if they can inject HTML
+            if (_c.domCatalog?.elements?.has(_n.name) && !_e.has(key)) {
+              const loc = getNodeLoc(_n);
+              const clobberLabel = new TaintLabel('dom-clobbering', _c.file,
+                loc?.line || 0, loc?.col || 0,
+                `DOM element #${_n.name} (${_c.domCatalog.elements.get(_n.name)}) used as value`);
+              const ts = new TaintSet();
+              ts.add(clobberLabel);
+              V.push(ts);
+              break;
+            }
             V.push(TaintSet.empty());
             break;
           }
