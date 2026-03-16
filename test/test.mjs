@@ -45346,17 +45346,17 @@ if (jquery331 && jquery350) {
 
   test('CVE-2019-11358: jQuery 3.3.1 $.extend(true, {}, tainted) → PP detected', () => {
     const findings = analyzeMultiple([
-      { source: jquery331, file: 'jquery.min.js' },
+      { source: jquery331, file: 'jquery-3.3.1.min.js' },
       { source: ppBootstrap, file: 'app.js' },
     ]);
     expect(findings).toHaveType('Prototype Pollution');
     // Pin: finding at a[t]=r inside $.extend deep copy loop
-    expect(findings).toHaveFingerprint('jquery.min.js:2:2087:a[taintedKey]');
+    expect(findings).toHaveFingerprint('jquery-3.3.1.min.js:2:2087:a[taintedKey]');
   });
 
   test('CVE-2019-11358: jQuery 3.5.0 $.extend(true, {}, tainted) → PP patched (guard recognized)', () => {
     const findings = analyzeMultiple([
-      { source: jquery350, file: 'jquery.min.js' },
+      { source: jquery350, file: 'jquery-3.5.0.min.js' },
       { source: ppBootstrap, file: 'app.js' },
     ]);
     expect(findings).notToHaveType('Prototype Pollution');
@@ -45391,10 +45391,12 @@ if (jquery341 && jquery350) {
 
   test('CVE-2020-11022: jQuery 3.4.1 .html(tainted) → XSS detected', () => {
     const findings = analyzeMultiple([
-      { source: jquery341, file: 'jquery.min.js' },
+      { source: jquery341, file: 'jquery-3.4.1.min.js' },
       { source: xssBootstrap, file: 'app.js' },
     ]);
     expect(findings).toHaveType('XSS');
+    // Pin: finding at innerHTML assignment inside jQuery's .html() implementation
+    expect(findings).toHaveFingerprint('jquery-3.4.1.min.js:2:38301:a.innerHTML');
   });
 
   // jQuery 3.4.1 standalone: 0 FP
@@ -45405,7 +45407,7 @@ if (jquery341 && jquery350) {
 
   test('CVE-2020-11022: jQuery 3.4.1 .append(tainted) → XSS detected', () => {
     const findings = analyzeMultiple([
-      { source: jquery341, file: 'jquery.min.js' },
+      { source: jquery341, file: 'jquery-3.4.1.min.js' },
       { source: `jQuery("#output").append(location.hash);`, file: 'app.js' },
     ]);
     expect(findings).toHaveType('XSS');
@@ -45437,20 +45439,24 @@ if (lodash41711 && lodash41712) {
 
   test('CVE-2019-10744: Lodash 4.17.11 + _.merge(attacker input) → Prototype Pollution detected', () => {
     const findings = analyzeMultiple([
-      { source: lodash41711, file: 'lodash.js' },
+      { source: lodash41711, file: 'lodash-4.17.11.min.js' },
       { source: lodashMergeBootstrap, file: 'app.js' },
     ]);
     const pp = findings.filter(f => f.type === 'Prototype Pollution');
     expect(pp).toHaveAtLeast(1);
+    // Pin: finding at n[t]=r inside baseAssignValue (recursive merge context)
+    expect(findings).toHaveFingerprint('lodash-4.17.11.min.js:23:410:n[taintedKey]');
   });
 
   test('CVE-2019-10744: Lodash 4.17.12 + _.merge(attacker input) → no findings (patched)', () => {
     const findings = analyzeMultiple([
-      { source: lodash41712, file: 'lodash.js' },
+      { source: lodash41712, file: 'lodash-4.17.12.min.js' },
       { source: lodashMergeBootstrap, file: 'app.js' },
     ]);
     const pp = findings.filter(f => f.type === 'Prototype Pollution');
     expect(pp).toBeEmpty();
+    // Verify no findings at the baseAssignValue location either
+    expect(findings).notToHaveFingerprint('lodash-4.17.12.min.js:23:410:n[taintedKey]');
   });
 } else {
   console.log('  SKIP  CVE-2019-10744 tests (download lodash-4.17.11.min.js and lodash-4.17.12.min.js to test/cve/)');
