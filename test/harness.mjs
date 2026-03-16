@@ -61,6 +61,20 @@ export function analyzeMultiple(scripts, { domCatalog = null } = {}) {
       allowReturnOutsideFunction: true,
     });
 
+    // Tag all AST nodes with their source file for correct finding attribution
+    // when interprocedural analysis crosses file boundaries.
+    const srcFile = file || 'test.js';
+    (function tagFile(node) {
+      if (!node || typeof node !== 'object') return;
+      if (node.type) node._sourceFile = srcFile;
+      for (const key of Object.keys(node)) {
+        if (key === 'leadingComments' || key === 'trailingComments' || key === 'innerComments' || key === '_sourceFile') continue;
+        const child = node[key];
+        if (Array.isArray(child)) { for (const c of child) { if (c && typeof c === 'object' && c.type) tagFile(c); } }
+        else if (child && typeof child === 'object' && child.type) tagFile(child);
+      }
+    })(ast);
+
     let scopeInfo = null;
     try { scopeInfo = buildScopeInfo(ast); } catch {}
 

@@ -9,6 +9,7 @@ import {
   EVENT_SOURCES, MEMBER_SOURCES,
 } from './sources-sinks.js';
 import { buildCFG } from './cfg.js';
+import { parse as babelParse } from '@babel/parser';
 
 // ── Taint label: tracks where taint originated ──
 const _NO_TRANSFORMS = [];
@@ -22,6 +23,7 @@ export class TaintLabel {
     this.transforms = transforms || _NO_TRANSFORMS;
     this.sourceKey = sourceKey || null; // actual param/key name from the source call
     this.stateSteps = null; // array of {action, handler, variable, delay} for multi-step PoCs
+    this.constraints = null; // array of {variable, op, value} — path conditions this taint flows through
   }
 
   get id() {
@@ -33,6 +35,7 @@ export class TaintLabel {
       this.transforms === _NO_TRANSFORMS ? [op] : [...this.transforms, op]);
     l.sourceKey = this.sourceKey;
     l.stateSteps = this.stateSteps;
+    l.constraints = this.constraints;
     return l;
   }
 
@@ -41,6 +44,18 @@ export class TaintLabel {
       this.transforms === _NO_TRANSFORMS ? [] : [...this.transforms]);
     l.sourceKey = this.sourceKey;
     l.stateSteps = this.stateSteps ? [...this.stateSteps, step] : [step];
+    l.constraints = this.constraints;
+    return l;
+  }
+
+  // Add a path constraint: {variable, op, value}
+  // op can be: '!==', '!=', '===', '==', 'typeof', 'typeof!='
+  withConstraint(constraint) {
+    const l = new TaintLabel(this.sourceType, this.file, this.line, this.col, this.description,
+      this.transforms === _NO_TRANSFORMS ? [] : [...this.transforms]);
+    l.sourceKey = this.sourceKey;
+    l.stateSteps = this.stateSteps;
+    l.constraints = this.constraints ? [...this.constraints, constraint] : [constraint];
     return l;
   }
 }
@@ -65,7 +80,19 @@ export class TaintSet {
   merge(other) {
     if (!other || other.labels === null || other.labels.size === 0) return this;
     if (this.labels === null) this.labels = new Map();
-    for (const [id, label] of other.labels) this.labels.set(id, label);
+    for (const [id, label] of other.labels) {
+      const existing = this.labels.get(id);
+      if (!existing) {
+        this.labels.set(id, label);
+      } else {
+        // Same source on two paths: one may have constraints, the other not.
+        // An unconstrained label means taint flows unconditionally on that path.
+        // Keep the LESS constrained version — the attacker picks the easier path.
+        const existingCount = existing.constraints?.length || 0;
+        const newCount = label.constraints?.length || 0;
+        if (newCount < existingCount) this.labels.set(id, label);
+      }
+    }
     return this;
   }
 
@@ -108,6 +135,17 @@ export class TaintSet {
     const newLabels = new Map();
     for (const [id, label] of this.labels) {
       const nl = label.addStateStep(step);
+      newLabels.set(nl.id, nl);
+    }
+    return new TaintSet(newLabels);
+  }
+
+  // Create a new TaintSet with a constraint appended to all labels
+  withConstraint(constraint) {
+    if (this.labels === null || this.labels.size === 0) return this;
+    const newLabels = new Map();
+    for (const [id, label] of this.labels) {
+      const nl = label.withConstraint(constraint);
       newLabels.set(nl.id, nl);
     }
     return new TaintSet(newLabels);
@@ -192,6 +230,10 @@ export class TaintEnv {
     this._base = null;       // shared read-only snapshot (Map<string, TaintSet> | null)
     this._own = new Map();   // writable overlay for modifications
     this.parent = parent || null;
+    // Path-sensitive: constraints active on this execution path (from branch conditions).
+    // Each entry is {variable, op, value}. Accumulated as blocks with branchConditions are entered.
+    // These propagate to return values so interprocedural callers know the return is conditional.
+    this._branchConstraints = [];
     // Path-sensitive: variables confirmed to have http/https URL scheme on this path
     this.schemeCheckedVars = new Set();
     // Track new URL(x) origins: urlVar → sourceVar (so checking url.protocol also validates sourceVar)
@@ -224,6 +266,17 @@ export class TaintEnv {
 
   child() { return new TaintEnv(this); }
 
+  // Walk the parent chain to find an alias (aliases don't need to be copied on child())
+  getAlias(name) {
+    let cur = this;
+    while (cur) {
+      const a = cur.aliases.get(name);
+      if (a !== undefined) return a;
+      cur = cur.parent;
+    }
+    return undefined;
+  }
+
   // Flatten _own overlay into _base, returning the merged snapshot.
   // O(0) when _own is empty (most common after clone), O(_own.size) otherwise.
   _flatten() {
@@ -243,6 +296,7 @@ export class TaintEnv {
     this._base = snapshot;
     this._own = new Map();
     env._base = snapshot;
+    env._branchConstraints = [...this._branchConstraints];
     env.schemeCheckedVars = new Set(this.schemeCheckedVars);
     env.urlConstructorOrigins = new Map(this.urlConstructorOrigins);
     env.aliases = new Map(this.aliases);
@@ -315,7 +369,7 @@ export class TaintEnv {
       if (!this.urlConstructorOrigins.has(k)) this.urlConstructorOrigins.set(k, v);
     }
     for (const [k, v] of other.aliases) {
-      if (!this.aliases.has(k)) this.aliases.set(k, v);
+      if (!this.aliases.has(k)) { this.aliases.set(k, v); changed = true; }
     }
     return changed;
   }
@@ -345,6 +399,22 @@ export class TaintEnv {
     while (env) {
       for (const [key, taint] of env.entries()) {
         if (key.startsWith(prefix) && taint.tainted && !results.has(key)) {
+          results.set(key, taint);
+        }
+      }
+      env = env.parent;
+    }
+    return results;
+  }
+
+  // Like getTaintedWithPrefix but returns ALL entries (including non-tainted).
+  // Used for per-index array propagation where clean entries matter for positioning.
+  getAllWithPrefix(prefix) {
+    const results = new Map();
+    let env = this;
+    while (env) {
+      for (const [key, taint] of env.entries()) {
+        if (key.startsWith(prefix) && !results.has(key)) {
           results.set(key, taint);
         }
       }
@@ -384,7 +454,10 @@ class AnalysisContext {
   }
 }
 
-// Push a finding with deduplication (prevents duplicates from event handler back-edge re-iteration)
+// Push a finding with deduplication and universal SMT satisfiability check.
+// Before emitting, checks if the constraints on the taint labels allow a
+// viable exploit. If constraints make the exploit unsatisfiable, the finding
+// is suppressed. This is the single code path for ALL finding types.
 function pushFinding(ctx, finding) {
   // Reclassify as DOM Clobbering if all sources are dom-clobbering
   if (finding.source) {
@@ -396,11 +469,151 @@ function pushFinding(ctx, finding) {
       finding.title = `DOM Clobbering: ${finding.sink?.expression || 'element value'} controlled via named DOM element`;
     }
   }
+  // Universal SMT check: collect constraints from all source labels
+  // and verify the exploit payload is satisfiable.
+  if (!_isFindingSatisfiable(finding)) {
+    if (globalThis._TAINT_DEBUG) {
+      console.log(`[SMT-SUPPRESS] ${finding.type}: ${finding.sink?.expression} — constraints make exploit unsatisfiable`);
+    }
+    return;
+  }
   const key = `${finding.type}:${finding.sink?.expression}:${finding.sink?.file}:${finding.sink?.line}:${finding.sink?.col}`;
   if (!ctx._findingKeys) ctx._findingKeys = new Set();
   if (ctx._findingKeys.has(key)) return;
   ctx._findingKeys.add(key);
   ctx.findings.push(finding);
+}
+
+// ── Danger set: property names with prototype-traversal semantics ──
+// Discovered from the JS runtime at load time, not hardcoded.
+// These are Object.prototype properties with setter accessors — assigning to
+// obj[key] where key is one of these triggers the accessor and modifies the
+// prototype chain (e.g., __proto__).
+const _PROTO_SETTER_KEYS = (() => {
+  const keys = [];
+  for (const k of Object.getOwnPropertyNames(Object.prototype)) {
+    const d = Object.getOwnPropertyDescriptor(Object.prototype, k);
+    if (d && d.set) keys.push(k);
+  }
+  return keys;
+})();
+
+// ── Universal constraint satisfiability solver ──
+// Type-agnostic: works the same for PP, XSS, Open Redirect, CSS Injection, etc.
+// Checks if the constraints on a finding's taint labels allow any dangerous value
+// to reach the sink. The danger set comes from the finding's sinkModel (if present).
+//
+// 1. Collect constraints from the finding's constraint source
+// 2. Check for internal contradictions (=== X and !== X on same variable)
+// 3. If finding has a sinkModel with a danger set, check if ANY value survives
+// 4. No sinkModel → infinite danger set → always satisfiable unless contradiction
+function _isFindingSatisfiable(finding) {
+  // Use sinkModel.constraintSource if provided (separates key vs value constraints),
+  // otherwise fall back to finding.source
+  const constraintSrc = finding.sinkModel?.constraintSource;
+  let constraints;
+  if (constraintSrc) {
+    // constraintSource is a TaintSet — extract constraints from its labels
+    constraints = [];
+    if (constraintSrc.tainted) {
+      for (const label of constraintSrc.toArray()) {
+        if (label.constraints) {
+          for (const c of label.constraints) constraints.push(c);
+        }
+      }
+    }
+  } else {
+    // Fall back to finding.source (formatted source objects)
+    const sources = finding.source;
+    if (!sources) return true;
+    const sourceArr = Array.isArray(sources) ? sources : [sources];
+    constraints = [];
+    for (const src of sourceArr) {
+      if (src.constraints) {
+        for (const c of src.constraints) constraints.push(c);
+      }
+    }
+  }
+  // Also collect constraints from valueConstraintSource (e.g., safeGet return constraints)
+  // These restrict which key values can produce tainted values.
+  const valSrc = finding.sinkModel?.valueConstraintSource;
+  if (valSrc && valSrc.tainted) {
+    for (const label of valSrc.toArray()) {
+      if (label.constraints) {
+        for (const c of label.constraints) constraints.push(c);
+      }
+    }
+  }
+
+  if (constraints.length === 0) return true;
+
+  // Check for internal contradictions: === X and !== X on the same variable
+  if (_hasContradiction(constraints)) return false;
+
+  // If the finding has a sink model with a finite danger set,
+  // check if ANY dangerous value is permitted by the constraints
+  if (finding.sinkModel?.dangerousValues) {
+    return _anyValuePermitted(finding.sinkModel.dangerousValues, constraints);
+  }
+
+  // No sink model → infinite danger set → satisfiable (constraints can't block everything)
+  return true;
+}
+
+// Check if at least one value from the danger set is NOT excluded by constraints.
+function _anyValuePermitted(dangerousValues, constraints) {
+  for (const val of dangerousValues) {
+    let permitted = true;
+    for (const c of constraints) {
+      if ((c.op === '!==' || c.op === '!=') && c.value === val) {
+        permitted = false;
+        break;
+      }
+    }
+    if (permitted) return true;
+  }
+  return false;
+}
+
+// Check if constraints contain a contradiction: same variable with === X and !== X.
+function _hasContradiction(constraints) {
+  const inclusions = new Map();
+  const exclusions = new Map();
+  for (const c of constraints) {
+    if (c.op === '===' || c.op === '==') {
+      if (!inclusions.has(c.variable)) inclusions.set(c.variable, new Set());
+      inclusions.get(c.variable).add(c.value);
+    }
+    if (c.op === '!==' || c.op === '!=') {
+      if (!exclusions.has(c.variable)) exclusions.set(c.variable, new Set());
+      exclusions.get(c.variable).add(c.value);
+    }
+  }
+  for (const [v, incl] of inclusions) {
+    const excl = exclusions.get(v);
+    if (excl) {
+      for (const val of incl) {
+        if (excl.has(val)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// ── Evaluate whether an AST node refers to a prototype object ──
+// Used by APIs that set own properties (Object.defineProperty, Reflect.defineProperty)
+// to determine if the target is a shared prototype. These APIs only cause PP when
+// the target IS a prototype — setting own properties on regular objects is safe.
+function _isPrototypeNode(node) {
+  if (!node) return false;
+  // Direct: X.prototype
+  if (node.type === 'MemberExpression' && !node.computed && node.property?.name === 'prototype') return true;
+  // Global: Object.prototype
+  if (node.type === 'MemberExpression' && !node.computed) {
+    const obj = node.object;
+    if (obj.type === 'Identifier' && node.property?.name === 'prototype') return true;
+  }
+  return false;
 }
 
 // ── Extract property key name as a string (handles NumericLiteral → "2") ──
@@ -583,6 +796,37 @@ function applyBranchCondition(testNode, polarity, env) {
       stack.push({ node: node.right, positive: true });
       continue;
     }
+    // if (a && b) in the false branch → NOT (a && b) = !a || !b
+    // If one operand is provably truthy, the other must be false.
+    if (node.type === 'LogicalExpression' && node.operator === '&&' && !positive) {
+      const leftConst = isConstantBool(node.left, null);
+      const rightConst = isConstantBool(node.right, null);
+      if (leftConst === true) {
+        // Left is always true → right must be false
+        stack.push({ node: node.right, positive: false });
+        continue;
+      }
+      if (rightConst === true) {
+        // Right is always true → left must be false
+        stack.push({ node: node.left, positive: false });
+        continue;
+      }
+      // If one side is non-tainted (no attacker influence), the attacker can only
+      // control the other side. Apply the negation to the potentially tainted side.
+      // This handles patterns like: `"x" == key && obj` where `obj` is always defined.
+      const leftTaint = env.get(node.left.type === 'Identifier' ? node.left.name : '');
+      const rightTaint = env.get(node.right.type === 'Identifier' ? node.right.name : '');
+      if (node.right.type === 'Identifier' && !rightTaint.tainted) {
+        stack.push({ node: node.left, positive: false });
+        continue;
+      }
+      if (node.left.type === 'Identifier' && !leftTaint.tainted) {
+        stack.push({ node: node.right, positive: false });
+        continue;
+      }
+      // Can't determine which side is false — skip constraints
+      continue;
+    }
     // if (a || b) in the false branch → both are false
     if (node.type === 'LogicalExpression' && node.operator === '||' && !positive) {
       stack.push({ node: node.left, positive: false });
@@ -649,6 +893,65 @@ function applyBranchCondition(testNode, polarity, env) {
         for (const [key] of env.entries()) {
           if (key.endsWith(suffix)) env.set(key, TaintSet.empty());
         }
+      }
+    }
+
+    // Generic constraint: key !== "value" (exclusion) or key === "value" (inclusion)
+    // Adds a constraint to the taint labels on the variable, recording that on this
+    // branch the variable can/cannot equal this specific string value. This is used by
+    // the universal SMT satisfiability check in pushFinding.
+    if (node.type === 'BinaryExpression') {
+      const isExclude = (node.operator === '!==' || node.operator === '!=') && positive;
+      const isExcludeFlip = (node.operator === '===' || node.operator === '==') && !positive;
+      const isInclude = (node.operator === '===' || node.operator === '==') && positive;
+      const isIncludeFlip = (node.operator === '!==' || node.operator === '!=') && !positive;
+      if (isExclude || isExcludeFlip || isInclude || isIncludeFlip) {
+        let varNode = null, strVal = null;
+        if (isStringLiteral(node.right) && !isStringLiteral(node.left)) {
+          varNode = node.left;
+          strVal = stringLiteralValue(node.right);
+        } else if (isStringLiteral(node.left) && !isStringLiteral(node.right)) {
+          varNode = node.right;
+          strVal = stringLiteralValue(node.left);
+        }
+        if (varNode && typeof strVal === 'string') {
+          const op = (isExclude || isExcludeFlip) ? '!==' : '===';
+          // Get the variable name: bare Identifier or dotted MemberExpression path
+          let varName = null;
+          if (varNode.type === 'Identifier') {
+            varName = varNode.name;
+          } else if (varNode.type === 'MemberExpression') {
+            varName = nodeToString(varNode);
+          }
+          if (varName) {
+            const constraint = { variable: varName, op, value: strVal };
+            if (varNode.type === 'Identifier') {
+              // Identifier: suffix-match all scoped bindings (existing behavior)
+              _addConstraintToVar(env, varName, constraint);
+            } else {
+              // MemberExpression: exact-match only (no suffix scan to avoid worklist divergence)
+              const taint = env.get(varName);
+              if (taint && taint.tainted) {
+                env.set(varName, taint.withConstraint(constraint));
+              }
+            }
+            env._branchConstraints.push(constraint);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Add a constraint to all taint labels on a variable in the env.
+// Looks up the variable by bare name and all scoped bindings (e.g., "0:varName").
+function _addConstraintToVar(env, varName, constraint) {
+  const suffix = `:${varName}`;
+  for (const [key] of env.entries()) {
+    if (key === varName || key === `global:${varName}` || key.endsWith(suffix)) {
+      const taint = env.get(key);
+      if (taint && taint.tainted) {
+        env.set(key, taint.withConstraint(constraint));
       }
     }
   }
@@ -933,29 +1236,49 @@ function formatSources(taint) {
     transforms: l.transforms.length > 0 ? l.transforms : undefined,
     sourceKey: l.sourceKey || undefined,
     stateSteps: l.stateSteps || undefined,
+    constraints: l.constraints && l.constraints.length > 0 ? l.constraints : undefined,
   }));
 }
 
-// Add sink stateStep to taint labels that already have store steps, for multi-step PoC generation
-function annotateSinkSteps(taint, ctx) {
+// Add sink stateStep to taint labels for multi-step PoC generation.
+// Handles two cases:
+// 1. Same-handler multi-step: taint was stored under one condition, sink under another
+// 2. Cross-handler prerequisite: branch condition depends on a variable set by a
+//    different event source (hashchange, URL param, etc.)
+function annotateSinkSteps(taint, ctx, env) {
   if (!taint.tainted) return taint;
-  // Check if any label has store steps
   const hasStore = taint.toArray().some(l => l.stateSteps && l.stateSteps.some(s => s.action === 'store'));
-  if (!hasStore) return taint;
 
-  // Add sink condition if inside a branch
   if (ctx._currentBranchCondition) {
     const cond = extractConditionInfo(ctx._currentBranchCondition.node, ctx._currentBranchCondition.polarity);
     if (cond) {
-      return taint.withStateStep({
-        action: 'sink',
-        condition: cond,
-        handler: ctx._handlerContext?.type || null,
-      });
+      if (hasStore) {
+        // Case 1: same-handler multi-step — add sink step
+        return taint.withStateStep({
+          action: 'sink',
+          condition: cond,
+          handler: ctx._handlerContext?.type || null,
+        });
+      }
+      // Case 2: cross-handler prerequisite — the branch condition references a
+      // variable set by a different event source (hashchange, URL, storage, etc.)
+      if (env && cond.discriminant) {
+        const condTaint = env.get(cond.discriminant);
+        if (condTaint && condTaint.tainted) {
+          const condLabels = condTaint.toArray();
+          const sourceType = condLabels[0]?.sourceType || 'unknown';
+          return taint.withStateStep({
+            action: 'prerequisite',
+            condition: cond,
+            sourceType,
+            handler: ctx._handlerContext?.type || null,
+          });
+        }
+      }
     }
   }
-  // Add timer sink step if inside a timer callback
-  if (ctx._handlerContext?.type === 'timer') {
+  // Timer sink step
+  if (hasStore && ctx._handlerContext?.type === 'timer') {
     return taint.withStateStep({
       action: 'sink',
       handler: 'timer',
@@ -966,7 +1289,16 @@ function annotateSinkSteps(taint, ctx) {
 }
 
 function makeSinkInfo(expression, ctx, loc) {
-  return { expression, file: ctx.file, line: loc.line || 0, col: loc.column || 0 };
+  const line = loc.line || 0;
+  const col = loc.column || 0;
+  // Use the AST node's source file if available (set during multi-file analysis),
+  // falling back to ctx.file. This ensures findings inside library code are
+  // attributed to the library file, not the calling script.
+  const file = ctx._sinkFile || ctx.file;
+  // Stable fingerprint: file:line:col:expression — uniquely identifies a sink location
+  // across runs. For minified code (1-2 lines), col is the key discriminator.
+  const fingerprint = `${file}:${line}:${col}:${expression}`;
+  return { expression, file, line, col, fingerprint };
 }
 
 function getSeverity(type) {
@@ -1008,7 +1340,86 @@ function resolveToConstant(node, _env, ctx) {
     }
     return result;
   }
+  // Arithmetic: -, *, /, %, |, &, ^, <<, >>, >>>
+  if (node.type === 'BinaryExpression' && /^[-*/%|&^]|<<|>>>?$/.test(node.operator)) {
+    const l = resolveToConstant(node.left, _env, ctx);
+    const r = resolveToConstant(node.right, _env, ctx);
+    if (typeof l === 'number' && typeof r === 'number') {
+      switch (node.operator) {
+        case '-': return l - r;
+        case '*': return l * r;
+        case '/': return r !== 0 ? l / r : undefined;
+        case '%': return r !== 0 ? l % r : undefined;
+        case '|': return l | r;
+        case '&': return l & r;
+        case '^': return l ^ r;
+        case '<<': return l << r;
+        case '>>': return l >> r;
+        case '>>>': return l >>> r;
+      }
+    }
+    return undefined;
+  }
+  // typeof expression: resolve to constant type string for known globals
+  if (node.type === 'UnaryExpression' && node.operator === 'typeof') {
+    const argType = _resolveTypeofResult(node.argument, _env, ctx);
+    if (argType) return argType;
+    return undefined;
+  }
+  // Comparison operators: ==, ===, !=, !==
+  if (node.type === 'BinaryExpression' && (node.operator === '==' || node.operator === '===' ||
+      node.operator === '!=' || node.operator === '!==')) {
+    const l = resolveToConstant(node.left, _env, ctx);
+    const r = resolveToConstant(node.right, _env, ctx);
+    if (globalThis._TAINT_DEBUG && node.right?.name === 'mn') {
+      console.log(`[RTC-EQ] null==mn: l=${l} (${typeof l}) r=${r !== undefined ? String(r).slice(0,30) : 'UNDEF'} (${typeof r}) paramConst=${ctx?._paramConstants?.has('mn')} localConst=${ctx?._localConstants?.has('mn')}`);
+    }
+    if (l !== undefined && r !== undefined) {
+      const strict = node.operator === '===' || node.operator === '!==';
+      const eq = strict ? l === r : l == r;
+      return (node.operator === '!=' || node.operator === '!==') ? !eq : eq;
+    }
+    return undefined;
+  }
   return resolveConstantLeaf(node, _env, ctx);
+}
+
+// Resolve typeof to a constant type string by determining what the argument resolves to.
+// Uses resolveCalleeIdentity to trace through scope chains and aliases.
+function _resolveTypeofResult(argNode, _env, ctx) {
+  if (!argNode) return undefined;
+  // typeof on literal types — directly from the AST node
+  if (isStringLiteral(argNode)) return 'string';
+  if (isNumericLit(argNode)) return 'number';
+  if (argNode.type === 'BooleanLiteral' || (argNode.type === 'Literal' && typeof argNode.value === 'boolean')) return 'boolean';
+  if (argNode.type === 'NullLiteral' || (argNode.type === 'Literal' && argNode.value === null)) return 'object';
+  if (argNode.type === 'Identifier' && argNode.name === 'undefined') return 'undefined';
+  if (argNode.type === 'FunctionExpression' || argNode.type === 'ArrowFunctionExpression') return 'function';
+  if (argNode.type === 'ObjectExpression' || argNode.type === 'ArrayExpression') return 'object';
+  // For identifiers: resolve through scope/alias chains to determine what the variable holds
+  if (argNode.type === 'Identifier') {
+    const identity = resolveCalleeIdentity(argNode, _env, ctx);
+    if (identity) {
+      // Known type of each runtime global
+      return _runtimeGlobalTypeof(identity);
+    }
+  }
+  return undefined;
+}
+
+// Runtime globals that are typeof "object" (not "function")
+const _TYPEOF_OBJECT_GLOBALS = new Set([
+  'window', 'self', 'globalThis', 'global',
+  'document', 'navigator', 'location', 'console', 'performance', 'crypto',
+  'localStorage', 'sessionStorage', 'history', 'screen',
+  'JSON', 'Math', 'Reflect',
+]);
+
+// Return the typeof result for a known runtime global identity
+function _runtimeGlobalTypeof(identity) {
+  if (_TYPEOF_OBJECT_GLOBALS.has(identity)) return 'object';
+  if (_RUNTIME_GLOBALS.has(identity)) return 'function';
+  return undefined;
 }
 // Iterative leaf resolver: follows Identifier → declaration init chains without recursion
 function resolveConstantLeaf(node, _env, ctx) {
@@ -1020,12 +1431,30 @@ function resolveConstantLeaf(node, _env, ctx) {
     if (cur.type === 'BooleanLiteral' || (cur.type === 'Literal' && typeof cur.value === 'boolean')) return cur.value;
     if (cur.type === 'NullLiteral' || (cur.type === 'Literal' && cur.value === null)) return null;
     if (cur.type === 'Identifier') {
+      // Variable was modified by UpdateExpression (i++, --j, etc.) or compound
+      // assignment — it is no longer a constant, don't resolve to its initializer.
+      if (ctx?._mutatedVars?.has(cur.name)) return undefined;
       if (ctx?._paramConstants?.has(cur.name)) {
         return ctx._paramConstants.get(cur.name);
+      }
+      if (ctx?._localConstants?.has(cur.name)) {
+        return ctx._localConstants.get(cur.name);
       }
       const _init = resolveInitFromScope(cur, ctx);
       if (_init) { cur = _init; continue; }
       return undefined;
+    }
+    // MemberExpression: handle func.length for function references
+    if (cur.type === 'MemberExpression' && !cur.computed &&
+        cur.property?.name === 'length' && cur.object?.type === 'Identifier') {
+      const objName = cur.object.name;
+      // Check _paramArgNames first (parameter→arg name mapping from call site)
+      const resolvedObjName = ctx?._paramArgNames?.get(objName) || objName;
+      const funcNode = ctx?.funcMap?.get(resolvedObjName) || ctx?.funcMap?.get(objName);
+      if (funcNode?.params) return funcNode.params.length;
+      // Check string/array length via _paramConstants
+      const constVal = ctx?._paramConstants?.get(objName);
+      if (typeof constVal === 'string') return constVal.length;
     }
     return undefined;
   }
@@ -1035,12 +1464,162 @@ function resolveConstantLeaf(node, _env, ctx) {
 // Resolve the root identifier in a dotted path through env.aliases
 // e.g., "w.location.hash" where w→window becomes "window.location.hash"
 function resolveAliasedPath(path, env) {
-  if (!path || !env.aliases.size) return path;
+  if (!path) return path;
   const dotIdx = path.indexOf('.');
   const root = dotIdx === -1 ? path : path.slice(0, dotIdx);
-  const alias = env.aliases.get(root);
+  const alias = env.getAlias ? env.getAlias(root) : env.aliases.get(root);
   if (!alias || alias === root) return path;
   return dotIdx === -1 ? alias : `${alias}${path.slice(dotIdx)}`;
+}
+
+// Global scope objects — accessing a property on these is equivalent to accessing the global directly.
+// window.Object === Object, self.Array === Array, etc.
+const _GLOBAL_SCOPE_OBJECTS = new Set(['window', 'self', 'globalThis', 'global']);
+
+// JavaScript runtime globals — objects and constructors that exist in every JS environment.
+// Used by resolveCalleeIdentity to recognize globals that don't have scope bindings.
+const _RUNTIME_GLOBALS = new Set([
+  // Global scope references
+  'window', 'self', 'globalThis', 'global',
+  // Constructors / namespaces
+  'Object', 'Array', 'Function', 'String', 'Number', 'Boolean', 'Symbol',
+  'RegExp', 'Date', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Promise', 'Proxy',
+  'Reflect', 'JSON', 'Math', 'Error', 'TypeError', 'RangeError', 'SyntaxError',
+  'ArrayBuffer', 'DataView', 'Int8Array', 'Uint8Array', 'Float32Array', 'Float64Array',
+  // DOM / Web APIs
+  'document', 'navigator', 'location', 'console', 'performance', 'crypto',
+  'localStorage', 'sessionStorage', 'history', 'screen',
+  // Functions
+  'eval', 'parseInt', 'parseFloat', 'isNaN', 'isFinite',
+  'encodeURIComponent', 'decodeURIComponent', 'encodeURI', 'decodeURI',
+  'atob', 'btoa', 'setTimeout', 'setInterval', 'fetch',
+  'alert', 'confirm', 'prompt', 'requestAnimationFrame', 'queueMicrotask', 'structuredClone',
+]);
+
+// Resolve an identifier's callee identity by following assignment/scope chains.
+// Returns a canonical callee string (e.g., "Object", "Object.defineProperty") or null.
+// This traces through: Identifier → init expression → MemberExpression → object resolution
+// enabling interprocedural resolution of aliased builtins like Qu = mn.Object → "Object".
+function resolveCalleeIdentity(node, env, ctx, _depth) {
+  if (!node || (_depth || 0) > 6) {
+    if (globalThis._TAINT_DEBUG && node?.type === 'ConditionalExpression') console.log(`[RCI] DEPTH LIMIT hit for ConditionalExpression depth=${_depth}`);
+    return null;
+  }
+  const depth = (_depth || 0) + 1;
+
+  if (node.type === 'Identifier') {
+    // Check alias first
+    const alias = env?.getAlias ? env.getAlias(node.name) : env?.aliases?.get(node.name);
+    if (globalThis._TAINT_DEBUG && node.name === '$n') console.log(`[RCI-ID] $n alias=${alias} depth=${depth}`);
+    if (alias) return alias;
+    // Known runtime globals — these exist in every JS environment and resolve to themselves.
+    // This is the JS runtime's API surface, not pattern matching.
+    if (_RUNTIME_GLOBALS.has(node.name)) return node.name;
+    // Follow scope to init expression
+    const init = resolveInitFromScope(node, ctx);
+    if (globalThis._TRACE_RESOLVE && (node.name === 'Mn' || node.name === 'Tn' || node.name === '$n' || node.name === 'mn' || node.name === 'Qu')) {
+      console.log('[RESOLVE]', node.name, 'init=', init?.type, 'scopeInfo=', !!ctx?.scopeInfo);
+    }
+    if (init) return resolveCalleeIdentity(init, env, ctx, depth);
+    return null;
+  }
+
+  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+    if (node.computed) return null;
+    const propName = node.property?.name;
+    if (!propName) return null;
+    // Resolve the object to its identity
+    const objIdentity = resolveCalleeIdentity(node.object, env, ctx, depth);
+    if (objIdentity) {
+      // When the object is a global scope reference (window, self, globalThis, global),
+      // accessing a property is the same as accessing the global directly.
+      // window.Object === Object, self.Array === Array, etc.
+      if (_GLOBAL_SCOPE_OBJECTS.has(objIdentity)) {
+        // Check if the property is itself a known global
+        if (_RUNTIME_GLOBALS.has(propName)) return propName;
+        // Otherwise return the full path
+        return `${objIdentity}.${propName}`;
+      }
+      return `${objIdentity}.${propName}`;
+    }
+    return null;
+  }
+
+  // LogicalExpression ||: A || B — try resolving each branch
+  if (node.type === 'LogicalExpression' && node.operator === '||') {
+    if (globalThis._TRACE_RESOLVE) console.log('[RCI-OR] depth=', depth, 'left=', node.left.type, node.left.name||'', 'right=', node.right.type);
+    const left = resolveCalleeIdentity(node.left, env, ctx, depth);
+    if (left) return left;
+    return resolveCalleeIdentity(node.right, env, ctx, depth);
+  }
+
+  // LogicalExpression &&: A && B — value is the RHS if LHS is truthy
+  if (node.type === 'LogicalExpression' && node.operator === '&&') {
+    if (globalThis._TRACE_RESOLVE) console.log('[RCI-AND] depth=', depth, 'right=', node.right.type, node.right.name||'');
+    return resolveCalleeIdentity(node.right, env, ctx, depth);
+  }
+
+  // ConditionalExpression: cond ? A : B — try to resolve condition, otherwise try both
+  if (node.type === 'ConditionalExpression') {
+    const condBool = isConstantBool(node.test, ctx);
+    if (globalThis._TAINT_DEBUG && (node.consequent?.name === '$n' || node.alternate?.name === '$n')) {
+      console.log(`[RCI-COND] depth=${depth} condBool=${condBool} test=${node.test?.type}/${node.test?.operator||''} cons=${node.consequent?.name||node.consequent?.type} alt=${node.alternate?.name||node.alternate?.type}`);
+    }
+    if (condBool === true) return resolveCalleeIdentity(node.consequent, env, ctx, depth);
+    if (condBool === false) return resolveCalleeIdentity(node.alternate, env, ctx, depth);
+    // Unknown condition: try both, prefer consequent
+    return resolveCalleeIdentity(node.consequent, env, ctx, depth) ||
+           resolveCalleeIdentity(node.alternate, env, ctx, depth);
+  }
+
+  // AssignmentExpression: a = expr — the value is the RHS
+  if (node.type === 'AssignmentExpression' && node.operator === '=') {
+    return resolveCalleeIdentity(node.right, env, ctx, depth);
+  }
+
+  // CallExpression: Function("return this")() → global scope
+  if (node.type === 'CallExpression' && node.callee?.type === 'CallExpression') {
+    const innerCallee = resolveCalleeIdentity(node.callee.callee, env, ctx, depth);
+    if (innerCallee === 'Function' && node.callee.arguments?.length > 0) {
+      const bodyArg = node.callee.arguments[node.callee.arguments.length - 1];
+      if (isStringLiteral(bodyArg)) {
+        const bodyStr = stringLiteralValue(bodyArg).trim();
+        // Parse body with Babel and check if it returns `this`
+        const parsed = parseFunctionConstructor(node.callee.arguments);
+        if (parsed?.body?.body?.length === 1 &&
+            parsed.body.body[0].type === 'ReturnStatement' &&
+            parsed.body.body[0].argument?.type === 'ThisExpression') {
+          return 'window'; // Function("return this")() in sloppy mode = global scope
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+// Parse a string literal body from Function(bodyStr) into a synthetic function AST node.
+// Returns a FunctionExpression node or null if parsing fails.
+function parseFunctionConstructor(args) {
+  if (!args || args.length === 0) return null;
+  // Extract string values: Function(body) or Function(param1, param2, ..., body)
+  const strArgs = [];
+  for (const arg of args) {
+    if (isStringLiteral(arg)) strArgs.push(stringLiteralValue(arg));
+    else return null; // non-constant arg, can't parse
+  }
+  const bodyStr = strArgs[strArgs.length - 1];
+  const paramStrs = strArgs.slice(0, -1);
+  try {
+    const ast = babelParse(`(function(${paramStrs.join(',')}) { ${bodyStr} })`, {
+      sourceType: 'unambiguous',
+      plugins: ['optionalChaining', 'nullishCoalescingOperator'],
+      errorRecovery: true,
+    });
+    const expr = ast.program.body[0]?.expression;
+    if (expr && expr.type === 'FunctionExpression') return expr;
+  } catch (_) { /* parsing failed */ }
+  return null;
 }
 
 // Find a function expression/arrow returned from a function body (for IIFE resolution)
@@ -1078,6 +1657,19 @@ function isConstantBoolLeaf(node, ctx) {
       return cur.value !== '';
     if (cur.type === 'NullLiteral' || (cur.type === 'Literal' && cur.value === null)) return false;
     if (cur.type === 'Identifier' && cur.name === 'undefined') return false;
+    // BinaryExpression comparison: typeof X == "object", etc.
+    if (cur.type === 'BinaryExpression' && (cur.operator === '==' || cur.operator === '===' ||
+        cur.operator === '!=' || cur.operator === '!==')) {
+      const resolved = resolveToConstant(cur, null, curCtx);
+      if (typeof resolved === 'boolean') return resolved;
+      return null;
+    }
+    // UnaryExpression !: negate the argument
+    if (cur.type === 'UnaryExpression' && cur.operator === '!') {
+      const argBool = isConstantBoolLeaf(cur.argument, curCtx);
+      if (argBool !== null) return !argBool;
+      return null;
+    }
     if (cur.type === 'Identifier' && curCtx?.scopeInfo) {
       const bindingKey = curCtx.scopeInfo.resolve(cur);
       if (bindingKey) {
@@ -1159,6 +1751,16 @@ function processNode(node, env, ctx) {
       break;
 
     case 'AssignmentExpression':
+      if (globalThis._TAINT_DEBUG && node.left?.name === 'mn' && node.right?.type === 'ConditionalExpression') {
+        const test = node.right.test;
+        console.log(`[PROCESS-NODE] mn test: type=${test.type} op=${test.operator} left=${test.left?.type}/${test.left?.value} right=${test.right?.type}/${test.right?.name}`);
+        // Try resolveToConstant on each side
+        const _l = resolveToConstant(test.left, null, ctx);
+        const _r = resolveToConstant(test.right, null, ctx);
+        console.log(`[PROCESS-NODE] mn test resolveToConstant: left=${_l} (${typeof _l}) right=${_r} (${typeof _r})`);
+        const _cb = isConstantBool(test, ctx);
+        console.log(`[PROCESS-NODE] mn test condBool=${_cb}`);
+      }
       processAssignment(node, env, ctx);
       break;
 
@@ -1171,12 +1773,12 @@ function processNode(node, env, ctx) {
     case 'ReturnStatement':
       if (node.argument) {
         const arg = node.argument;
-        // Track returned function nodes for factory pattern support
-        if (isFuncExpr(arg)) {
-          arg._closureEnv = env;
-          ctx.returnedFuncNode = arg;
-        }
+        // For SequenceExpression (comma operator), the effective return value is the last expression
+        // but we must evaluate the FULL expression for side effects (e.g., An.merge=Sf, An)
+        const effectiveReturn = (arg.type === 'SequenceExpression' && arg.expressions?.length > 0)
+          ? arg.expressions[arg.expressions.length - 1] : arg;
         // Track returned objects with function-valued properties (module pattern)
+        // Must be done BEFORE evaluateExpr to capture the object structure
         if (arg.type === 'ObjectExpression') {
           const methods = {};
           for (const prop of arg.properties) {
@@ -1207,10 +1809,35 @@ function processNode(node, env, ctx) {
           }
           if (Object.keys(methods).length > 0) ctx.returnedMethods = methods;
         }
-        ctx.returnTaint.merge(evaluateExpr(arg, env, ctx));
+        // Evaluate the full return expression for side effects and taint.
+        // If we're inside a conditional branch, the return value is conditional —
+        // propagate active branch constraints to the return taint so callers know
+        // this value only flows when the branch condition is satisfied.
+        let _retExprTaint = evaluateExpr(arg, env, ctx);
+        if (_retExprTaint.tainted && env._branchConstraints.length > 0) {
+          for (const c of env._branchConstraints) {
+            _retExprTaint = _retExprTaint.withConstraint(c);
+          }
+        }
+        ctx.returnTaint.merge(_retExprTaint);
         // Track per-element taints for array returns: return [expr1, expr2, ...]
         if (arg.type === 'ArrayExpression' && arg.elements.length > 0) {
           ctx.returnElementTaints = arg.elements.map(e => e ? evaluateExpr(e, env, ctx) : TaintSet.empty());
+        }
+        // When returning an Identifier that has per-index taints (e.g., return args
+        // where args is an array variable), propagate those per-index taints so the
+        // caller can access elements of the returned value.
+        if (effectiveReturn.type === 'Identifier' && !ctx.returnElementTaints) {
+          const retName = resolveId(effectiveReturn, ctx);
+          const retPerIdx = env.getTaintedWithPrefix(`${retName}.#idx_`);
+          if (retPerIdx.length > 0) {
+            const elemTaints = [];
+            for (const [key, taint] of retPerIdx) {
+              const m = key.match(/\.#idx_(\d+)$/);
+              if (m) elemTaints[parseInt(m[1])] = taint;
+            }
+            if (elemTaints.length > 0) ctx.returnElementTaints = elemTaints;
+          }
         }
         // Track per-property taints for object returns: return { a: tainted, b: safe }
         if (arg.type === 'ObjectExpression' && arg.properties.length > 0) {
@@ -1223,6 +1850,90 @@ function processNode(node, env, ctx) {
           }
           if (propTaints.size > 0) ctx.returnPropertyTaints = propTaints;
         }
+        // Track returned function nodes AFTER evaluateExpr so that SequenceExpression
+        // side effects (which clear returnedFuncNode via processAssignment) don't
+        // clobber the value. The funcMap is fully populated after evaluateExpr.
+        // Only create Object.create wrappers inside interprocedural analysis (IP stack),
+        // where the same function can be returned from multiple calls with different closures.
+        // At the top level, direct mutation is safe since there's no re-use concern.
+        if (isFuncExpr(effectiveReturn)) {
+          if (ctx._ipStack) {
+            const wrapper = Object.create(effectiveReturn);
+            wrapper._closureEnv = env;
+            wrapper._closureFuncMap = ctx.funcMap;
+            wrapper._wrapperId = ++_wrapperIdCounter;
+            if (ctx._paramArgNames) wrapper._closureParamArgNames = ctx._paramArgNames;
+            if (ctx._localConstants?.size > 0) wrapper._closureLocalConstants = new Map(ctx._localConstants);
+            ctx.returnedFuncNode = wrapper;
+            if (globalThis._TAINT_DEBUG && effectiveReturn.params?.length === 0) {
+              const entries = [];
+              for (const [k, v] of ctx.funcMap) {
+                if (k === 't' || k === 'n' || k.endsWith(':t') || k.endsWith(':n')) {
+                  entries.push(`${k}→${v?.id?.name||v?.type||'?'}(${v?.params?.length||'?'})`);
+                }
+              }
+              console.log(`[RET-FUNCEXPR-0PARAM] wrapperId=${wrapper._wrapperId} proto=${Object.getPrototypeOf(effectiveReturn)?._wrapperId||'ast'} funcMap t/n entries: ${entries.join(', ')}`);
+            }
+          } else {
+            effectiveReturn._closureEnv = env;
+            effectiveReturn._closureFuncMap = ctx.funcMap;
+            if (ctx._localConstants?.size > 0) effectiveReturn._closureLocalConstants = new Map(ctx._localConstants);
+            ctx.returnedFuncNode = effectiveReturn;
+          }
+        }
+        if (effectiveReturn.type === 'Identifier') {
+          const refKey = resolveId(effectiveReturn, ctx);
+          // Only fall back to bare name when resolveId returned the bare name itself
+          // (no scope-aware binding). When a scope-qualified key exists, the local
+          // binding (parameter/variable) shadows outer function declarations —
+          // falling back to the bare name would bypass scope shadowing.
+          let refFunc = ctx.funcMap.get(refKey);
+          if (!refFunc && refKey === effectiveReturn.name) {
+            refFunc = ctx.funcMap.get(effectiveReturn.name);
+          }
+          if (refFunc && refFunc.body) {
+            ctx.returnedFuncNode = refFunc;
+          } else {
+            // The returned identifier is not a function reference.
+            // Clear any stale returnedFuncNode set by sub-calls in the body,
+            // which would incorrectly propagate to the caller via _finalizeFrame.
+            ctx.returnedFuncNode = null;
+          }
+        }
+        // Propagate alias through return statements
+        // When returning an Identifier that has an alias (e.g., return n where n is aliased
+        // to Object.defineProperty or 'self'), set _returnedBuiltinAlias so the caller registers it.
+        // Also handles ternary: return cond ? aliasedVar : other
+        if (!ctx._returnedBuiltinAlias) {
+          const _checkReturnAlias = (node) => {
+            if (node.type !== 'Identifier') return null;
+            const alias = env.getAlias ? env.getAlias(node.name) : env.aliases?.get(node.name);
+            return alias || null;
+          };
+          let retAlias = _checkReturnAlias(effectiveReturn);
+          // Check ternary branches: return cond ? r : T
+          if (!retAlias && effectiveReturn.type === 'ConditionalExpression') {
+            retAlias = _checkReturnAlias(effectiveReturn.consequent) ||
+                       _checkReturnAlias(effectiveReturn.alternate);
+          }
+          if (retAlias) {
+            ctx._returnedBuiltinAlias = retAlias;
+          }
+        }
+        // Propagate property aliases from returned variable
+        // When `return target` where target has aliases like target.Object → Object,
+        // collect them so the caller can apply them to the LHS variable
+        if (effectiveReturn.type === 'Identifier') {
+          const retName = effectiveReturn.name;
+          const prefix = retName + '.';
+          for (const [aliasKey, aliasValue] of env.aliases) {
+            if (aliasKey.startsWith(prefix)) {
+              if (!ctx._returnedAliases) ctx._returnedAliases = new Map();
+              const suffix = aliasKey.slice(prefix.length);
+              ctx._returnedAliases.set(suffix, aliasValue);
+            }
+          }
+        }
       }
       break;
 
@@ -1230,6 +1941,7 @@ function processNode(node, env, ctx) {
       if (node.id) {
         node._closureEnv = env;
         node._closureFuncMap = ctx.funcMap;
+        node._closureScopeInfo = ctx.scopeInfo;
         const key = resolveId(node.id, ctx);
         ctx.funcMap.set(key, node);
         // Also store by raw name for cross-file resolution
@@ -1670,9 +2382,11 @@ function propagatePerPropertyEntries(sourceExpr, targetName, env, ctx) {
   // Copy per-property taints
   for (const [key, taint] of env.getTaintedWithPrefix(`${srcPrefix}.`)) {
     const propName = key.slice(srcPrefix.length + 1);
-    if (propName && !propName.startsWith('#')) {
-      env.set(`${targetName}.${propName}`, taint);
-    }
+    if (!propName) continue;
+    // Skip internal tracking entries (#key_, #elem_) but allow per-index entries (#idx_)
+    // which are needed for arguments aliasing (var u = arguments → u.#idx_0 = arguments.#idx_0)
+    if (propName.startsWith('#') && !propName.startsWith('#idx_')) continue;
+    env.set(`${targetName}.${propName}`, taint);
   }
   // Copy funcMap entries
   for (const [key, val] of ctx.funcMap) {
@@ -1688,6 +2402,9 @@ function propagatePerPropertyEntries(sourceExpr, targetName, env, ctx) {
 
 // ── Variable declaration ──
 function processVarDeclarator(node, env, ctx) {
+  if (globalThis._TRACE_RESOLVE && node.id?.name && ['$n','Mn','Tn','mn','Qu'].includes(node.id.name)) {
+    console.log('[PVD]', node.id.name, 'init=', node.init?.type);
+  }
   if (!node.init) {
     // Register uninitialized var declarations so closure propagation's env.has() can find them.
     // Use scope-resolved key only (no global: prefix) to avoid overwriting existing entries.
@@ -1712,6 +2429,7 @@ function processVarDeclarator(node, env, ctx) {
       (node.init.type === 'FunctionExpression' || node.init.type === 'ArrowFunctionExpression')) {
     node.init._closureEnv = env;
     node.init._closureFuncMap = ctx.funcMap;
+    node.init._closureScopeInfo = ctx.scopeInfo;
     const key = resolveId(node.id, ctx);
     ctx.funcMap.set(key, node.init);
     ctx.funcMap.set(node.id.name, node.init);
@@ -1792,7 +2510,11 @@ function processVarDeclarator(node, env, ctx) {
   // Alias: var r = obj.render — extract method reference from funcMap
   if (node.id.type === 'Identifier' && (node.init.type === 'MemberExpression' || node.init.type === 'OptionalMemberExpression')) {
     let initStr = nodeToString(node.init);
-    const methodName = node.init.property?.name;
+    // Only use bare property name as fallback for NON-computed members.
+    // For computed members like r[e], the property name 'e' is an index variable,
+    // not a method name — using it would incorrectly alias the variable to whatever
+    // function 'e' happens to map to in the funcMap (e.g., identity from a closure).
+    const methodName = !node.init.computed ? node.init.property?.name : null;
     // For computed members: var handler = this.handlers[event] → resolve event to constant
     if (!initStr && node.init.computed && node.init.property) {
       const objStr = nodeToString(node.init.object);
@@ -1804,6 +2526,17 @@ function processVarDeclarator(node, env, ctx) {
       const key = resolveId(node.id, ctx);
       ctx.funcMap.set(key, refFunc);
       ctx.funcMap.set(node.id.name, refFunc);
+    }
+    // Resolve callee identity through deep scope/init chain resolution.
+    // Handles: var Ai = Object.defineProperty → Ai = "Object.defineProperty"
+    //          var Qu = mn.Object → Qu = "window.Object" (when mn → window)
+    // Uses resolveCalleeIdentity which follows Identifier→init→MemberExpression chains.
+    if (!node.init.computed) {
+      const identity = resolveCalleeIdentity(node.init, env, ctx);
+      if (identity) {
+        env.aliases.set(node.id.name, identity);
+        if (globalThis._TAINT_DEBUG) console.log(`[ALIAS-RESOLVED] ${node.id.name} → ${identity}`);
+      }
     }
   }
 
@@ -1981,6 +2714,14 @@ function processVarDeclarator(node, env, ctx) {
   } else {
     assignToPattern(node.id, taint, env, ctx);
   }
+  // Track compile-time constant declarations: var x = constExpr
+  if (node.id.type === 'Identifier' && node.init) {
+    const constVal = resolveToConstant(node.init, null, ctx);
+    if (constVal !== undefined) {
+      if (!ctx._localConstants) ctx._localConstants = new Map();
+      ctx._localConstants.set(node.id.name, constVal);
+    }
+  }
   // Propagate per-property taints from Object.assign: var config = Object.assign({}, src1, src2)
   // This ensures config.html reflects the LAST source's value (safe override wins)
   if (node.init._assignPerPropertyTaints && node.id.type === 'Identifier') {
@@ -1994,6 +2735,24 @@ function processVarDeclarator(node, env, ctx) {
   }
 
   registerReturnedFunctions(node.id, ctx);
+
+  // Level 3: Register builtin alias from interprocedural return
+  // When var n = je(Object, "defineProperty") and je returned _returnedBuiltinAlias,
+  // register the alias on n so later n(...) resolves as Object.defineProperty(...)
+  if (ctx._returnedBuiltinAlias && node.id.type === 'Identifier') {
+    env.aliases.set(node.id.name, ctx._returnedBuiltinAlias);
+    if (globalThis._TAINT_DEBUG) console.log(`[ALIAS-BUILTIN-L3] ${node.id.name} → ${ctx._returnedBuiltinAlias} (from call return)`);
+    ctx._returnedBuiltinAlias = null;
+  }
+
+  // Apply returned aliases: var mn = rt.defaults(...) → mn.Object → Object
+  if (ctx._returnedAliases && node.id.type === 'Identifier') {
+    const lhsName = node.id.name;
+    for (const [suffix, aliasValue] of ctx._returnedAliases) {
+      env.aliases.set(`${lhsName}.${suffix}`, aliasValue);
+    }
+    ctx._returnedAliases = null;
+  }
 
   // Track bound built-in callee: var w = document.write.bind(document) → alias w to document.write
   if (ctx._boundCalleeStr && node.id.type === 'Identifier') {
@@ -2032,8 +2791,21 @@ function processVarDeclarator(node, env, ctx) {
       env.aliases.set(node.id.name, initName);
     }
     // Transitive: if init is itself an alias, propagate
-    const existing = env.aliases.get(initName);
+    const existing = env.getAlias ? env.getAlias(initName) : env.aliases.get(initName);
     if (existing) env.aliases.set(node.id.name, existing);
+  }
+  // Detect global scope references and other identity-carrying init expressions.
+  // Uses resolveCalleeIdentity to trace through || chains, && guards, ternaries, and
+  // Function("return this")() IIFEs. E.g., var $n = Mn || Tn || Function("return this")() → "window"
+  if (node.id.type === 'Identifier' && node.init && !node.init.computed) {
+    // Only try if not already resolved by the MemberExpression handler above
+    if (!env.aliases.has(node.id.name)) {
+      const identity = resolveCalleeIdentity(node.init, env, ctx);
+      if (identity) {
+        env.aliases.set(node.id.name, identity);
+        if (globalThis._TAINT_DEBUG) console.log(`[ALIAS-INIT] ${node.id.name} → ${identity}`);
+      }
+    }
   }
   // Resolve constant ternary: var fn = false ? console.log : eval → alias fn to eval
   if (node.id.type === 'Identifier' && node.init.type === 'ConditionalExpression') {
@@ -2174,10 +2946,31 @@ function processAssignment(node, env, ctx) {
   ctx.returnedFuncNode = null;
   ctx.returnedMethods = null;
 
+  // Track arithmetic compound assignments (+=, -=, *=, etc.) as variable mutations
+  // so resolveToConstant won't return the initializer for modified variables.
+  // Excludes logical assignments (??=, ||=, &&=) which need constant resolution
+  // to determine whether the assignment fires.
+  if (node.operator !== '=' && node.left.type === 'Identifier' &&
+      node.operator !== '??=' && node.operator !== '||=' && node.operator !== '&&=') {
+    if (!ctx._mutatedVars) ctx._mutatedVars = new Set();
+    ctx._mutatedVars.add(node.left.name);
+  }
+
   // Track `this` aliases: a = this → mark 'a' as a this alias
   if (node.operator === '=' && node.left.type === 'Identifier' && node.right.type === 'ThisExpression') {
     if (!ctx._thisAliases) ctx._thisAliases = new Set();
     ctx._thisAliases.add(node.left.name);
+  }
+
+  // Propagate callee identity on reassignment using deep resolution.
+  // Handles: mn = $n, mn = null==mn ? $n : expr, mn = A || B || C, etc.
+  if (node.operator === '=' && node.left.type === 'Identifier') {
+    const identity = resolveCalleeIdentity(node.right, env, ctx);
+    if (globalThis._TAINT_DEBUG && node.left.name === 'mn') console.log(`[DEBUG-MN] identity=${identity} right.type=${node.right.type}`);
+    if (identity) {
+      env.aliases.set(node.left.name, identity);
+      if (globalThis._TAINT_DEBUG) console.log(`[ALIAS-ASSIGN] ${node.left.name} → ${identity}`);
+    }
   }
 
   // Track document.createElement element types in assignments
@@ -2383,6 +3176,36 @@ function processAssignment(node, env, ctx) {
   }
   registerReturnedFunctions(node.left, ctx);
 
+  // Level 3b: Register builtin alias from interprocedural return (assignment)
+  // Same as Level 3 in processVarDeclarator but for assignments: Ai = IIFE()
+  if (ctx._returnedBuiltinAlias && node.left.type === 'Identifier') {
+    env.aliases.set(node.left.name, ctx._returnedBuiltinAlias);
+    if (globalThis._TAINT_DEBUG) console.log(`[ALIAS-BUILTIN-L3b] ${node.left.name} → ${ctx._returnedBuiltinAlias} (from call return, assignment)`);
+    ctx._returnedBuiltinAlias = null;
+  }
+
+  // Apply returned aliases for assignment: mn = rt.defaults(...) → mn.Object → Object
+  if (ctx._returnedAliases && node.left.type === 'Identifier') {
+    const lhsName = node.left.name;
+    for (const [suffix, aliasValue] of ctx._returnedAliases) {
+      env.aliases.set(`${lhsName}.${suffix}`, aliasValue);
+    }
+    ctx._returnedAliases = null;
+  }
+
+  // Track compile-time constant assignments: ident = constExpr
+  // Enables resolveToConstant to find reassigned values (e.g., r = t.length - 1 in overRest)
+  if (node.operator === '=' && node.left.type === 'Identifier') {
+    const constVal = resolveToConstant(node.right, null, ctx);
+    if (constVal !== undefined) {
+      if (!ctx._localConstants) ctx._localConstants = new Map();
+      ctx._localConstants.set(node.left.name, constVal);
+    } else if (ctx._localConstants?.has(node.left.name)) {
+      // Variable was constant but is now reassigned to non-constant — remove stale entry
+      ctx._localConstants.delete(node.left.name);
+    }
+  }
+
   // Propagate per-property taints from source to target on assignment
   if (node.operator === '=' && node.left.type === 'Identifier' &&
       node.right.type !== 'ObjectExpression' && node.right.type !== 'ArrayExpression') {
@@ -2557,6 +3380,30 @@ function processAssignment(node, env, ctx) {
         if (propName) ctx.funcMap.set(propName, refFunc);
       }
     }
+    // Global alias export: $n.X = someObj → copy someObj.* funcMap entries to X.*
+    // Only fires when LHS root is aliased to a global prefix (window/self/globalThis/global)
+    if (node.left.object?.type === 'Identifier') {
+      const _GS = new Set(['window', 'self', 'globalThis', 'global']);
+      const objAlias = env.aliases?.get(node.left.object.name) || node.left.object.name;
+      if (_GS.has(objAlias)) {
+        const targetName = node.left.property?.name;
+        const rhsSrcName = node.right.name;
+        const rhsSrcKey = resolveId(node.right, ctx);
+        if (targetName) {
+          const srcPrefixes = [rhsSrcName + '.'];
+          if (rhsSrcKey !== rhsSrcName) srcPrefixes.push(rhsSrcKey + '.');
+          for (const [key, val] of ctx.funcMap) {
+            for (const sp of srcPrefixes) {
+              if (key.startsWith(sp)) {
+                const suffix = key.slice(sp.length);
+                ctx.funcMap.set(`${targetName}.${suffix}`, val);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
     // Track global function alias: obj.fn = eval → env.aliases.set('obj.fn', 'eval')
     const rhsName = node.right.name;
     const rhsAlias = env.aliases.get(rhsName) || rhsName;
@@ -2591,10 +3438,41 @@ function processAssignment(node, env, ctx) {
     }
   }
 
+  // Computed bulk copy alias propagation: target[k] = source[k]
+  // When both sides use the same computed key and source has an alias,
+  // target inherits the source's identity for property resolution
+  if (node.operator === '=' &&
+      node.left.type === 'MemberExpression' && node.left.computed &&
+      node.right.type === 'MemberExpression' && node.right.computed) {
+    const lhsKeyStr = nodeToString(node.left.property);
+    const rhsKeyStr = nodeToString(node.right.property);
+    if (lhsKeyStr && rhsKeyStr && lhsKeyStr === rhsKeyStr) {
+      const lhsObjStr = nodeToString(node.left.object);
+      const rhsObjStr = nodeToString(node.right.object);
+      if (lhsObjStr && rhsObjStr && lhsObjStr !== rhsObjStr) {
+        const rhsAlias = env.getAlias ? env.getAlias(rhsObjStr) : env.aliases?.get(rhsObjStr);
+        if (rhsAlias && !env.aliases.has(lhsObjStr)) {
+          env.aliases.set(lhsObjStr, rhsAlias);
+        }
+      }
+    }
+  }
+
   // Register object literal methods: obj = { render: function(){} } or window.Mod = { get: function(){} }
   if (node.operator === '=' && node.right.type === 'ObjectExpression') {
     const leftStr = nodeToString(node.left);
     if (leftStr) {
+      // Resolve global alias: if root is aliased to window/self/globalThis, compute stripped path
+      // e.g., $n._ = { merge: fn } where $n→window → strippedLeft="_"
+      const _GLOBAL_SET = new Set(['window', 'self', 'globalThis', 'global']);
+      let strippedLeft = null;
+      const resolvedLeft = resolveAliasedPath(leftStr, env);
+      const resolvedRoot = resolvedLeft.split('.')[0];
+      if (_GLOBAL_SET.has(resolvedRoot) && resolvedLeft.indexOf('.') !== -1) {
+        strippedLeft = resolvedLeft.slice(resolvedRoot.length + 1);
+      } else if (_GLOBAL_SET.has(leftStr.split('.')[0]) && leftStr.indexOf('.') !== -1) {
+        strippedLeft = leftStr.slice(leftStr.indexOf('.') + 1);
+      }
       for (const prop of node.right.properties) {
         if (isObjectProp(prop) && prop.key) {
           const propName = propKeyName(prop.key);
@@ -2603,6 +3481,7 @@ function processAssignment(node, env, ctx) {
             val._closureEnv = env;
             ctx.funcMap.set(`${leftStr}.${propName}`, val);
             if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, val);
+            if (strippedLeft) ctx.funcMap.set(`${strippedLeft}.${propName}`, val);
           }
         }
         if (prop.type === 'ObjectMethod' && prop.key) {
@@ -2611,6 +3490,7 @@ function processAssignment(node, env, ctx) {
             prop._closureEnv = env;
             ctx.funcMap.set(`${leftStr}.${propName}`, prop);
             if (!ctx.funcMap.has(propName)) ctx.funcMap.set(propName, prop);
+            if (strippedLeft) ctx.funcMap.set(`${strippedLeft}.${propName}`, prop);
           }
         }
       }
@@ -2645,7 +3525,7 @@ function processAssignment(node, env, ctx) {
           severity: 'high',
           title: `XSS: tainted data assigned to event handler property .${propName}`,
           sink: makeSinkInfo(`.${propName}`, ctx, loc),
-          source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+          source: formatSources(annotateSinkSteps(rhsTaint, ctx, env)),
           path: buildTaintPath(rhsTaint, `.${propName}`),
         });
       }
@@ -2752,6 +3632,7 @@ function assignToPattern(rootPattern, rootTaint, env, ctx) {
     switch (pattern.type) {
       case 'Identifier': {
         const key = resolveId(pattern, ctx);
+        if (globalThis._TAINT_DEBUG && taint.tainted) console.log(`[ASSIGN-ID] ${pattern.name} key=${key} tainted=${taint.tainted}`);
         env.set(key, taint);
         const skipGlobal = ctx._blockScopedDecl && ctx.scopeInfo &&
           key !== `global:${pattern.name}` && key !== pattern.name &&
@@ -2769,24 +3650,41 @@ function assignToPattern(rootPattern, rootTaint, env, ctx) {
         if (!pattern.computed && pattern.property?.name) {
           const objStr = nodeToString(pattern.object);
           if (objStr) env.set(`${objStr}.${pattern.property.name}`, taint);
-          const GLOBAL_PREFIXES = new Set(['window', 'self', 'globalThis']);
-          if (pattern.object.type === 'Identifier' && GLOBAL_PREFIXES.has(pattern.object.name)) {
-            const propName = pattern.property.name;
-            env.set(propName, taint);
-            env.set(`global:${propName}`, taint);
+          const GLOBAL_PREFIXES = new Set(['window', 'self', 'globalThis', 'global']);
+          if (pattern.object.type === 'Identifier') {
+            const objName = env.aliases?.get(pattern.object.name) || pattern.object.name;
+            if (GLOBAL_PREFIXES.has(objName)) {
+              const propName = pattern.property.name;
+              env.set(propName, taint);
+              env.set(`global:${propName}`, taint);
+            }
           }
         }
         if (pattern.computed) {
           const objStr = nodeToString(pattern.object);
           if (objStr) {
             const resolved = resolveToConstant(pattern.property, null, ctx);
+            if (globalThis._TAINT_DEBUG) console.log(`[ASSIGN-COMPUTED] ${objStr}[${nodeToString(pattern.property)||'?'}] resolved=${resolved} tainted=${taint.tainted}`);
             if (resolved !== undefined) {
               env.set(`${objStr}.${resolved}`, taint);
               if (/^\d+$/.test(String(resolved))) {
                 env.set(`${objStr}.#idx_${resolved}`, taint);
+                // When assigning an array-like value (with per-element taints) to an
+                // array slot, propagate nested per-index taints. E.g., arr[1] = restArray
+                // where restArray has per-index taints → arr.#idx_1.#idx_0, arr.#idx_1.#idx_1, etc.
+                if (ctx.returnElementTaints) {
+                  const retElems = ctx.returnElementTaints;
+                  for (let ri = 0; ri < retElems.length; ri++) {
+                    if (retElems[ri]) {
+                      env.set(`${objStr}.#idx_${resolved}.#idx_${ri}`, retElems[ri]);
+                      env.set(`${objStr}.#idx_${resolved}.${ri}`, retElems[ri]);
+                    }
+                  }
+                }
               }
             } else {
               // Computed key couldn't be resolved → taint the base object
+              if (globalThis._TAINT_DEBUG && taint.tainted) console.log(`[ASSIGN-COMPUTED-FALLBACK] ${objStr}[?] → tainting base object '${objStr}'`);
               if (taint.tainted) {
                 env.set(objStr, env.get(objStr).clone().merge(taint));
                 // Also taint scope-resolved keys so outer lookups find it
@@ -2838,8 +3736,22 @@ function registerReturnedFunctions(target, ctx) {
   // Direct function return: var fn = factory()
   if (ctx.returnedFuncNode && target.type === 'Identifier') {
     const key = resolveId(target, ctx);
-    ctx.funcMap.set(key, ctx.returnedFuncNode);
-    ctx.funcMap.set(target.name, ctx.returnedFuncNode);
+    const retFunc = ctx.returnedFuncNode;
+    if (globalThis._TAINT_DEBUG) console.log(`[REG-RET] ${target.name} → ${retFunc.type}/${retFunc.id?.name||'anon'} params=${retFunc.params?.length}`);
+    ctx.funcMap.set(key, retFunc);
+    ctx.funcMap.set(target.name, retFunc);
+    // Copy returned function's sub-entries to target: if factory returns An,
+    // copy An.merge → rt.merge so later assignments like $n._ = rt can propagate
+    const retName = retFunc.id?.name;
+    if (retName) {
+      const retPrefix = retName + '.';
+      for (const [fk, fv] of ctx.funcMap) {
+        if (fk.startsWith(retPrefix)) {
+          const suffix = fk.slice(retPrefix.length);
+          ctx.funcMap.set(`${target.name}.${suffix}`, fv);
+        }
+      }
+    }
     ctx.returnedFuncNode = null;
   }
 
@@ -2956,6 +3868,24 @@ function binaryStep(accum, parts, index, bn, env, ctx, W, V) {
   W.push({ kind: W_EVAL_EXPR, node: right, env, ctx });
 }
 
+/** When && LHS is a proto-guard comparison (e.g., "__proto__" !== key), mark key as proto-guarded
+ *  so that PP checks in the RHS are suppressed. */
+// Apply exclusion constraint from a logical && guard: "x" !== key && ...
+// When LHS of && is truthy, RHS executes with the guarantee that key !== "x".
+function _applyLogicalExclusionGuard(node, env) {
+  if (node.type !== 'BinaryExpression') return;
+  if (node.operator !== '!==' && node.operator !== '!=') return;
+  let varName = null, strVal = null;
+  if (node.left.type === 'Identifier' && isStringLiteral(node.right)) {
+    varName = node.left.name; strVal = stringLiteralValue(node.right);
+  } else if (node.right.type === 'Identifier' && isStringLiteral(node.left)) {
+    varName = node.right.name; strVal = stringLiteralValue(node.left);
+  }
+  if (varName && typeof strVal === 'string') {
+    _addConstraintToVar(env, varName, { variable: varName, op: '!==', value: strVal });
+  }
+}
+
 /** Push work for the next step of a LogicalExpression chain, or finalize. */
 function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
   // While loop to handle short-circuit skips without recursion
@@ -2964,6 +3894,8 @@ function logicalStep(accum, parts, index, ln, env, ctx, W, V) {
     if (op === '&&') {
       const constLeft = isConstantBool(ln, ctx);
       if (constLeft === false) { V.push(TaintSet.empty()); return; }
+      // When LHS of && is truthy, apply proto-guard: "x" !== key && ... means key !== "x" on the RHS path
+      _applyLogicalExclusionGuard(ln, env);
       if (constLeft === true || accum.tainted) {
         // Left is known truthy (constant true OR tainted source string = always truthy)
         // Result is RHS only — push RHS with empty accum so merge doesn't carry LHS
@@ -3055,10 +3987,31 @@ export function evaluateExpr(node, env, ctx) {
           case 'Identifier': {
             const key = resolveId(_n, _c);
             const taint = _e.get(key);
-            if (taint.tainted) { V.push(taint.clone()); break; }
-            if (key !== _n.name && _e.has(key)) { V.push(TaintSet.empty()); break; }
+            if (taint.tainted) {
+              if (globalThis._TAINT_DEBUG) console.log(`[EVAL-ID] ${_n.name} key=${key} → TAINTED (direct) loc=${_n.loc?.start?.line}:${_n.loc?.start?.column}`);
+              V.push(taint.clone()); break;
+            }
+            // Check per-index taints: when array elements are individually tainted
+            // but the whole variable isn't (e.g., f[0] = tainted via loop assignment),
+            // merge per-index taints so the variable evaluates as tainted when passed
+            // to functions like identity(f) or applyHelper(t, this, o).
+            const _perIdxKey = (key !== _n.name && _e.has(key)) ? key : _n.name;
+            const _perIdx = _e.getTaintedWithPrefix(`${_perIdxKey}.#idx_`);
+            if (_perIdx.length > 0) {
+              const merged = TaintSet.empty();
+              for (const [, t] of _perIdx) merged.merge(t);
+              if (globalThis._TAINT_DEBUG) console.log(`[EVAL-ID] ${_n.name} key=${key} → TAINTED (per-idx, ${_perIdx.length} entries)`);
+              V.push(merged);
+              break;
+            }
+            if (key !== _n.name && _e.has(key)) {
+              if (globalThis._TAINT_DEBUG && (_n.name === 'o' || _n.name === 'f' || _n.name === 'u' || _n.name === 'arguments')) console.log(`[EVAL-ID] ${_n.name} key=${key} → EMPTY (scope-resolved, exists but empty)`);
+              V.push(TaintSet.empty()); break;
+            }
             const globalTaint = _e.get(`global:${_n.name}`);
-            if (globalTaint.tainted) { V.push(globalTaint.clone()); break; }
+            if (globalTaint.tainted) {
+              V.push(globalTaint.clone()); break;
+            }
             // DOM clobbering: bare identifier matching a DOM catalog element ID
             // with no JS declaration → attacker-controlled if they can inject HTML
             if (_c.domCatalog?.elements?.has(_n.name) && !_e.has(key)) {
@@ -3085,11 +4038,19 @@ export function evaluateExpr(node, env, ctx) {
           case 'RegExpLiteral':
           case 'Literal':
           case 'UpdateExpression':
+            // Track that the updated variable is no longer a constant.
+            // Without this, resolveToConstant returns the initializer forever
+            // (e.g., `for (var i=0; ...; i++)` always resolves i to 0).
+            if (_n.argument?.type === 'Identifier') {
+              if (!_c._mutatedVars) _c._mutatedVars = new Set();
+              _c._mutatedVars.add(_n.argument.name);
+            }
             V.push(TaintSet.empty());
             break;
           case 'ArrowFunctionExpression':
           case 'FunctionExpression':
             _n._closureEnv = _e;
+            _n._closureScopeInfo = _c.scopeInfo;
             V.push(TaintSet.empty());
             break;
           // ── Stage 6: MemberExpression (iterative chain walk) ──
@@ -3135,7 +4096,7 @@ export function evaluateExpr(node, env, ctx) {
                 }
               }
               if (!_mCur.computed && _mCur.object?.type === 'Identifier') {
-                const _mAlias = _e.aliases.get(_mCur.object.name);
+                const _mAlias = _e.getAlias(_mCur.object.name);
                 if (_mAlias && _mCur.property) {
                   const _mDeepPath = `${_mAlias}.${_mCur.property.name || _mCur.property.value}`;
                   if (MEMBER_SOURCES[_mDeepPath]) {
@@ -3224,11 +4185,22 @@ export function evaluateExpr(node, env, ctx) {
               }
             }
             if (_cCalleeStr && _n.callee.type === 'Identifier') {
-              const alias = _e.aliases.get(_cCalleeStr);
+              const alias = _e.getAlias(_cCalleeStr);
               if (alias) _cCalleeStr = alias;
+              // Resolve through parameter→arg name mapping (e.g., fn param received eval)
+              if (_c._paramArgNames) {
+                const paramArg = _c._paramArgNames.get(_cCalleeStr);
+                if (paramArg) _cCalleeStr = paramArg;
+              }
+              // Deep resolution: follow scope/init chains to resolve aliased builtins
+              // e.g., Qu = mn.Object → "Object" when mn resolves to window/self/globalThis
+              if (!_e.getAlias(_cCalleeStr) && !_c.funcMap.has(_cCalleeStr)) {
+                const identity = resolveCalleeIdentity(_n.callee, _e, _c);
+                if (identity) _cCalleeStr = identity;
+              }
             }
             if (_cCalleeStr && (_n.callee.type === 'MemberExpression' || _n.callee.type === 'OptionalMemberExpression')) {
-              const memberAlias = _e.aliases.get(_cCalleeStr);
+              const memberAlias = _e.getAlias(_cCalleeStr);
               if (memberAlias) _cCalleeStr = memberAlias;
             }
             if (!_cCalleeStr && _n.callee.type === 'SequenceExpression') {
@@ -3551,16 +4523,34 @@ export function evaluateExpr(node, env, ctx) {
             break;
           }
           case C_COND_BRANCH: {
-            const consequentTaint = V.pop();
+            let consequentTaint = V.pop();
             const cn = item.cn;
             if (item.checkedVar && !item.hadCheck) item.env.schemeCheckedVars.delete(item.checkedVar);
+            // Annotate consequent taint with positive branch constraints.
+            // The consequent only executes when the condition is true, so constraints
+            // from the true branch apply to these taint labels. Uses a temp env to
+            // extract constraints without modifying the real env (avoids side-effect breakage).
+            if (consequentTaint.tainted) {
+              const _tmp = new TaintEnv();
+              _tmp._branchConstraints = [];
+              applyBranchCondition(cn.test, true, _tmp);
+              for (const _c of _tmp._branchConstraints) {
+                consequentTaint = consequentTaint.withConstraint(_c);
+              }
+            }
             let accum = item.accum.merge(consequentTaint);
             if (!item.ctx.returnedFuncNode && cn.consequent.type === 'Identifier') {
               const refKey = resolveId(cn.consequent, item.ctx);
               const funcRef = item.ctx.funcMap.get(refKey) || item.ctx.funcMap.get(cn.consequent.name);
               if (funcRef) item.ctx.returnedFuncNode = funcRef;
             }
-            conditionalStep(accum, cn.alternate, item.env, item.ctx, W, V);
+            // Apply negated branch constraint to alternate env — the false branch
+            // only executes when the condition is false, so any condition checks
+            // (e.g., key === "__proto__") are negated on this path.
+            // Use a snapshot-clone: apply constraints but merge side effects back.
+            const altEnv = item.env.clone();
+            applyBranchCondition(cn.test, false, altEnv);
+            conditionalStep(accum, cn.alternate, altEnv, item.ctx, W, V);
             break;
           }
           case C_COND_FINAL: {
@@ -3750,6 +4740,29 @@ function _evaluateComputedMemberBody(node, objTaint, keyTaint, env, ctx) {
       const propName = !node.computed && node.property ? (node.property.name || node.property.value) : litKey;
       return propName ? objTaint.withTransform({ op: 'property', args: [propName] }) : objTaint.clone();
     }
+
+    // Level 1: Track builtin member access through parameters
+    // When n[t] where n resolves to a builtin object (Object, Array, etc.) and t resolves to a method name,
+    // set _returnedBuiltinAlias so the caller knows this expression yields a builtin reference.
+    // This enables: Be(Object, "defineProperty") → returns Object.defineProperty → tracked through chain.
+    if (litKey && node.object?.type === 'Identifier') {
+      const _BUILTIN_OBJS = ['Object', 'Array', 'Reflect', 'JSON', 'Math', 'Number', 'String', 'Boolean', 'Promise', 'Symbol'];
+      const objName = node.object.name;
+      // Resolve object name: through _paramArgNames (fn param), env.getAlias (walks parent chain)
+      let resolvedObjName = ctx._paramArgNames?.get(objName) || objName;
+      const _getAlias = (n) => env.getAlias ? env.getAlias(n) : env.aliases?.get(n);
+      resolvedObjName = _getAlias(resolvedObjName) || resolvedObjName;
+      // Also check if objName itself has a direct alias
+      if (!_BUILTIN_OBJS.includes(resolvedObjName)) {
+        const directAlias = _getAlias(objName);
+        if (directAlias) resolvedObjName = directAlias;
+      }
+      if (_BUILTIN_OBJS.includes(resolvedObjName)) {
+        ctx._returnedBuiltinAlias = `${resolvedObjName}.${litKey}`;
+        if (globalThis._TAINT_DEBUG) console.log(`[BUILTIN-MEMBER-L1] ${objName}[${litKey}] → ${ctx._returnedBuiltinAlias} (objName=${objName} resolved=${resolvedObjName})`);
+      }
+    }
+
     // If key is tainted but object has no tainted values, the read value is safe
   return objTaint;
 }
@@ -3769,9 +4782,27 @@ function isCalleeMatch(node, objectName, methodName, env) {
       const objName = callee.object.name;
       // Direct match or alias match
       if (objName === objectName) return true;
-      const alias = env?.aliases?.get(objName);
+      const alias = env?.getAlias ? env.getAlias(objName) : env?.aliases?.get(objName);
       if (alias === objectName) return true;
     }
+  }
+  // Aliased builtin: var Ai = Object.defineProperty; Ai(...) matches Object.defineProperty
+  if (callee.type === 'Identifier' && env?.getAlias) {
+    const alias = env.getAlias(callee.name);
+    if (globalThis._TAINT_DEBUG && methodName === 'defineProperty') {
+      // Verbose: trace the parent chain to find where alias might be
+      let depth = 0;
+      let cur = env;
+      let chain = '';
+      while (cur && depth < 10) {
+        const a = cur.aliases?.get(callee.name);
+        chain += `[d${depth}:${a||'-'}] `;
+        cur = cur.parent;
+        depth++;
+      }
+      console.log(`[isCalleeMatch] callee=${callee.name} want=${objectName}.${methodName} alias=${alias} chain=${chain}`);
+    }
+    if (alias === `${objectName}.${methodName}`) return true;
   }
   return false;
 }
@@ -3847,6 +4878,14 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
 
   const sinkInfo = checkCallSink(calleeStr, methodName);
   if (sinkInfo) checkSinkCall(node, sinkInfo, argTaints, calleeStr || methodName, env, ctx);
+
+  // Function(bodyStr) — parse constant string body into a real function AST
+  // e.g., Function("return this")() creates a function, calling it returns this (global scope)
+  if (calleeStr === 'Function' || calleeStr === 'window.Function' ||
+      calleeStr === 'self.Function' || calleeStr === 'globalThis.Function') {
+    const parsedFunc = parseFunctionConstructor(node.arguments);
+    if (parsedFunc) ctx.returnedFuncNode = parsedFunc;
+  }
 
   // DOM attachment tracking: parent.appendChild(child), parent.append(child), etc.
   if (methodName === 'appendChild' || methodName === 'append' || methodName === 'prepend' ||
@@ -4035,15 +5074,17 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
     const objNode = node.arguments[0];
     const propNode = node.arguments[1];
     const descNode = node.arguments[2];
-    // Detect tainted key as Prototype Pollution: Object.defineProperty(obj, taintedKey, ...)
+    // Object.defineProperty sets OWN properties by JS spec — it never traverses the
+    // prototype chain. PP only occurs when the TARGET is itself a prototype object.
+    // Evaluate the target AST to determine if it's a prototype reference.
     const propKeyTaint = evaluateExpr(propNode, env, ctx);
-    if (propKeyTaint.tainted) {
+    if (propKeyTaint.tainted && _isPrototypeNode(objNode)) {
       const loc = getNodeLoc(node);
       const objStr = nodeToString(objNode) || 'obj';
       pushFinding(ctx, {
         type: 'Prototype Pollution',
         severity: 'critical',
-        title: `Prototype Pollution: attacker controls property key in Object.defineProperty`,
+        title: `Prototype Pollution: attacker controls property key on prototype via Object.defineProperty`,
         sink: makeSinkInfo(`Object.defineProperty(${objStr}, taintedKey)`, ctx, loc),
         source: formatSources(propKeyTaint),
         path: buildTaintPath(propKeyTaint, `Object.defineProperty(${objStr}, taintedKey)`),
@@ -4104,7 +5145,18 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
         }
       }
     }
-    return TaintSet.empty();
+    // Object.defineProperty returns its first argument — propagate callability
+    if (objNode) {
+      if (objNode.type === 'Identifier') {
+        const key = resolveId(objNode, ctx);
+        const funcNode = ctx.funcMap.get(key) || ctx.funcMap.get(objNode.name);
+        if (funcNode) ctx.returnedFuncNode = funcNode;
+        if (globalThis._TAINT_DEBUG) console.log(`[ODP-RET] objNode=${objNode.name} key=${key} funcNode=${funcNode?.type}/${funcNode?.id?.name||'anon'} params=${funcNode?.params?.length} byKey=${!!ctx.funcMap.get(key)} byName=${!!ctx.funcMap.get(objNode.name)}`);
+      } else if (isFuncExpr(objNode)) {
+        ctx.returnedFuncNode = objNode;
+      }
+    }
+    return argTaints[0]?.clone() || TaintSet.empty();
   }
 
   // Object.getOwnPropertyDescriptor(obj, prop) — return descriptor with getter/setter refs
@@ -4239,10 +5291,11 @@ function _evaluateCallExprBody(node, calleeStr, methodName, argTaints, objTaint,
     }
   }
 
-  // Reflect.defineProperty(obj, taintedKey, descriptor) — PP with tainted key
+  // Reflect.defineProperty(obj, taintedKey, descriptor) — sets own properties.
+  // Only PP when target is a prototype object (same as Object.defineProperty).
   if (isCalleeMatch(node, 'Reflect', 'defineProperty', env) && node.arguments.length >= 2) {
     const propTaint = argTaints[1] || TaintSet.empty();
-    if (propTaint.tainted) {
+    if (propTaint.tainted && _isPrototypeNode(node.arguments[0])) {
       const loc = getNodeLoc(node);
       const objStr = nodeToString(node.arguments[0]) || 'obj';
       pushFinding(ctx, {
@@ -4521,6 +5574,11 @@ function _evaluateNewExprBody(node, constructorName, argTaints, env, ctx) {
     // new Function(body) or new Function(arg1, ..., body) — any tainted arg is code injection
     const allArgIndices = argTaints.map((_, i) => i);
     checkSinkCall(node, { type: 'XSS', taintedArgs: allArgIndices }, argTaints, 'new Function()', env, ctx);
+    // Parse constant string body into a real function AST for interprocedural analysis
+    const parsedFunc = parseFunctionConstructor(node.arguments);
+    if (parsedFunc) {
+      ctx.returnedFuncNode = parsedFunc;
+    }
   }
 
   // new WebSocket(url) — tainted URL is injection risk (attacker-controlled endpoint)
@@ -5136,21 +6194,44 @@ function handleBuiltinMethod(methodName, node, argTaints, objTaint, env, ctx) {
           callee: { ...node.callee, object: node.arguments?.[0] || node.callee.object },
         }, restArgTaints, thisArgTaint, env, ctx);
         if (result !== null) return thisArgTaint.clone().merge(result);
-        // Try interprocedural: fn.call(thisArg, arg1, ...) → analyze fn with args
-        const funcRef = calleeObj.type === 'Identifier'
+      }
+      // Try interprocedural: fn.call(thisArg, arg1, ...) → analyze fn with args
+      {
+        // Resolve callee name through _paramArgNames (parameter→arg mapping from call site)
+        const resolvedCallName = calleeObj?.type === 'Identifier'
+          ? (ctx._paramArgNames?.get(calleeObj.name) || calleeObj.name)
+          : protoMethod;
+
+        // Check if resolved callee is a known sink
+        if (resolvedCallName) {
+          const sinkInfo = checkCallSink(resolvedCallName, resolvedCallName);
+          if (sinkInfo) {
+            const sinkCall = { ...node, callee: calleeObj, arguments: node.arguments?.slice(1) || [] };
+            checkSinkCall(sinkCall, sinkInfo, restArgTaints, resolvedCallName, env, ctx);
+          }
+        }
+
+        // Try interprocedural with funcMap resolution
+        let funcRef = calleeObj?.type === 'Identifier'
           ? (ctx.funcMap.get(resolveId(calleeObj, ctx)) || ctx.funcMap.get(calleeObj.name))
           : (protoMethod && ctx.funcMap.get(protoMethod));
+        if (!funcRef && resolvedCallName !== protoMethod && resolvedCallName) {
+          funcRef = ctx.funcMap.get(resolvedCallName);
+        }
+        // IIFE .call(this): (function(){...}).call(thisArg) — callee object is a FunctionExpression
+        if (!funcRef && calleeObj && (calleeObj.type === 'FunctionExpression' || calleeObj.type === 'ArrowFunctionExpression')) {
+          funcRef = calleeObj;
+        }
         if (funcRef && funcRef.body) {
           const thisArgNode = node.arguments?.[0];
           const thisArgName = thisArgNode ? nodeToString(thisArgNode) : null;
           if (thisArgName) {
             funcRef._boundThisArg = thisArgName;
           } else if (thisArgNode && thisArgNode.type === 'ObjectExpression') {
-            // Inline object literal: evaluate properties into this.* bindings
             funcRef._boundThisNode = thisArgNode;
           }
           const synthCall = { ...node, callee: calleeObj, arguments: node.arguments.slice(1) };
-          return analyzeCalledFunction(synthCall, protoMethod, restArgTaints, env, ctx);
+          return analyzeCalledFunction(synthCall, resolvedCallName || protoMethod, restArgTaints, env, ctx);
         }
       }
       return thisArgTaint.clone().merge(restArgTaints.reduce((a, t) => a.merge(t), TaintSet.empty()));
@@ -5160,17 +6241,118 @@ function handleBuiltinMethod(methodName, node, argTaints, objTaint, env, ctx) {
       // Function.prototype.apply(thisArg, argsArray) — similar to call but args in array
       const thisArgTaint = argTaints[0] || TaintSet.empty();
       const argsArrayTaint = argTaints[1] || TaintSet.empty();
-      // Try interprocedural: fn.apply(thisArg, [args]) → analyze fn
       const applyObj = node.callee?.object;
       if (applyObj) {
-        const funcName = nodeToString(applyObj);
-        const funcRef = applyObj.type === 'Identifier'
+        // Resolve callee name: direct nodeToString, then through _paramArgNames
+        // for parameter→arg mapping (e.g., fn param received eval at call site)
+        let funcName = nodeToString(applyObj);
+        if (!funcName && applyObj.type === 'Identifier') funcName = applyObj.name;
+        const resolvedName = (applyObj.type === 'Identifier' && ctx._paramArgNames?.get(applyObj.name))
+          || funcName;
+
+        // Resolve funcRef early so we can use param count for taint unpacking
+        let funcRef = applyObj.type === 'Identifier'
           ? (ctx.funcMap.get(resolveId(applyObj, ctx)) || ctx.funcMap.get(applyObj.name))
           : (funcName && ctx.funcMap.get(funcName));
+        if (!funcRef && resolvedName !== funcName && resolvedName) {
+          funcRef = ctx.funcMap.get(resolvedName);
+        }
+        // IIFE .apply(this, args): (function(){...}).apply(thisArg, argsArray)
+        if (!funcRef && (applyObj.type === 'FunctionExpression' || applyObj.type === 'ArrowFunctionExpression')) {
+          funcRef = applyObj;
+        }
+        if (globalThis._TAINT_DEBUG) {
+          const _scopedKey = applyObj.type === 'Identifier' ? resolveId(applyObj, ctx) : 'N/A';
+          const _callerArg0 = ctx._callerArgNodes?.[0];
+          const _callerArg0Ret = _callerArg0?._returnedFuncNode;
+          console.log(`[APPLY] ${funcName}.apply() resolved=${resolvedName} funcRef=${funcRef?.type||'null'}/${funcRef?.id?.name||'anon'} params=${funcRef?.params?.length} hasBody=${!!funcRef?.body} scopeKey=${_scopedKey} hasClosure=${!!funcRef?._closureEnv} callerRetFunc=${!!ctx._callerReturnedFuncNode} retFunc=${!!ctx.returnedFuncNode} callerArg0RetFunc=${_callerArg0Ret?.type||'none'}/${_callerArg0Ret?.params?.length}`);
+        }
+        // Unpack per-index argument taints from the args array
+        const argsNode = node.arguments?.[1];
+        let unpackedArgTaints;
+        if (argsNode?.type === 'Identifier') {
+          const argsName = argsNode.name;
+          // Collect all per-index entries from the args variable.
+          // Use getAllWithPrefix to find the highest index, then fill in gaps with empty taints.
+          const allIdx = env.getAllWithPrefix(`${argsName}.#idx_`);
+          let maxIdx = -1;
+          const idxMap = new Map();
+          for (const [key, taint] of allIdx) {
+            const m = key.match(/\.#idx_(\d+)$/);
+            if (m) {
+              const idx = parseInt(m[1]);
+              idxMap.set(idx, taint);
+              if (idx > maxIdx) maxIdx = idx;
+            }
+          }
+          const perIdx = [];
+          for (let ai = 0; ai <= maxIdx; ai++) {
+            perIdx.push(idxMap.get(ai) || TaintSet.empty());
+          }
+          if (perIdx.length > 0) {
+            // Pad per-index array to cover all callee params — if the array was
+            // populated via a dynamic-index loop (o[i] = args[i]), some indices
+            // may be missing. Use the overall array taint for missing slots.
+            const paramCount = funcRef?.params?.length || perIdx.length;
+            while (perIdx.length < paramCount && argsArrayTaint.tainted) {
+              perIdx.push(argsArrayTaint.clone());
+            }
+            unpackedArgTaints = perIdx;
+          } else if (argsArrayTaint.tainted) {
+            // No per-index entries but the array variable itself is tainted (e.g., from
+            // a loop like `while(++i<N) arr[i] = args[i]` where indices couldn't be resolved).
+            // Spread the base taint across all params so each param gets tainted.
+            const paramCount = funcRef?.params?.length || 1;
+            unpackedArgTaints = Array.from({ length: Math.max(paramCount, 1) }, () => argsArrayTaint.clone());
+          } else {
+            unpackedArgTaints = [argsArrayTaint];
+          }
+        } else if (argsNode?.type === 'ArrayExpression') {
+          unpackedArgTaints = argsNode.elements.map(el => el ? evaluateExpr(el, env, ctx) : TaintSet.empty());
+        } else {
+          unpackedArgTaints = [argsArrayTaint];
+        }
+
+        // Check if resolved callee is a known sink (eval, document.write, etc.)
+        if (resolvedName) {
+          const sinkInfo = checkCallSink(resolvedName, resolvedName);
+          if (sinkInfo) {
+            const synthArgs = argsNode?.type === 'ArrayExpression' ? argsNode.elements : [];
+            const sinkCall = { ...node, callee: applyObj, arguments: synthArgs };
+            checkSinkCall(sinkCall, sinkInfo, unpackedArgTaints, resolvedName, env, ctx);
+          }
+        }
         if (funcRef && funcRef.body) {
-          // For apply, args are in an array — pass the array taint as each arg
-          const synthCall = { ...node, callee: applyObj, arguments: node.arguments?.slice(1) || [] };
-          return analyzeCalledFunction(synthCall, funcName, [argsArrayTaint], env, ctx);
+          const thisArgNode = node.arguments?.[0];
+          if (thisArgNode) {
+            const thisArgNameApply = nodeToString(thisArgNode);
+            if (thisArgNameApply) funcRef._boundThisArg = thisArgNameApply;
+          }
+          // Construct synthCall with proper argument AST nodes (not the argsArray wrapper).
+          // This enables function node registration (e.g., param→FunctionExpression mapping)
+          // inside the callee when functions are passed through .apply().
+          let synthArgs;
+          if (argsNode?.type === 'ArrayExpression') {
+            synthArgs = argsNode.elements;
+          } else if (argsNode?.type === 'Identifier' && argsNode.name === 'arguments' && ctx._callerArgNodes) {
+            synthArgs = ctx._callerArgNodes;
+            // Propagate returnedFuncNode from the outer call site so that param→funcNode
+            // registration works (e.g., Ce wrapper forwarding Ue result via arguments to ao)
+            if (ctx._callerReturnedFuncNode && !ctx.returnedFuncNode) {
+              ctx.returnedFuncNode = ctx._callerReturnedFuncNode;
+            }
+          } else {
+            synthArgs = node.arguments?.slice(1) || [];
+          }
+          const synthCall = { ...node, callee: applyObj, arguments: synthArgs };
+          // When args came from a variable (not inline array/arguments), store the variable
+          // name so analyzeCalledFunction can propagate nested per-index taints
+          // (e.g., argsVar.#idx_1.#idx_0 → param_r.#idx_0)
+          if (argsNode?.type === 'Identifier' && argsNode.name !== 'arguments') {
+            synthCall._applyArgsVarName = argsNode.name;
+          }
+          const applyResult = analyzeCalledFunction(synthCall, resolvedName || funcName, unpackedArgTaints, env, ctx);
+          return applyResult;
         }
       }
       return thisArgTaint.clone().merge(argsArrayTaint);
@@ -5752,6 +6934,7 @@ function analyzePromiseCallback(node, argTaints, objTaint, env, ctx) {
 // ── Shared frame finalization ──
 // Propagates results (exit state, returnedFuncNode, funcMap entries) from child to caller.
 const _GLOBAL_OBJ_PREFIXES = ['window.', 'self.', 'globalThis.'];
+let _wrapperIdCounter = 0;
 function _finalizeFrame(frame) {
   const { innerCtx, callerCtx, env, cfg, blockEnvs } = frame;
 
@@ -5764,16 +6947,48 @@ function _finalizeFrame(frame) {
   }
 
   // Propagate returned function/method info to the caller context
-  if (innerCtx.returnedFuncNode) callerCtx.returnedFuncNode = innerCtx.returnedFuncNode;
+  if (innerCtx.returnedFuncNode) {
+    if (globalThis._TAINT_DEBUG) console.log(`[FINALIZE] callee=${frame.calleeStr||'?'} retFunc=${innerCtx.returnedFuncNode.type}/${innerCtx.returnedFuncNode.id?.name||'anon'} params=${innerCtx.returnedFuncNode.params?.length} prevRetFunc=${callerCtx.returnedFuncNode?.type||'none'}/${callerCtx.returnedFuncNode?.id?.name||'anon'} prevParams=${callerCtx.returnedFuncNode?.params?.length||'?'}`);
+    callerCtx.returnedFuncNode = innerCtx.returnedFuncNode;
+    if (frame.callNode) {
+      frame.callNode._returnedFuncNode = callerCtx.returnedFuncNode;
+    }
+  }
   if (innerCtx.returnedMethods) callerCtx.returnedMethods = innerCtx.returnedMethods;
   if (innerCtx.returnElementTaints) callerCtx.returnElementTaints = innerCtx.returnElementTaints;
   if (innerCtx.returnPropertyTaints) callerCtx.returnPropertyTaints = innerCtx.returnPropertyTaints;
 
+  // Level 2: Propagate _returnedBuiltinAlias through interprocedural call chain
+  // When a callee returns a builtin reference (e.g., Be(Object,"defineProperty") → Object.defineProperty),
+  // propagate the alias to the caller so var assignments can register it.
+  if (innerCtx._returnedBuiltinAlias) {
+    if (globalThis._TAINT_DEBUG) console.log(`[FINALIZE-BUILTIN-L2] callee=${frame.calleeStr||'?'} alias=${innerCtx._returnedBuiltinAlias}`);
+    callerCtx._returnedBuiltinAlias = innerCtx._returnedBuiltinAlias;
+  }
+
+  // Propagate env aliases from inner to caller (for IIFEs especially)
+  // This allows aliases set inside an IIFE body to be visible in the caller scope
+  if (frame._isIIFE && innerCtx._iifePropagatedAliases) {
+    for (const [k, v] of innerCtx._iifePropagatedAliases) {
+      if (!env.aliases.has(k)) env.aliases.set(k, v);
+    }
+  }
+
   // Propagate funcMap entries: array callbacks, this.*, global objects, plain method names
   // COW: only iterate new entries (overlay), not the entire inherited map
   const newFuncEntries = innerCtx.funcMap.newEntries ? innerCtx.funcMap.newEntries() : innerCtx.funcMap;
+  // For IIFEs (callee is a FunctionExpression, not a named function), propagate ALL funcMap entries
+  // because IIFEs are scope wrappers — their purpose is to define globals via window.X, module.exports, etc.
+  const isIIFE = frame._isIIFE;
   for (const [key, val] of newFuncEntries) {
     if (callerCtx.funcMap.has(key)) continue;
+    if (isIIFE) {
+      // IIFE: propagate everything except scope-resolved keys (0:varName)
+      if (!(key.charCodeAt(0) >= 48 && key.charCodeAt(0) <= 57)) {
+        callerCtx.funcMap.set(key, val);
+      }
+      continue;
+    }
     if (key.length > 2 && key[key.length - 1] === ']' && key[key.length - 2] === '[') {
       callerCtx.funcMap.set(key, val);
     } else if (key.charCodeAt(0) === 116 && key.startsWith('this.')) { // 't'
@@ -5820,10 +7035,18 @@ function analyzeInlineFunction(funcNode, env, ctx, callerEnv) {
     ctx.globalEnv, ctx.scopeInfo, ctx.analyzedCalls
   );
   innerCtx._aifStack = ctx._aifStack; // propagate re-entrancy guard to nested calls
+  if (ctx._isRecursiveCall) innerCtx._isRecursiveCall = true; // propagate to callees
+  // Track source file for correct finding attribution in multi-file analysis.
+  // If the function was parsed from a different file, use that file for sink info.
+  innerCtx._sinkFile = funcNode._sourceFile || ctx._sinkFile || ctx.file;
   innerCtx.classBodyMap = ctx.classBodyMap;
   innerCtx.superClassMap = ctx.superClassMap;
   innerCtx.protoMethodMap = ctx.protoMethodMap;
   if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
+  if (ctx._localConstants?.size > 0) {
+    if (!innerCtx._localConstants) innerCtx._localConstants = new Map(ctx._localConstants);
+    else for (const [k, v] of ctx._localConstants) innerCtx._localConstants.set(k, v);
+  }
   if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
   if (ctx._handlerContext) innerCtx._handlerContext = ctx._handlerContext;
 
@@ -6168,12 +7391,27 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     }
   }
 
-  if (!funcNode || !funcNode.body) return TaintSet.empty();
+  if (!funcNode || !funcNode.body) {
+    if (globalThis._TAINT_DEBUG) {
+      const _aliasInfo = callNode.callee?.type === 'Identifier' && env?.getAlias ? env.getAlias(callNode.callee.name) : undefined;
+      console.log(`[ACF] NO funcNode for '${calleeStr}' callee=${callNode.callee?.type}/${callNode.callee?.name||''} alias=${_aliasInfo||'none'} key=${callNode.callee?.type === 'Identifier' ? resolveId(callNode.callee, ctx) : 'N/A'}`);
+    }
+    return TaintSet.empty();
+  }
 
   // Include the resolved super class in the signature so different super() calls in an inheritance chain aren't deduplicated
   const superSuffix = callNode.callee?.type === 'Super' && ctx._currentSuperClass ? `:super=${ctx._currentSuperClass}` : '';
   // For inline function expressions (IIFEs), use source location to disambiguate since they all resolve to 'anon'
   const locSuffix = (!calleeStr && funcNode.loc) ? `:${funcNode.loc.start.line}:${funcNode.loc.start.column}` : '';
+  // Include funcNode source location to disambiguate different function definitions
+  // that share the same calleeStr. This prevents cache collisions when e.g. nested wrappers
+  // both use "func" as parameter name — func(t,r) (callback) vs func(n,t) (outerFunc)
+  // resolve to different AST nodes but would otherwise share the same callSig.
+  let wrapperSuffix = '';
+  if (funcNode.loc && calleeStr &&
+      calleeStr.indexOf('.') === -1 && calleeStr.indexOf(':') === -1) {
+    wrapperSuffix = `:fl${funcNode.loc.start.line}:${funcNode.loc.start.column}`;
+  }
   let taintBits = 0;
   for (let i = 0; i < argTaints.length; i++) if (argTaints[i].tainted) taintBits |= (1 << i);
   // When arguments include ObjectExpressions, include property names in signature
@@ -6192,17 +7430,241 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       }
     }
   }
-  const callSig = `${calleeStr || 'anon'}:${taintBits}${superSuffix}${locSuffix}${objArgSuffix}`;
+  // When arguments include FunctionExpressions and taint is flowing (taintBits > 0),
+  // include source locations in signature so decorator calls with different inner functions
+  // are analyzed separately (different taint paths through different function bodies).
+  // When taintBits === 0 (definition time), skip this — structural result is identical,
+  // only returnedFuncNode differs, which we handle via wrapper creation on cache hit.
+  // When arguments include inline FunctionExpressions, include source locations so that
+  // calls like wrapper(function A(){...}) and wrapper(function B(){...}) are analyzed separately.
+  // Only include for INLINE function expressions — NOT for Identifier refs or CallExpression results,
+  // as those cause explosive cache growth in large libs (jQuery/lodash have 100s of internal wrapper calls).
+  let funcArgSuffix = '';
+  if (callNode.arguments) {
+    for (let i = 0; i < callNode.arguments.length; i++) {
+      const arg = callNode.arguments[i];
+      if (arg && (arg.type === 'FunctionExpression' || arg.type === 'ArrowFunctionExpression') && arg.loc) {
+        funcArgSuffix += `:fn${i}=${arg.loc.start.line}:${arg.loc.start.column}`;
+      } else if (arg && arg.type === 'Identifier') {
+        // When an Identifier arg resolves to a function in funcMap, include its identity
+        // in the sig. Without this, higher-order functions like apply(func, this, args)
+        // return cached results from a DIFFERENT function when called with the same taintBits
+        // but different closure-captured function references (e.g., lodash's minified wrapper
+        // chain where `n(t, this, o)` is called with different callbacks bound to `t`).
+        const resolvedKey = resolveId(arg, ctx);
+        const refFunc = ctx.funcMap.get(resolvedKey) || ctx.funcMap.get(arg.name);
+        if (refFunc) {
+          if (refFunc.loc) funcArgSuffix += `:fn${i}=${refFunc.loc.start.line}:${refFunc.loc.start.column}`;
+          else if (refFunc._wrapperId) funcArgSuffix += `:fn${i}=w${refFunc._wrapperId}`;
+        }
+      } else if (arg && (arg.type === 'CallExpression' || arg.type === 'OptionalCallExpression')) {
+        // When a CallExpression arg produced a returnedFuncNode (wrapper), include its
+        // identity so passthrough functions like setToString(overRest(...), str) don't
+        // collapse all calls into one cached result with the wrong returned function.
+        const retFunc = arg._returnedFuncNode;
+        if (retFunc) {
+          if (retFunc.loc) funcArgSuffix += `:fn${i}=${retFunc.loc.start.line}:${retFunc.loc.start.column}`;
+          else if (retFunc._wrapperId) funcArgSuffix += `:fn${i}=w${retFunc._wrapperId}`;
+        }
+      }
+    }
+  }
+  const callSig = `${calleeStr || 'anon'}:${taintBits}${superSuffix}${locSuffix}${wrapperSuffix}${objArgSuffix}${funcArgSuffix}`;
+  if (globalThis._TAINT_DEBUG) {
+    console.log(`[ACF] ENTER '${calleeStr}' fn=${funcNode.id?.name||'anon'} params=${funcNode.params?.length} taintBits=${taintBits} sig=${callSig} cached=${ctx.analyzedCalls.has(callSig)}`);
+    if (funcNode.params?.length === 0 && taintBits > 0 && funcNode._closureFuncMap) {
+      const entries = [];
+      for (const [k, v] of funcNode._closureFuncMap) {
+        entries.push(`${k}→${v?.id?.name||v?.type||'?'}(${v?.params?.length||'?'})`);
+      }
+      console.log(`[ACF-0PARAM-CLOSURE] wrapperId=${funcNode._wrapperId||'none'} ownKeys=[${funcNode._closureFuncMap._own ? [...funcNode._closureFuncMap._own.keys()].filter(k=>k==='t'||k==='n'||k.endsWith(':t')||k.endsWith(':n')).join(',') : 'N/A'}] entries: ${entries.slice(0,20).join(', ')}`);
+    }
+  }
   if (ctx.analyzedCalls.has(callSig)) {
     const cached = ctx.analyzedCalls.get(callSig);
-    if (cached && cached._returnedFuncNode) ctx.returnedFuncNode = cached._returnedFuncNode;
+    // For definition-time calls (taintBits=0) with function args, reuse cached structural
+    // result but create a fresh wrapper for returnedFuncNode with current closure bindings.
+    // This avoids re-analyzing the same wrapper body N times (e.g., lodash's baseRest(fn) x100).
+    if (cached && cached._returnedFuncNode && taintBits === 0) {
+      // For functions with 0 params (passthrough/shortOut pattern using 'arguments'):
+      // arg evaluation may have already set ctx.returnedFuncNode to the correct wrapper
+      // (e.g., xo(Ue(...), str) where Ue(...) produces the returned function).
+      // Since there are no named params, the wrapper path can't bind any closure entries.
+      // Preserve the arg-eval returnedFuncNode if set; otherwise fall back to cached.
+      if (!funcNode.params || funcNode.params.length === 0) {
+        if (!ctx.returnedFuncNode) {
+          ctx.returnedFuncNode = cached._returnedFuncNode;
+        }
+        if (cached._returnedMethods) ctx.returnedMethods = cached._returnedMethods;
+        if (globalThis._TAINT_DEBUG) console.log(`[ACF] CACHE-HIT(0-param) '${calleeStr}' → tainted=${cached.tainted} retFunc=${ctx.returnedFuncNode?.type}/${ctx.returnedFuncNode?.id?.name||'anon'}`);
+        return cached.clone();
+      }
+      // Get the underlying AST node. If cached is an Object.create wrapper (_wrapperId),
+      // unwrap one level to the prototype (the real AST node). If it's already a real AST
+      // node (no _wrapperId), use it directly — its prototype is Node.prototype, not an AST node.
+      const rfn = cached._returnedFuncNode;
+      const astNode = rfn._wrapperId ? (Object.getPrototypeOf(rfn) || rfn) : rfn;
+      const newWrapper = Object.create(astNode);
+      // Build closure bindings: bind function's params → current call's args
+      // so the wrapper's body can resolve parameter references (e.g., func → innerWrapper)
+      const closureEnv = (funcNode._closureEnv || env).child();
+      const closureFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
+      if (funcNode._closureFuncMap) {
+        // Closure entries take priority over caller-inherited entries
+        for (const [k, v] of funcNode._closureFuncMap) {
+          closureFuncMap.set(k, v);
+        }
+        // Add caller entries that aren't in the closure
+        for (const [k, v] of ctx.funcMap) {
+          if (!closureFuncMap.has(k)) closureFuncMap.set(k, v);
+        }
+      }
+      // When the returned function already has its own closureFuncMap (e.g., a wrapper
+      // from overRest with closure binding t→callback), merge those bindings with highest
+      // priority. Without this, passthrough wrappers like setToString(overRest(...))
+      // would lose the inner function's closure bindings and replace them with the
+      // outer caller's entries (e.g., t → outer function declaration).
+      if (rfn._closureFuncMap) {
+        for (const [k, v] of rfn._closureFuncMap) {
+          closureFuncMap.set(k, v);
+        }
+      }
+      // Resolve scope-qualified param keys using the callee's scope info so that
+      // body references (which resolve via scopeInfo) find the correct bindings.
+      const wrapperScopeInfo = funcNode._closureScopeInfo || ctx.scopeInfo;
+      for (let pi = 0; pi < funcNode.params.length && pi < callNode.arguments.length; pi++) {
+        const param = funcNode.params[pi];
+        if (param.type !== 'Identifier') continue;
+        const argNode = callNode.arguments[pi];
+        let boundFunc = null;
+        if (argNode.type === 'FunctionExpression' || argNode.type === 'ArrowFunctionExpression') {
+          const argWrapper = Object.create(argNode);
+          argWrapper._closureEnv = env;
+          argWrapper._closureFuncMap = ctx.funcMap;
+          argWrapper._wrapperId = ++_wrapperIdCounter;
+          boundFunc = argWrapper;
+        } else if (argNode.type === 'Identifier') {
+          const refFunc = ctx.funcMap.get(resolveId(argNode, ctx)) || ctx.funcMap.get(argNode.name);
+          if (refFunc) boundFunc = refFunc;
+        }
+        // CallExpression arg that produced a returnedFuncNode (per-node or volatile ctx)
+        if (argNode.type === 'CallExpression' || argNode.type === 'OptionalCallExpression') {
+          const retFunc = argNode._returnedFuncNode || ctx.returnedFuncNode;
+          if (retFunc) boundFunc = retFunc;
+        }
+        if (boundFunc) {
+          closureFuncMap.set(param.name, boundFunc);
+          // Also set scope-qualified key so resolveId() lookups in the wrapper body
+          // find the correct function (e.g., "6:t" for Ue's param 't')
+          if (wrapperScopeInfo) {
+            const paramKey = wrapperScopeInfo.resolve(param);
+            if (paramKey && paramKey !== param.name) closureFuncMap.set(paramKey, boundFunc);
+          }
+        }
+        if (argTaints[pi]) closureEnv.set(param.name, argTaints[pi]);
+      }
+      // Apply closure→param mapping: rebind inner closure keys to current call's
+      // argument functions. This handles multi-level wrapper chains where the
+      // returned function's closure uses a different variable name than the callee's
+      // param (e.g., fr(callback) returns Ue wrapper with closure key 't' → callback,
+      // so on cache hit we need to bind 't' to the new call's arg).
+      if (cached._closureParamMapping) {
+        for (const [closureKey, paramIdx] of Object.entries(cached._closureParamMapping)) {
+          if (paramIdx < callNode.arguments.length) {
+            const argNode = callNode.arguments[paramIdx];
+            let resolvedFunc = null;
+            // Reuse the wrapper already bound for this param
+            const paramName = funcNode.params[paramIdx]?.name;
+            if (paramName) resolvedFunc = closureFuncMap.get(paramName);
+            if (!resolvedFunc) {
+              if (argNode.type === 'FunctionExpression' || argNode.type === 'ArrowFunctionExpression') {
+                const w = Object.create(argNode);
+                w._closureEnv = env; w._closureFuncMap = ctx.funcMap;
+                w._wrapperId = ++_wrapperIdCounter;
+                resolvedFunc = w;
+              } else if (argNode.type === 'Identifier') {
+                resolvedFunc = ctx.funcMap.get(resolveId(argNode, ctx)) || ctx.funcMap.get(argNode.name);
+              } else if (argNode.type === 'CallExpression' || argNode.type === 'OptionalCallExpression') {
+                resolvedFunc = argNode._returnedFuncNode || ctx.returnedFuncNode;
+              }
+            }
+            if (resolvedFunc) {
+              closureFuncMap.set(closureKey, resolvedFunc);
+              if (globalThis._TAINT_DEBUG) console.log(`[FIX-C] closureKey=${closureKey} paramIdx=${paramIdx} → ${resolvedFunc.id?.name||resolvedFunc.type}(${resolvedFunc.params?.length})`);
+            }
+          }
+        }
+      }
+      newWrapper._closureEnv = closureEnv;
+      newWrapper._closureFuncMap = closureFuncMap;
+      newWrapper._wrapperId = ++_wrapperIdCounter;
+      if (ctx._paramArgNames) newWrapper._closureParamArgNames = ctx._paramArgNames;
+      ctx.returnedFuncNode = newWrapper;
+      if (cached._returnedMethods) ctx.returnedMethods = cached._returnedMethods;
+      if (globalThis._TAINT_DEBUG) {
+        console.log(`[ACF] CACHE-HIT(wrapper) '${calleeStr}' wrapperId=${newWrapper._wrapperId} → tainted=${cached.tainted} retFunc=${newWrapper.type}/${newWrapper.id?.name||'anon'} params=${newWrapper.params?.length}`);
+        if (newWrapper.params?.length === 0) {
+          const te = closureFuncMap.get('t'), ne = closureFuncMap.get('n');
+          console.log(`[ACF] CACHE-HIT(0param) t=${te?.id?.name||te?.type||'?'}(${te?.params?.length||'?'}) n=${ne?.id?.name||ne?.type||'?'}(${ne?.params?.length||'?'})`);
+        }
+      }
+      return cached.clone();
+    }
+    if (cached && cached._returnedFuncNode) {
+      ctx.returnedFuncNode = cached._returnedFuncNode;
+    }
     if (cached && cached._returnedMethods) ctx.returnedMethods = cached._returnedMethods;
+    // If cache entry was pre-seeded (analysis still in progress) and the call has
+    // tainted arguments, this is a recursive call. Return the merged argument taint
+    // as a conservative approximation: tainted input → tainted output.
+    // This enables recursive merge functions to propagate taint through recursion.
+    if (cached?._preSeeded && taintBits > 0) {
+      // Mark the current analysis context as recursive — the function calls itself.
+      // This enables PP Pattern 5 to expand the danger set (e.g., constructor path).
+      ctx._isRecursiveCall = true;
+      const mergedArgTaint = TaintSet.empty();
+      for (const at of argTaints) if (at.tainted) mergedArgTaint.merge(at.clone());
+      if (mergedArgTaint.tainted) {
+        if (globalThis._TAINT_DEBUG) console.log(`[ACF] RECURSIVE-APPROX '${calleeStr}' → propagating arg taint as return`);
+        return mergedArgTaint;
+      }
+    }
+    if (globalThis._TAINT_DEBUG) console.log(`[ACF] CACHE-HIT '${calleeStr}' → tainted=${cached?.tainted} retFunc=${cached?._returnedFuncNode?.id?.name||'none'}`);
     return cached?.clone() || TaintSet.empty();
   }
-  ctx.analyzedCalls.set(callSig, TaintSet.empty());
+  const _preSeeded = TaintSet.empty();
+  _preSeeded._preSeeded = true;
+  ctx.analyzedCalls.set(callSig, _preSeeded);
+
+  // Detect recursion: if the same function name is already on the IP call stack,
+  // mark the context so PP Pattern 5 can expand the danger set.
+  if (calleeStr && ctx._ipStack) {
+    for (const frame of ctx._ipStack) {
+      if (frame.calleeStr === calleeStr) {
+        ctx._isRecursiveCall = true;
+        break;
+      }
+    }
+  }
 
   const closureEnv = funcNode._closureEnv || env;
   const childEnv = closureEnv.child();
+
+  // For wrapper functions (created via Object.create in returnedFuncNode handling):
+  // Walk the prototype chain to find inner function's closure env bindings that may
+  // have been lost through wrapper stacking. Each wrapper level overwrites _closureEnv
+  // with the outer function's env, losing inner closure variables (e.g., Ue's param 'r'
+  // gets lost when xo wraps the result). Copy missing bindings into childEnv so the
+  // body can access closure variables from the inner function's definition context.
+  let proto = Object.getPrototypeOf(funcNode);
+  while (proto && proto !== Object.prototype) {
+    if (proto._closureEnv && proto._closureEnv !== closureEnv) {
+      for (const [key, val] of proto._closureEnv.entries()) {
+        if (!childEnv.has(key)) childEnv.set(key, val);
+      }
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
 
   // For method calls (obj.method()), bind 'this' to the receiver object
   // Propagate obj.* taint as this.* so this.prop lookups resolve correctly
@@ -6288,14 +7750,23 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   }
 
   // Store function expression arguments in funcMap so they can be called inside the body
-  const innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
-  // Merge closure-captured funcMap entries so inner-scope functions (e.g., M inside jQuery IIFE) are accessible
+  // Build innerFuncMap with correct lexical scoping:
+  // 1. Start from closure scope (where the function was defined) — these represent
+  //    the function's free variable bindings and should take priority.
+  // 2. Add caller's entries that aren't in the closure scope — these represent
+  //    functions/variables discovered after the closure was created.
+  // 3. Parameter bindings (set below at ~line 6835) override everything.
+  let innerFuncMap;
   if (funcNode._closureFuncMap) {
-    for (const [key, val] of funcNode._closureFuncMap) {
+    // Start from closure funcMap as the base
+    innerFuncMap = funcNode._closureFuncMap.fork ? funcNode._closureFuncMap.fork() : new FuncMap(funcNode._closureFuncMap);
+    // Add caller entries that aren't in the closure (don't override closure bindings)
+    for (const [key, val] of ctx.funcMap) {
       if (!innerFuncMap.has(key)) innerFuncMap.set(key, val);
     }
+  } else {
+    innerFuncMap = ctx.funcMap.fork ? ctx.funcMap.fork() : new FuncMap(ctx.funcMap);
   }
-
   // Proxy apply trap: bind target function to 1st param name so t() resolves inside trap body
   if (funcNode._isProxyApplyTrap && funcNode._proxyTargetFunc && funcNode._proxyTargetParam) {
     innerFuncMap.set(funcNode._proxyTargetParam, funcNode._proxyTargetFunc);
@@ -6311,16 +7782,28 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     }
   }
 
+  // Compute the callee's scopeInfo early so param assignment uses the same scoped keys
+  // as the body. Without this, cross-file calls (app.js → lodash.js) resolve param nodes
+  // using the caller's scopeInfo, producing different keys than the body's scopeInfo,
+  // causing closure variable lookups to fall through to polluted global:name entries.
+  const innerScopeInfo = funcNode._closureScopeInfo || ctx.scopeInfo;
+  // Create a lightweight ctx proxy for param assignment that uses callee's scopeInfo
+  const paramCtx = innerScopeInfo !== ctx.scopeInfo ? Object.create(ctx, {
+    scopeInfo: { value: innerScopeInfo, writable: false }
+  }) : ctx;
+
   for (let i = 0; i < funcNode.params.length; i++) {
     const param = funcNode.params[i];
     if (param.type === 'Identifier' && callNode.arguments[i]) {
       const argNode = callNode.arguments[i];
       if (argNode.type === 'FunctionExpression' || argNode.type === 'ArrowFunctionExpression') {
-        argNode._closureEnv = env;
-        argNode._closureFuncMap = ctx.funcMap;
-        innerFuncMap.set(param.name, argNode);
-        const paramKey = resolveId(param, ctx);
-        innerFuncMap.set(paramKey, argNode);
+        const argWrapper = Object.create(argNode);
+        argWrapper._closureEnv = env;
+        argWrapper._closureFuncMap = ctx.funcMap;
+        argWrapper._wrapperId = ++_wrapperIdCounter;
+        innerFuncMap.set(param.name, argWrapper);
+        const paramKey = resolveId(param, paramCtx);
+        innerFuncMap.set(paramKey, argWrapper);
       }
       if (argNode.type === 'Identifier') {
         const refKey = resolveId(argNode, ctx);
@@ -6331,8 +7814,9 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
           const refFunc = ctx.funcMap.get(refKey) || ctx.funcMap.get(argNode.name);
           if (refFunc) {
             innerFuncMap.set(param.name, refFunc);
-            const paramKey = resolveId(param, ctx);
+            const paramKey = resolveId(param, paramCtx);
             innerFuncMap.set(paramKey, refFunc);
+            if (globalThis._TAINT_DEBUG) console.log(`[ACF-PARAM-BIND] param=${param.name} paramKey=${paramKey} arg=${argNode.name} refKey=${refKey} → ${refFunc.id?.name||refFunc.type}(${refFunc.params?.length})`);
           }
         }
       }
@@ -6342,42 +7826,60 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
             const pName = propKeyName(prop.key);
             const val = prop.value;
             if (pName && val && (val.type === 'FunctionExpression' || val.type === 'ArrowFunctionExpression')) {
-              val._closureEnv = env;
-              val._closureFuncMap = ctx.funcMap;
-              innerFuncMap.set(`${param.name}.${pName}`, val);
+              const valWrapper = Object.create(val);
+              valWrapper._closureEnv = env;
+              valWrapper._closureFuncMap = ctx.funcMap;
+              valWrapper._wrapperId = ++_wrapperIdCounter;
+              innerFuncMap.set(`${param.name}.${pName}`, valWrapper);
             }
           }
+        }
+      }
+      // CallExpression arg that produced a returnedFuncNode (factory/decorator result):
+      // Register the returned function under the parameter name so the callee body
+      // can resolve it (e.g., shortOut(overRest(...)) → func.apply() resolves func).
+      // Must overwrite any inherited entry (e.g., outer scope's 'func' from baseRest).
+      // Use per-call-site _returnedFuncNode (tagged on AST node in _finalizeFrame) first,
+      // falling back to the volatile ctx.returnedFuncNode. Per-call-site is immune to
+      // overwrites by sibling argument evaluations (e.g., xo(Ue(...), n+"")).
+      if (argNode.type === 'CallExpression' || argNode.type === 'OptionalCallExpression') {
+        const retFunc = argNode._returnedFuncNode || ctx.returnedFuncNode;
+        if (retFunc) {
+          innerFuncMap.set(param.name, retFunc);
+          const paramKey = resolveId(param, paramCtx);
+          innerFuncMap.set(paramKey, retFunc);
+          if (globalThis._TAINT_DEBUG) console.log(`[ACF-RETFUNC] param=${param.name} paramKey=${paramKey} retFunc=${retFunc.type}/${retFunc.id?.name||'anon'} params=${retFunc.params?.length} source=${argNode._returnedFuncNode ? 'per-node' : 'ctx'}`);
         }
       }
     }
     if (param.type === 'RestElement') {
       const restTaint = TaintSet.empty();
       for (let j = i; j < argTaints.length; j++) restTaint.merge(argTaints[j]);
-      assignToPattern(param.argument, restTaint, childEnv, ctx);
+      assignToPattern(param.argument, restTaint, childEnv, paramCtx);
     } else {
       if (param.type === 'AssignmentPattern' && i < callNode.arguments.length) {
         const argNode = callNode.arguments[i];
         const isUndefined = argNode && argNode.type === 'Identifier' && argNode.name === 'undefined';
         if (isUndefined) {
-          assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+          assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, paramCtx);
         } else {
-          assignToPattern(param.left, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+          assignToPattern(param.left, argTaints[i] || TaintSet.empty(), childEnv, paramCtx);
         }
       } else {
         if (param.type === 'ObjectPattern' && callNode.arguments[i]) {
           const argNode = callNode.arguments[i];
           const argStr = nodeToString(argNode);
           if (argStr) {
-            assignObjectPatternFromSource(param, argStr, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+            assignObjectPatternFromSource(param, argStr, argTaints[i] || TaintSet.empty(), childEnv, paramCtx);
           } else if (argNode.type === 'ObjectExpression') {
             const literalProps = new Map();
             for (const prop of argNode.properties) {
               if (isObjectProp(prop) && prop.key) {
                 const pName = propKeyName(prop.key);
-                if (pName) literalProps.set(pName, evaluateExpr(prop.value, childEnv, ctx));
+                if (pName) literalProps.set(pName, evaluateExpr(prop.value, childEnv, paramCtx));
               }
               if (prop.type === 'SpreadElement' || prop.type === 'RestElement') {
-                const spreadTaint = evaluateExpr(prop.argument || prop, childEnv, ctx);
+                const spreadTaint = evaluateExpr(prop.argument || prop, childEnv, paramCtx);
                 if (spreadTaint.tainted) {
                   for (const pp of param.properties) {
                     if (pp.type !== 'RestElement') {
@@ -6390,27 +7892,77 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
             }
             for (const prop of param.properties) {
               if (prop.type === 'RestElement') {
-                assignToPattern(prop.argument, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+                assignToPattern(prop.argument, argTaints[i] || TaintSet.empty(), childEnv, paramCtx);
                 continue;
               }
               const keyName = propKeyName(prop.key);
               const target = prop.value || prop.key;
               if (keyName && literalProps.has(keyName)) {
                 if (target.type === 'AssignmentPattern') {
-                  assignToPattern(target.left, literalProps.get(keyName), childEnv, ctx);
+                  assignToPattern(target.left, literalProps.get(keyName), childEnv, paramCtx);
                 } else {
-                  assignToPattern(target, literalProps.get(keyName), childEnv, ctx);
+                  assignToPattern(target, literalProps.get(keyName), childEnv, paramCtx);
                 }
               } else {
-                assignToPattern(target, TaintSet.empty(), childEnv, ctx);
+                assignToPattern(target, TaintSet.empty(), childEnv, paramCtx);
               }
             }
           } else {
-            assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+            assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, paramCtx);
           }
         } else {
-          assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, ctx);
+          assignToPattern(param, argTaints[i] || TaintSet.empty(), childEnv, paramCtx);
         }
+      }
+    }
+  }
+
+  // Propagate per-index taints from caller to callee when passing array-like values.
+  // When fn(arguments) or fn(args) is called and the arg has .#idx_N entries, copy them
+  // to the callee's param name so param[N] resolves correctly.
+  if (callNode.arguments) {
+    for (let i = 0; i < funcNode.params.length && i < callNode.arguments.length; i++) {
+      const param = funcNode.params[i];
+      if (param.type !== 'Identifier') continue;
+      const argNode = callNode.arguments[i];
+      const paramName = param.name;
+      if (argNode?.type === 'Identifier') {
+        const argName = argNode.name;
+        // Copy argName.#idx_N → paramName.#idx_N for array-like pass-through.
+        // Use getAllWithPrefix (not getTaintedWithPrefix) to include non-tainted entries,
+        // since clean entries at lower indices are needed for correct per-index unpacking
+        // (e.g., arr[0]={} arr[1]=tainted → both must propagate for apply to unpack correctly).
+        const perIdxEntries = env.getAllWithPrefix(`${argName}.#idx_`);
+        for (const [key, taint] of perIdxEntries) {
+          const suffix = key.slice(argName.length);
+          childEnv.set(`${paramName}${suffix}`, taint);
+        }
+      } else if (argNode?.type === 'ArrayExpression') {
+        // Inline array: fn([a, b, c]) → set paramName.#idx_N for each element
+        for (let ai = 0; ai < argNode.elements.length; ai++) {
+          const el = argNode.elements[ai];
+          if (el) {
+            childEnv.set(`${paramName}.#idx_${ai}`, evaluateExpr(el, env, ctx));
+          }
+        }
+      }
+    }
+  }
+  // When called via .apply(ctx, argsVar), propagate nested per-index taints from the
+  // args variable to each parameter. E.g., argsVar.#idx_1.#idx_0 → param_r.#idx_0
+  // This handles patterns like lodash's overRest where args are rebuilt into an array,
+  // with some elements being arrays themselves (rest args), then passed via .apply().
+  if (callNode._applyArgsVarName && funcNode.params) {
+    const argsVarName = callNode._applyArgsVarName;
+    for (let i = 0; i < funcNode.params.length; i++) {
+      const param = funcNode.params[i];
+      if (param.type !== 'Identifier') continue;
+      const paramName = param.name;
+      const prefix = `${argsVarName}.#idx_${i}.`;
+      const nested = env.getTaintedWithPrefix(prefix);
+      for (const [key, taint] of nested) {
+        const suffix = key.slice(prefix.length - 1); // keep the dot
+        childEnv.set(`${paramName}${suffix}`, taint);
       }
     }
   }
@@ -6488,15 +8040,50 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
   // Build a map of parameter → constant argument value for resolveToConstant
   const savedParamConstants = ctx._paramConstants;
   const paramConstants = new Map();
+  // Build a map of parameter → original argument Identifier name for callee resolution
+  // e.g., wrapper(eval, args) → fn→"eval" so fn.apply() resolves correctly
+  const paramArgNames = new Map();
   for (let i = 0; i < funcNode.params.length && i < callNode.arguments.length; i++) {
     const param = funcNode.params[i];
     if (param.type === 'Identifier') {
       const argNode = callNode.arguments[i];
       const constVal = resolveToConstant(argNode, env, ctx);
       if (constVal !== undefined) paramConstants.set(param.name, constVal);
+      // Track Identifier arg names for callee resolution in .call()/.apply()
+      // Resolve through aliases and parent _paramArgNames for multi-level wrappers
+      if (argNode.type === 'Identifier') {
+        const resolvedArgName = ctx._paramArgNames?.get(argNode.name)
+          || env.aliases?.get(argNode.name) || argNode.name;
+        paramArgNames.set(param.name, resolvedArgName);
+      } else if (argNode.type === 'MemberExpression' || argNode.type === 'OptionalMemberExpression') {
+        const argPath = nodeToString(argNode);
+        if (argPath) paramArgNames.set(param.name, argPath);
+      }
     }
   }
   if (paramConstants.size > 0) ctx._paramConstants = paramConstants;
+
+  // Propagate caller's aliases to function parameters
+  // When defaults(target, src) is called with src=xn and xn has alias 'self',
+  // the parameter 'src' inside the function should carry alias 'self'
+  for (let i = 0; i < funcNode.params.length && i < callNode.arguments.length; i++) {
+    const param = funcNode.params[i];
+    if (param.type !== 'Identifier') continue;
+    const argNode = callNode.arguments[i];
+    if (argNode.type === 'Identifier') {
+      const argAlias = env.getAlias ? env.getAlias(argNode.name) : env.aliases?.get(argNode.name);
+      if (argAlias) childEnv.aliases.set(param.name, argAlias);
+      // Also propagate per-property aliases: if caller has xn.X → Y, set src.X → Y
+      const argName = argNode.name;
+      const prefix = argName + '.';
+      for (const [aliasKey, aliasValue] of env.aliases) {
+        if (aliasKey.startsWith(prefix)) {
+          const suffix = aliasKey.slice(prefix.length);
+          childEnv.aliases.set(`${param.name}.${suffix}`, aliasValue);
+        }
+      }
+    }
+  }
 
   const body = funcNode.body.type === 'BlockStatement'
     ? funcNode.body
@@ -6504,16 +8091,55 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
 
   // Build the CFG and inner context for the function body
   const innerCfg = buildCFG(body);
+  // innerScopeInfo already computed above (before param assignment) to ensure consistent
+  // scope key resolution between param assignment and body analysis.
   const innerCtx = new AnalysisContext(
     ctx.file, innerFuncMap.fork ? innerFuncMap.fork() : new FuncMap(innerFuncMap), ctx.findings,
-    ctx.globalEnv, ctx.scopeInfo, ctx.analyzedCalls
+    ctx.globalEnv, innerScopeInfo, ctx.analyzedCalls
   );
+  innerCtx._sinkFile = funcNode._sourceFile || ctx._sinkFile || ctx.file;
+  if (ctx._isRecursiveCall) innerCtx._isRecursiveCall = true;
   innerCtx.classBodyMap = ctx.classBodyMap;
   innerCtx.superClassMap = ctx.superClassMap;
   innerCtx.protoMethodMap = ctx.protoMethodMap;
   if (ctx._paramConstants) innerCtx._paramConstants = ctx._paramConstants;
+  // Propagate local constants to callee for closure variable resolution
+  if (ctx._localConstants?.size > 0) {
+    if (!innerCtx._localConstants) innerCtx._localConstants = new Map(ctx._localConstants);
+    else for (const [k, v] of ctx._localConstants) innerCtx._localConstants.set(k, v);
+    // Remove entries that conflict with function parameter names — params shadow
+    // outer constants (e.g., outer `var mn = "..."` shadowed by param `mn`)
+    if (funcNode.params) {
+      for (const param of funcNode.params) {
+        if (param.type === 'Identifier' && innerCtx._localConstants.has(param.name)) {
+          innerCtx._localConstants.delete(param.name);
+        }
+      }
+    }
+  }
+  if (paramArgNames.size > 0) innerCtx._paramArgNames = paramArgNames;
   if (funcNode._superClass) innerCtx._currentSuperClass = funcNode._superClass;
   if (ctx._handlerContext) innerCtx._handlerContext = ctx._handlerContext;
+
+  // Store caller's argument AST nodes so that `arguments` inside the body can resolve
+  // to the actual call-site nodes (needed for func.apply(this, arguments) wrappers)
+  if (callNode.arguments) {
+    innerCtx._callerArgNodes = callNode.arguments;
+    // Also store the returnedFuncNode from the call site so that func.apply(T, arguments)
+    // can propagate it into the callee's param registration (e.g., Ce wrapper forwarding
+    // the Ue wrapper result to ao via arguments object)
+    if (ctx.returnedFuncNode) innerCtx._callerReturnedFuncNode = ctx.returnedFuncNode;
+  }
+  // Propagate closure-captured param→arg names from factory patterns
+  if (funcNode._closureParamArgNames) {
+    if (!innerCtx._paramArgNames) innerCtx._paramArgNames = new Map(funcNode._closureParamArgNames);
+    else for (const [k, v] of funcNode._closureParamArgNames) innerCtx._paramArgNames.set(k, v);
+  }
+  // Propagate closure-captured local constants
+  if (funcNode._closureLocalConstants) {
+    if (!innerCtx._localConstants) innerCtx._localConstants = new Map(funcNode._closureLocalConstants);
+    else for (const [k, v] of funcNode._closureLocalConstants) innerCtx._localConstants.set(k, v);
+  }
 
   // Capture all state needed for post-processing in a closure
   const _callNode = callNode, _callSig = callSig, _childEnv = childEnv,
@@ -6527,8 +8153,13 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     _callerCtx.funcMap = _savedFuncMap;
 
     // Propagate new funcMap entries discovered during the call (COW: only overlay)
+    // Skip scope-qualified keys (e.g., "6:t") — these are parameter bindings local to the
+    // callee's scope and must not leak to the caller. Without this filter, a higher-order
+    // function like Ue(callback) leaks "6:t → callback" to the caller, polluting subsequent
+    // calls with stale bindings (e.g., lodash's wrapper cache resolves to wrong callback).
     const _newFuncEntries = _innerFuncMap.newEntries ? _innerFuncMap.newEntries() : _innerFuncMap;
     for (const [key, val] of _newFuncEntries) {
+      if (key.charCodeAt(0) >= 48 && key.charCodeAt(0) <= 57) continue;
       if (!_savedFuncMap.has(key)) _savedFuncMap.set(key, val);
     }
 
@@ -6562,6 +8193,28 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       }
     }
 
+    // IIFE .call(this) at global scope: propagate this.* as global exports
+    // e.g., (function(){ this._ = lodash; }).call(this) → window._ = lodash
+    if (_funcNode._boundThisArg === 'this') {
+      for (const [key, taint] of _childEnv.entries()) {
+        if (key.startsWith('this.')) {
+          const propName = key.slice(5);
+          _callerEnv.set(propName, taint);
+          _callerEnv.set(`global:${propName}`, taint);
+          _callerEnv.set(`window.${propName}`, taint);
+        }
+      }
+      // Also propagate funcMap entries: this.methodName → global methodName
+      const _newFuncEntries3 = _innerFuncMap.newEntries ? _innerFuncMap.newEntries() : _innerFuncMap;
+      for (const [key, val] of _newFuncEntries3) {
+        if (key.startsWith('this.')) {
+          const propName = key.slice(5);
+          _savedFuncMap.set(propName, val);
+          _savedFuncMap.set(`window.${propName}`, val);
+        }
+      }
+    }
+
     // Propagate closure variable mutations back to the closure env
     if (_funcNode._closureEnv) {
       for (const [key, taint] of _childEnv.entries()) {
@@ -6586,6 +8239,19 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
           key.slice(0, 5) !== 'this.' && key.slice(0, 7) !== 'global:' &&
           !(key[0] >= '0' && key[0] <= '9')) {
         _callerEnv.set(key, taint);
+      }
+    }
+
+    // Propagate global exports from IIFEs (global:X entries and their bare forms)
+    // IIFEs are scope wrappers — their window.X assignments should be visible in the outer scope
+    if (_callNode.callee && (_callNode.callee.type === 'FunctionExpression' ||
+        _callNode.callee.type === 'ArrowFunctionExpression')) {
+      for (const [key, taint] of _childEnv.entries()) {
+        if (key.startsWith('global:') && key.length > 7) {
+          _callerEnv.set(key, taint);
+          const bare = key.slice(7);
+          _callerEnv.set(bare, taint);
+        }
       }
     }
 
@@ -6616,10 +8282,57 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
       }
     }
 
+    // Propagate returnedFuncNode/Methods to caller context so the call site can use them
+    if (innerCtx.returnedFuncNode) _callerCtx.returnedFuncNode = innerCtx.returnedFuncNode;
+    if (innerCtx.returnedMethods) _callerCtx.returnedMethods = innerCtx.returnedMethods;
+
+    // Propagate returned aliases (property aliases from the returned variable)
+    if (innerCtx._returnedAliases) _callerCtx._returnedAliases = innerCtx._returnedAliases;
+
+    // Propagate parameter property aliases back to caller argument names
+    // Mirrors the parameter property taint propagation pattern above
+    for (let i = 0; i < _funcNode.params.length && i < _callNode.arguments.length; i++) {
+      const param = _funcNode.params[i];
+      if (param.type !== 'Identifier') continue;
+      const pName = param.name;
+      const argNode = _callNode.arguments[i];
+      const argStr = nodeToString(argNode);
+      if (!argStr || argStr === pName) continue;
+      const prefix = pName + '.';
+      for (const [aliasKey, aliasValue] of _childEnv.aliases) {
+        if (aliasKey.startsWith(prefix)) {
+          const suffix = aliasKey.slice(pName.length);
+          _callerEnv.aliases.set(`${argStr}${suffix}`, aliasValue);
+        }
+      }
+    }
+
     // Cache the result (include returnedFuncNode/Methods so cache hits restore them)
     const cachedResult = result.tainted ? result : TaintSet.empty();
     if (innerCtx.returnedFuncNode) cachedResult._returnedFuncNode = innerCtx.returnedFuncNode;
     if (innerCtx.returnedMethods) cachedResult._returnedMethods = innerCtx.returnedMethods;
+
+    // Store closure→param mapping: when the returned function's closureFuncMap entries
+    // match callee param bindings by identity, record which closure key came from which
+    // param index. Cache-hit wrapper path uses this to rebind inner closure keys to
+    // current call's argument functions (multi-level wrapper propagation).
+    if (innerCtx.returnedFuncNode && innerCtx.returnedFuncNode._closureFuncMap) {
+      const mapping = {};
+      for (const [key, val] of innerCtx.returnedFuncNode._closureFuncMap) {
+        for (let pi = 0; pi < _funcNode.params.length; pi++) {
+          if (_funcNode.params[pi].type !== 'Identifier') continue;
+          const paramFunc = _innerFuncMap.get(_funcNode.params[pi].name);
+          if (paramFunc && paramFunc === val) {
+            mapping[key] = pi;
+            break;
+          }
+        }
+      }
+      if (Object.keys(mapping).length > 0) {
+        cachedResult._closureParamMapping = mapping;
+        if (globalThis._TAINT_DEBUG) console.log(`[FIX-B] sig=${_callSig} mapping=${JSON.stringify(mapping)}`);
+      }
+    }
     _callerCtx.analyzedCalls.set(_callSig, cachedResult);
   };
 
@@ -6633,7 +8346,15 @@ function analyzeCalledFunction(callNode, calleeStr, argTaints, env, ctx) {
     callerCtx: ctx,
     env: childEnv,
     postProcess,
+    calleeStr,
+    callNode,  // for tagging returnedFuncNode per call site
   };
+  // Mark IIFE frames: callee is an inline FunctionExpression (not resolved from funcMap)
+  // IIFEs are scope wrappers — their globals/funcMap entries should propagate to the caller
+  if (callNode.callee && (callNode.callee.type === 'FunctionExpression' ||
+      callNode.callee.type === 'ArrowFunctionExpression')) {
+    frame._isIIFE = true;
+  }
 
   // If we're inside the IP loop, push a frame and signal suspension
   if (ctx._ipStack) {
@@ -6656,11 +8377,6 @@ function processForBinding(node, env, ctx) {
   // but tainted when the iterable itself is attacker-controlled (e.g., JSON.parse(tainted))
   if (node._isForIn) {
     let keyTaint = TaintSet.empty();
-    // Only taint keys when the object was produced by an attacker-controlled expression
-    // that controls object structure (JSON.parse, postMessage data, etc.).
-    // Object literals with tainted values have known keys — those keys are safe.
-    // Detect by checking taint labels: if any label has a transform from JSON.parse
-    // or comes from a source that controls structure, the keys are attacker-controlled.
     const iterableTaint = evaluateExpr(node.right, env, ctx);
     if (iterableTaint.tainted) {
       const labels = iterableTaint.toArray();
@@ -6676,6 +8392,7 @@ function processForBinding(node, env, ctx) {
         if (l.type === 'window.name' || l.type === 'cookie') return true;
         return false;
       });
+      if (globalThis._TAINT_DEBUG) console.log(`[FOR-IN] iterable tainted, controlsStructure=${controlsStructure} labels=${labels.map(l=>`${l.type||l.description}[${(l.transforms||[]).map(t=>t.op).join(',')}]`).join(';')}`);
       if (controlsStructure) {
         keyTaint = iterableTaint;
       }
@@ -6893,7 +8610,7 @@ function checkElementPropertySink(leftNode, rhsTaint, rhsNode, env, ctx) {
         severity: 'critical',
         title: `XSS: tainted data flows to script element ${propName}`,
         sink: makeSinkInfo(sinkExpr, ctx, loc),
-        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx, env)),
         path: buildTaintPath(rhsTaint, sinkExpr),
       });
     }
@@ -6910,7 +8627,7 @@ function checkElementPropertySink(leftNode, rhsTaint, rhsNode, env, ctx) {
         severity: getSeverity(type),
         title: `${type}: tainted data flows to ${tag} element ${propName}`,
         sink: makeSinkInfo(sinkExpr, ctx, loc),
-        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx, env)),
         path: buildTaintPath(rhsTaint, sinkExpr),
       });
     }
@@ -6926,7 +8643,7 @@ function checkElementPropertySink(leftNode, rhsTaint, rhsNode, env, ctx) {
       severity: getSeverity(type),
       title: `${type}: tainted data flows to ${tag} element ${propName}`,
       sink: makeSinkInfo(sinkExpr, ctx, loc),
-      source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+      source: formatSources(annotateSinkSteps(rhsTaint, ctx, env)),
       path: buildTaintPath(rhsTaint, sinkExpr),
     });
     return;
@@ -6949,7 +8666,7 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
       severity: 'high',
       title: `CSS Injection: tainted data flows to ${leftStr || 'element.style'}`,
       sink: makeSinkInfo(leftStr || 'element.style', ctx, loc),
-      source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+      source: formatSources(annotateSinkSteps(rhsTaint, ctx, env)),
       path: buildTaintPath(rhsTaint, leftStr || 'element.style'),
     });
     return;
@@ -7008,7 +8725,7 @@ function checkSinkAssignment(leftNode, rhsTaint, rhsNode, env, ctx) {
     severity,
     title: `${type}: tainted data flows to ${leftStr || propName}`,
     sink: makeSinkInfo(leftStr || propName, ctx, loc),
-    source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+    source: formatSources(annotateSinkSteps(rhsTaint, ctx, env)),
     path: buildTaintPath(rhsTaint, leftStr || propName),
   });
 }
@@ -7049,7 +8766,7 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
       severity,
       title: `${type}: tainted data flows to ${calleeStr}()`,
       sink: makeSinkInfo(`${calleeStr}(arg${argIdx})`, ctx, loc),
-      source: formatSources(annotateSinkSteps(argTaint, ctx)),
+      source: formatSources(annotateSinkSteps(argTaint, ctx, env)),
       path: buildTaintPath(argTaint, calleeStr),
     });
   }
@@ -7059,10 +8776,15 @@ function checkSinkCall(callNode, sinkInfo, argTaints, calleeStr, env, ctx) {
 // All taint values are pre-computed by the caller (processAssignment) in the iterative engine.
 // rhsTaint: taint of the RHS value, keyTaint: taint of the innermost computed key,
 // outerKeyTaint: taint of the outer computed key in obj[k1][k2] patterns.
-export function checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, outerKeyTaint) {
+export function checkPrototypePollution(node, _env, ctx, rhsTaint, keyTaint, outerKeyTaint) {
   if (node.type !== 'AssignmentExpression') return;
   const left = node.left;
   if (left.type !== 'MemberExpression') return;
+  if (globalThis._TAINT_DEBUG && (rhsTaint.tainted || keyTaint.tainted)) {
+    const keyTransforms = keyTaint.tainted ? keyTaint.toArray().map(l => (l.transforms||[]).map(t=>t.op).join(',')).join(';') : '';
+    const rhsTransforms = rhsTaint.tainted ? rhsTaint.toArray().map(l => (l.transforms||[]).map(t=>t.op).join(',')).join(';') : '';
+    console.log(`[PP-CHECK] ${nodeToString(left)||left.type} computed=${left.computed} rhsTainted=${rhsTaint.tainted} keyTainted=${keyTaint.tainted} outerKeyTainted=${outerKeyTaint.tainted} file=${ctx.file} keyTransforms=[${keyTransforms}] rhsTransforms=[${rhsTransforms}] loc=${node.loc?.start?.line}:${node.loc?.start?.column}`);
+  }
 
   // Pattern 1: obj[key1][key2] = tainted (both keys tainted)
   if (left.computed && left.object.type === 'MemberExpression' && left.object.computed) {
@@ -7075,6 +8797,7 @@ export function checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, oute
         sink: makeSinkInfo(nodeToString(left) || 'obj[key1][key2]', ctx, loc),
         source: formatSources(outerKeyTaint.clone().merge(keyTaint)),
         path: buildTaintPath(outerKeyTaint.clone().merge(keyTaint), 'obj[key1][key2]'),
+        sinkModel: { dangerousValues: [..._PROTO_SETTER_KEYS, 'constructor'], constraintSource: outerKeyTaint },
       });
     }
   }
@@ -7136,17 +8859,21 @@ export function checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, oute
         severity: 'critical',
         title: 'Prototype Pollution: tainted data assigned to __proto__',
         sink: makeSinkInfo(expr, ctx, loc),
-        source: formatSources(annotateSinkSteps(rhsTaint, ctx)),
+        source: formatSources(annotateSinkSteps(rhsTaint, ctx, _env)),
         path: buildTaintPath(rhsTaint, expr),
       });
     }
   }
 
-  // Pattern 5: obj[taintedKey] = taintedValue — attacker controls both key and value
-  // Can set __proto__ to attacker data. Only flag when value is also tainted to avoid FPs
-  // on patterns like `obj[taintedKey] = "safe literal"`.
+  // Pattern 5: obj[taintedKey] = taintedValue — attacker controls both key and value.
   if (left.computed && !(left.object.type === 'MemberExpression' && left.object.computed)) {
     if (keyTaint.tainted && rhsTaint.tainted) {
+      if (globalThis._TAINT_DEBUG) {
+        const keyNode = left.property;
+        const keyName = keyNode?.type === 'Identifier' ? keyNode.name : nodeToString(keyNode);
+        const objStr2 = nodeToString(left.object);
+        console.log(`[PP5-FIRE] ${objStr2}[${keyName}] loc=${node.loc?.start?.line}:${node.loc?.start?.column} recursive=${!!ctx._isRecursiveCall} keyLabels=${keyTaint.toArray().map(l=>l.description).join(';')}`);
+      }
       const loc = getNodeLoc(node);
       const objStr = nodeToString(left.object) || 'obj';
       pushFinding(ctx, {
@@ -7156,11 +8883,35 @@ export function checkPrototypePollution(node, env, ctx, rhsTaint, keyTaint, oute
         sink: makeSinkInfo(`${objStr}[taintedKey]`, ctx, loc),
         source: formatSources(keyTaint.clone().merge(rhsTaint)),
         path: buildTaintPath(keyTaint, `${objStr}[taintedKey]`),
+        // When inside a recursive function (e.g., deep merge), the attacker's value
+        // gets recursively processed. This enables 2-step PP via constructor.prototype.
+        // Expand danger set to include 'constructor' when recursion is detected.
+        // Check constraints from BOTH key and value — the value's constraints
+        // (from safeGet conditional returns) also restrict which keys are viable.
+        sinkModel: (() => {
+          // In recursive functions, check if the value went through a conditional
+          // return (has constraints). If so, the attacker's structured data gets
+          // recursively processed, enabling constructor.prototype PP.
+          const rhsHasConstraints = ctx._isRecursiveCall && rhsTaint.tainted &&
+            rhsTaint.toArray().some(l => l.constraints && l.constraints.length > 0);
+          return {
+            dangerousValues: rhsHasConstraints
+              ? [..._PROTO_SETTER_KEYS, 'constructor']
+              : _PROTO_SETTER_KEYS,
+            constraintSource: keyTaint,
+            valueConstraintSource: rhsHasConstraints ? rhsTaint : null,
+          };
+        })(),
       });
     }
   }
 }
 
+
+// Check if a TaintSet carries structured data — the attacker controls nested properties.
+// Structured sources: JSON.parse output, postMessage data, parsed URL params.
+// When structured, obj[key] = val allows the attacker to set nested objects,
+// enabling multi-level PP (e.g., constructor.prototype).
 function buildTaintPath(taintSet, sinkExpr) {
   return taintSet.toArray().map(label => `${label.description} (${label.file}:${label.line}) → ${sinkExpr}`);
 }
@@ -7414,16 +9165,36 @@ function wrapDelivery(sourceType, value, pageUrl, sourceKey, propertyChain) {
 // Emits working JavaScript with sequential postMessage calls or timer waits.
 function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
   const page = 'https://victim.com/page';
+  const prereqSteps = stateSteps.filter(s => s.action === 'prerequisite');
   const storeSteps = stateSteps.filter(s => s.action === 'store');
   const sinkSteps = stateSteps.filter(s => s.action === 'sink');
-  if (storeSteps.length === 0) return null;
+  if (storeSteps.length === 0 && prereqSteps.length === 0) return null;
 
   const isPostMessage = sourceType.startsWith('postMessage');
-  if (!isPostMessage) return null;
+  if (!isPostMessage && prereqSteps.length === 0) return null;
 
   const lines = [];
-  lines.push(`// Multi-step PoC — ${storeSteps.length + sinkSteps.length} message(s) required`);
+  const totalSteps = prereqSteps.length + storeSteps.length + sinkSteps.length;
+  lines.push(`// Multi-step PoC — ${totalSteps} step(s) required`);
   lines.push(`var w = window.open(${JSON.stringify(page)});`);
+
+  // Prerequisites: state that must be set up via other event sources (URL, hashchange, etc.)
+  for (let i = 0; i < prereqSteps.length; i++) {
+    const prereq = prereqSteps[i];
+    const condDesc = prereq.condition
+      ? `${prereq.condition.discriminant} === ${JSON.stringify(prereq.condition.value)}`
+      : 'state setup';
+    if (prereq.sourceType === 'url.location.hash' || prereq.sourceType === 'url.hashchange') {
+      const hashVal = prereq.condition?.value || '';
+      lines.push(`// Step ${i + 1}: set URL hash to satisfy ${condDesc}`);
+      lines.push(`w.location.hash = ${JSON.stringify(hashVal)};`);
+    } else if (prereq.sourceType?.startsWith('url.')) {
+      lines.push(`// Step ${i + 1}: navigate with URL param to satisfy ${condDesc}`);
+      lines.push(`// Ensure URL contains: ${prereq.condition?.propName}=${JSON.stringify(prereq.condition?.value)}`);
+    } else {
+      lines.push(`// Step ${i + 1}: prerequisite — ${condDesc} (via ${prereq.sourceType})`);
+    }
+  }
 
   let delay = 1000;
 
@@ -7453,16 +9224,18 @@ function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
         ? `${store.condition.discriminant} !== ${JSON.stringify(store.condition.value)}`
         : `${store.condition.discriminant} === ${JSON.stringify(store.condition.value)}`)
       : 'handler';
-    lines.push(`// Step ${i + 1}: store payload via ${condDesc}`);
+    const stepNum = prereqSteps.length + i + 1;
+    lines.push(`// Step ${stepNum}: store payload via ${condDesc}`);
     lines.push(`setTimeout(() => w.postMessage(${msgData}, '*'), ${delay});`);
     delay += 1000;
   }
 
   for (let i = 0; i < sinkSteps.length; i++) {
     const sink = sinkSteps[i];
+    const stepNum = prereqSteps.length + storeSteps.length + i + 1;
     if (sink.handler === 'timer') {
       const timerDelay = sink.delay || 0;
-      lines.push(`// Step ${storeSteps.length + i + 1}: wait ${timerDelay}ms for timer callback to fire and trigger sink`);
+      lines.push(`// Step ${stepNum}: wait ${timerDelay}ms for timer callback to fire and trigger sink`);
     } else if (sink.condition) {
       const triggerObj = {};
       if (sink.condition.negated) {
@@ -7473,15 +9246,34 @@ function buildMultiStepVector(stateSteps, propertyChain, rawInput, sourceType) {
       const condDesc = sink.condition.negated
         ? `${sink.condition.discriminant} !== ${JSON.stringify(sink.condition.value)}`
         : `${sink.condition.discriminant} === ${JSON.stringify(sink.condition.value)}`;
-      lines.push(`// Step ${storeSteps.length + i + 1}: trigger sink via ${condDesc}`);
+      lines.push(`// Step ${stepNum}: trigger sink via ${condDesc}`);
       lines.push(`setTimeout(() => w.postMessage(${JSON.stringify(triggerObj)}, '*'), ${delay});`);
       delay += 1000;
     }
   }
 
+  // If there are prerequisites but no store/sink steps, add the postMessage delivery
+  // as the final step — the prerequisite sets up state, the postMessage delivers payload
+  if (prereqSteps.length > 0 && storeSteps.length === 0 && sinkSteps.length === 0 && isPostMessage) {
+    const stepNum = prereqSteps.length + 1;
+    const msgObj = {};
+    const dataProps = propertyChain.filter(p => p !== 'data');
+    if (dataProps.length > 0) {
+      let cur = msgObj;
+      for (let pi = 0; pi < dataProps.length - 1; pi++) { cur[dataProps[pi]] = {}; cur = cur[dataProps[pi]]; }
+      cur[dataProps[dataProps.length - 1]] = rawInput;
+    } else {
+      msgObj._raw = rawInput;
+    }
+    const msgData = msgObj._raw !== undefined ? JSON.stringify(msgObj._raw) : JSON.stringify(msgObj);
+    lines.push(`// Step ${stepNum}: deliver payload via postMessage`);
+    lines.push(`setTimeout(() => w.postMessage(${msgData}, '*'), 1000);`);
+  }
+
+  const msgCount = storeSteps.length + sinkSteps.filter(s => s.handler !== 'timer').length + (prereqSteps.length > 0 && storeSteps.length === 0 ? 1 : 0);
   return {
     vector: lines.join('\n'),
-    description: `Send ${storeSteps.length + sinkSteps.filter(s => s.handler !== 'timer').length} sequential postMessage(s) to trigger ${storeSteps.length > 0 ? 'multi-step ' : ''}exploit`,
+    description: `${prereqSteps.length > 0 ? 'Set up prerequisite state, then s' : 'S'}end ${msgCount} postMessage(s) to trigger exploit`,
   };
 }
 

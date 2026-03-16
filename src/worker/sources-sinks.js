@@ -62,6 +62,9 @@ export const CALL_SOURCES = {
   'JSON.parse': 'passthrough',
   'fetch': 'passthrough',       // tainted URL → tainted response for .then chains
   'String': 'passthrough',
+  'Object': 'passthrough',
+  'Number': 'passthrough',
+  'Boolean': 'passthrough',
   'JSON.stringify': 'passthrough',
   'structuredClone': 'passthrough',
   'URL.createObjectURL': 'passthrough',

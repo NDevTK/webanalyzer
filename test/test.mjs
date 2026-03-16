@@ -1,14 +1,21 @@
 /* test/test.mjs — Unified test suite for the taint analysis engine.
    Covers positive detections, negative (safe) patterns, and baseline library scans. */
 
-import { readFileSync, readdirSync } from 'fs';
+import { readFileSync, readdirSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { analyze, analyzeMultiple } from './harness.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const libsDir = resolve(__dirname, 'libs');
+const cveDir = resolve(__dirname, 'cve');
+const bundlesDir = resolve(__dirname, 'bundles');
 const jquerySrc = readFileSync(resolve(libsDir, 'jquery.min.js'), 'utf8');
+
+// Helper: load a file if it exists, return null otherwise (for optional CVE/bundle files)
+function tryReadFile(path) {
+  try { return readFileSync(path, 'utf8'); } catch { return null; }
+}
 
 let passed = 0, failed = 0;
 
@@ -42,6 +49,14 @@ function expect(findings) {
     notToHaveType(type) {
       const found = findings.some(f => f.type === type);
       if (found) throw new Error(`Expected no "${type}" finding but got one: ${findings.filter(f => f.type === type).map(f => f.title).join('; ')}`);
+    },
+    toHaveFingerprint(fp) {
+      const found = findings.some(f => f.sink?.fingerprint === fp);
+      if (!found) throw new Error(`Expected finding at ${fp} but got: [${findings.map(f => f.sink?.fingerprint).join(', ') || 'none'}]`);
+    },
+    notToHaveFingerprint(fp) {
+      const found = findings.some(f => f.sink?.fingerprint === fp);
+      if (found) throw new Error(`Expected no finding at ${fp} but one exists`);
     },
     get not() {
       return {
@@ -41787,12 +41802,21 @@ test('recursive merge function with tainted key', () => {
   expect(findings).toHaveType('Prototype Pollution');
 });
 
-test('Object.defineProperty with tainted key', () => {
+test('Object.defineProperty on prototype with tainted key', () => {
+  const { findings } = analyze(`
+    var key = location.hash;
+    Object.defineProperty(Object.prototype, key, { value: "x" });
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+test('SAFE: Object.defineProperty on plain object with tainted key', () => {
+  // Object.defineProperty sets own properties — safe on non-prototype targets
   const { findings } = analyze(`
     var key = location.hash;
     Object.defineProperty({}, key, { value: "x" });
   `);
-  expect(findings).toHaveType('Prototype Pollution');
+  expect(findings).notToHaveType('Prototype Pollution');
 });
 
 test('Reflect.set with __proto__', () => {
@@ -43197,13 +43221,22 @@ test('PP: nested bracket access obj[a][b] = tainted', () => {
   expect(findings).toHaveType('Prototype Pollution');
 });
 
-test('PP: Object.defineProperty with tainted property name', () => {
+test('PP: Object.defineProperty on prototype with tainted property name', () => {
+  const { findings } = analyze(`
+    window.addEventListener('message', function(e) {
+      Object.defineProperty(Object.prototype, e.data.prop, { value: e.data.val });
+    });
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+test('SAFE: Object.defineProperty on plain object with tainted property name', () => {
   const { findings } = analyze(`
     window.addEventListener('message', function(e) {
       Object.defineProperty({}, e.data.prop, { value: e.data.val });
     });
   `);
-  expect(findings).toHaveType('Prototype Pollution');
+  expect(findings).notToHaveType('Prototype Pollution');
 });
 
 test('PP: Reflect.set with __proto__ key', () => {
@@ -44617,12 +44650,20 @@ test('PP: recursive merge function', () => {
   expect(findings).toHaveType('Prototype Pollution');
 });
 
-test('PP: Reflect.defineProperty', () => {
+test('PP: Reflect.defineProperty on prototype', () => {
+  const { findings } = analyze(`
+    var key = location.hash.slice(1);
+    Reflect.defineProperty(Object.prototype, key, { value: "x" });
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+test('SAFE: Reflect.defineProperty on plain object', () => {
   const { findings } = analyze(`
     var key = location.hash.slice(1);
     Reflect.defineProperty({}, key, { value: "x" });
   `);
-  expect(findings).toHaveType('Prototype Pollution');
+  expect(findings).notToHaveType('Prototype Pollution');
 });
 
 test('SAFE: PP — static keys (no taint)', () => {
@@ -44634,7 +44675,7 @@ test('SAFE: PP — static keys (no taint)', () => {
   expect(findings).notToHaveType('Prototype Pollution');
 });
 
-test('SAFE: PP — hasOwnProperty guard', () => {
+test('SAFE: PP — __proto__ guard suppresses PP', () => {
   const { findings } = analyze(`
     function safeMerge(target, source) {
       for (var key in source) {
@@ -44647,9 +44688,8 @@ test('SAFE: PP — hasOwnProperty guard', () => {
     var input = JSON.parse(location.hash);
     safeMerge({}, input);
   `);
-  // Engine may still flag this — the __proto__ skip is hard to model
-  // At minimum it should detect the base pattern
-  expect(findings).toHaveType('Prototype Pollution');
+  // Engine recognizes key === '__proto__' continue guard → no PP
+  expect(findings).notToHaveType('Prototype Pollution');
 });
 
 test('PP: Object.setPrototypeOf with tainted proto', () => {
@@ -45284,6 +45324,245 @@ test('document.domain assignment', () => {
   `);
   expect(findings).toHaveType('XSS');
 });
+
+// ═══════════════════════════════════════════════════════════════
+// ║  CVE DIFF TESTS — vulnerable vs patched library versions     ║
+// ║  Downloads in test/cve/ (gitignored). Skipped if absent.     ║
+// ═══════════════════════════════════════════════════════════════
+
+console.log('\n--- CVE diff tests ---');
+
+// CVE-2019-11358: jQuery $.extend deep merge prototype pollution
+// Vulnerable: jQuery 3.3.1 (no __proto__ guard in extend)
+// Patched: jQuery 3.5.0 (adds "__proto__"!==t guard)
+const jquery331 = tryReadFile(resolve(cveDir, 'jquery-3.3.1.min.js'));
+const jquery350 = tryReadFile(resolve(cveDir, 'jquery-3.5.0.min.js'));
+
+if (jquery331 && jquery350) {
+  const ppBootstrap = `
+    var payload = JSON.parse(location.hash.slice(1));
+    jQuery.extend(true, {}, payload);
+  `;
+
+  test('CVE-2019-11358: jQuery 3.3.1 $.extend(true, {}, tainted) → PP detected', () => {
+    const findings = analyzeMultiple([
+      { source: jquery331, file: 'jquery.min.js' },
+      { source: ppBootstrap, file: 'app.js' },
+    ]);
+    expect(findings).toHaveType('Prototype Pollution');
+    // Pin: finding at a[t]=r inside $.extend deep copy loop
+    expect(findings).toHaveFingerprint('jquery.min.js:2:2087:a[taintedKey]');
+  });
+
+  test('CVE-2019-11358: jQuery 3.5.0 $.extend(true, {}, tainted) → PP patched (guard recognized)', () => {
+    const findings = analyzeMultiple([
+      { source: jquery350, file: 'jquery.min.js' },
+      { source: ppBootstrap, file: 'app.js' },
+    ]);
+    expect(findings).notToHaveType('Prototype Pollution');
+  });
+
+  // Verify the vulnerable version still produces 0 FP when used normally (no taint source)
+  test('CVE-2019-11358: jQuery 3.3.1 standalone → 0 false positives', () => {
+    const { findings } = analyze(jquery331, { file: 'jquery-3.3.1.min.js' });
+    expect(findings).toBeEmpty();
+  });
+
+  test('CVE-2019-11358: jQuery 3.5.0 standalone → 0 false positives', () => {
+    const { findings } = analyze(jquery350, { file: 'jquery-3.5.0.min.js' });
+    expect(findings).toBeEmpty();
+  });
+} else {
+  console.log('  SKIP  CVE-2019-11358 tests (download jquery-3.3.1.min.js and jquery-3.5.0.min.js to test/cve/)');
+}
+
+// CVE-2020-11022: jQuery .html() / .append() XSS via htmlPrefilter
+// Vulnerable: jQuery 3.4.1 (regex-based htmlPrefilter causes XSS with crafted self-closing tags)
+// Patched: jQuery 3.5.0 (removed htmlPrefilter regex, direct innerHTML)
+// Note: .html(tainted) is always a finding since it's a real DOM XSS sink regardless of jQuery internals.
+// The CVE is about ADDITIONAL exploitation vectors, but the base pattern is dangerous in all versions.
+const jquery341 = tryReadFile(resolve(cveDir, 'jquery-3.4.1.min.js'));
+
+if (jquery341 && jquery350) {
+  const xssBootstrap = `
+    var userInput = location.hash.slice(1);
+    jQuery("#output").html(userInput);
+  `;
+
+  test('CVE-2020-11022: jQuery 3.4.1 .html(tainted) → XSS detected', () => {
+    const findings = analyzeMultiple([
+      { source: jquery341, file: 'jquery.min.js' },
+      { source: xssBootstrap, file: 'app.js' },
+    ]);
+    expect(findings).toHaveType('XSS');
+  });
+
+  // jQuery 3.4.1 standalone: 0 FP
+  test('CVE-2020-11022: jQuery 3.4.1 standalone → 0 false positives', () => {
+    const { findings } = analyze(jquery341, { file: 'jquery-3.4.1.min.js' });
+    expect(findings).toBeEmpty();
+  });
+
+  test('CVE-2020-11022: jQuery 3.4.1 .append(tainted) → XSS detected', () => {
+    const findings = analyzeMultiple([
+      { source: jquery341, file: 'jquery.min.js' },
+      { source: `jQuery("#output").append(location.hash);`, file: 'app.js' },
+    ]);
+    expect(findings).toHaveType('XSS');
+  });
+} else {
+  console.log('  SKIP  CVE-2020-11022 tests (download jquery-3.4.1.min.js to test/cve/)');
+}
+
+// CVE-2019-10744: Lodash _.defaultsDeep prototype pollution via constructor.prototype
+// Vulnerable: Lodash 4.17.11
+// Patched: Lodash 4.17.12
+const lodash41711 = tryReadFile(resolve(cveDir, 'lodash-4.17.11.min.js'));
+const lodash41712 = tryReadFile(resolve(cveDir, 'lodash-4.17.12.min.js'));
+
+if (lodash41711 && lodash41712) {
+  // Lodash standalone FP check
+  test('CVE-2019-10744: Lodash 4.17.11 standalone → 0 false positives', () => {
+    const { findings } = analyze(lodash41711, { file: 'lodash-4.17.11.min.js' });
+    expect(findings).toBeEmpty();
+  });
+
+  test('CVE-2019-10744: Lodash 4.17.12 standalone → 0 false positives', () => {
+    const { findings } = analyze(lodash41712, { file: 'lodash-4.17.12.min.js' });
+    expect(findings).toBeEmpty();
+  });
+
+  // CVE diff tests: vulnerable version detects PP, patched version clean
+  const lodashMergeBootstrap = 'var input = JSON.parse(location.hash.slice(1)); _.merge({}, input);';
+
+  test('CVE-2019-10744: Lodash 4.17.11 + _.merge(attacker input) → Prototype Pollution detected', () => {
+    const findings = analyzeMultiple([
+      { source: lodash41711, file: 'lodash.js' },
+      { source: lodashMergeBootstrap, file: 'app.js' },
+    ]);
+    const pp = findings.filter(f => f.type === 'Prototype Pollution');
+    expect(pp).toHaveAtLeast(1);
+  });
+
+  test('CVE-2019-10744: Lodash 4.17.12 + _.merge(attacker input) → no findings (patched)', () => {
+    const findings = analyzeMultiple([
+      { source: lodash41712, file: 'lodash.js' },
+      { source: lodashMergeBootstrap, file: 'app.js' },
+    ]);
+    const pp = findings.filter(f => f.type === 'Prototype Pollution');
+    expect(pp).toBeEmpty();
+  });
+} else {
+  console.log('  SKIP  CVE-2019-10744 tests (download lodash-4.17.11.min.js and lodash-4.17.12.min.js to test/cve/)');
+}
+
+// CVE-2021-23358: Underscore _.template variable option → new Function() injection
+// Vulnerable: Underscore 1.12.0
+// Patched: Underscore 1.13.1
+const underscore1120 = tryReadFile(resolve(cveDir, 'underscore-1.12.0.min.js'));
+const underscore1131 = tryReadFile(resolve(cveDir, 'underscore-1.13.1.min.js'));
+
+if (underscore1120 && underscore1131) {
+  test('CVE-2021-23358: Underscore 1.12.0 standalone → 0 false positives', () => {
+    const { findings } = analyze(underscore1120, { file: 'underscore-1.12.0.min.js' });
+    expect(findings).toBeEmpty();
+  });
+
+  test('CVE-2021-23358: Underscore 1.13.1 standalone → 0 false positives', () => {
+    const { findings } = analyze(underscore1131, { file: 'underscore-1.13.1.min.js' });
+    expect(findings).toBeEmpty();
+  });
+} else {
+  console.log('  SKIP  CVE-2021-23358 tests (download underscore-1.12.0.min.js and underscore-1.13.1.min.js to test/cve/)');
+}
+
+// Synthetic CVE pattern tests — these don't need downloaded files
+
+test('CVE pattern: __proto__ guard in for-in suppresses PP', () => {
+  const { findings } = analyze(`
+    var source = JSON.parse(location.hash);
+    var target = {};
+    for (var key in source) {
+      if (key !== "__proto__") {
+        target[key] = source[key];
+      }
+    }
+  `);
+  expect(findings).notToHaveType('Prototype Pollution');
+});
+
+test('CVE pattern: unguarded for-in deep merge → PP detected', () => {
+  const { findings } = analyze(`
+    var source = JSON.parse(location.hash);
+    var target = {};
+    for (var key in source) {
+      target[key] = source[key];
+    }
+  `);
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+test('CVE pattern: minified && guard ("__proto__"!==t&&...)', () => {
+  const { findings } = analyze(`
+    var source = JSON.parse(location.hash);
+    var target = {};
+    for (var t in source) {
+      "__proto__" !== t && (target[t] = source[t]);
+    }
+  `);
+  expect(findings).notToHaveType('Prototype Pollution');
+});
+
+test('CVE pattern: constructor guard suppresses PP', () => {
+  const { findings } = analyze(`
+    var source = JSON.parse(location.hash);
+    var target = {};
+    for (var key in source) {
+      if (key === "constructor") continue;
+      if (key === "__proto__") continue;
+      target[key] = source[key];
+    }
+  `);
+  expect(findings).notToHaveType('Prototype Pollution');
+});
+
+test('CVE pattern: only constructor guard — still vulnerable via __proto__', () => {
+  const { findings } = analyze(`
+    var source = JSON.parse(location.hash);
+    var target = {};
+    for (var key in source) {
+      if (key === "constructor") continue;
+      target[key] = source[key];
+    }
+  `);
+  // Only guards constructor, not __proto__ — still vulnerable
+  expect(findings).toHaveType('Prototype Pollution');
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ║  PERFORMANCE TESTS — large bundles must complete in time     ║
+// ═══════════════════════════════════════════════════════════════
+
+console.log('\n--- Performance tests ---');
+
+const closureSrc = tryReadFile(resolve(bundlesDir, 'm=cdos,hsm,jsa,mb4ZUb,cEt90b,SNUn3,qddgKe,sTsDMc,dtl0hd,eHDfl,YV'));
+
+if (closureSrc) {
+  test('Google Closure bundle: 0 findings, under 60s', () => {
+    const t0 = Date.now();
+    const { findings } = analyze(closureSrc, { file: 'closure-bundle.js' });
+    const elapsed = Date.now() - t0;
+    console.log(`        Closure bundle: ${elapsed}ms, ${findings.length} findings`);
+    if (findings.length > 0) {
+      throw new Error(`Expected 0 findings from Closure bundle, got ${findings.length}: ${findings.map(f => f.type + ': ' + f.title).join('; ')}`);
+    }
+    if (elapsed > 60000) {
+      throw new Error(`Closure bundle took ${elapsed}ms (limit: 60000ms)`);
+    }
+  });
+} else {
+  console.log('  SKIP  Closure bundle perf test (no file in test/bundles/)');
+}
 
 // ═══════════════════════════════════════════════════════
 console.log(`\n${'='.repeat(50)}`);
