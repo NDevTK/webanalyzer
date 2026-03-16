@@ -70,19 +70,8 @@ async function handleScript(tabId, origin, pageUrl, script) {
       plugins: [
         'jsx',
         'typescript',
-        'dynamicImport',
-        'optionalChaining',
-        'nullishCoalescingOperator',
-        'classProperties',
-        'classPrivateProperties',
-        'classPrivateMethods',
         'decorators-legacy',
         'exportDefaultFrom',
-        'exportNamespaceFrom',
-        'objectRestSpread',
-        'asyncGenerators',
-        'optionalCatchBinding',
-        'topLevelAwait',
       ],
       errorRecovery: true,
       allowReturnOutsideFunction: true,
@@ -272,9 +261,7 @@ async function runCrossFileAnalysis(tabId) {
     try {
       ast = parse(mod.source, {
         sourceType: 'module',
-        plugins: ['jsx', 'typescript', 'dynamicImport', 'optionalChaining',
-          'nullishCoalescingOperator', 'classProperties', 'decorators-legacy',
-          'objectRestSpread', 'topLevelAwait'],
+        plugins: ['jsx', 'typescript', 'decorators-legacy', 'exportDefaultFrom'],
         errorRecovery: true,
       });
     } catch { continue; }
@@ -312,9 +299,7 @@ async function runCrossFileAnalysis(tabId) {
     try {
       ast = parse(script.source, {
         sourceType: 'script',
-        plugins: ['jsx', 'typescript', 'dynamicImport', 'optionalChaining',
-          'nullishCoalescingOperator', 'classProperties', 'decorators-legacy',
-          'objectRestSpread'],
+        plugins: ['jsx', 'typescript', 'decorators-legacy', 'exportDefaultFrom'],
         errorRecovery: true,
         allowReturnOutsideFunction: true,
       });

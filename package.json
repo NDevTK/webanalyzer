@@ -8,8 +8,8 @@
     "test": "node test/test.mjs"
   },
   "dependencies": {
-    "@babel/parser": "^7.26.0",
-    "@babel/traverse": "^7.26.0"
+    "@babel/parser": "^8.0.0-rc.2",
+    "@babel/traverse": "^8.0.0-rc.2"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"

@@ -8,11 +8,9 @@ import { buildScopeInfo } from '../src/worker/scope.js';
 import { extractGlobalDeclarations } from '../src/worker/module-graph.js';
 import { nodeToString } from '../src/worker/sources-sinks.js';
 
+// Babel 8: most syntax plugins are now built-in. Only non-default syntax needs explicit plugins.
 const BABEL_PLUGINS = [
-  'jsx', 'typescript', 'dynamicImport', 'optionalChaining',
-  'nullishCoalescingOperator', 'classProperties', 'decorators-legacy',
-  'objectRestSpread', 'topLevelAwait', 'classPrivateProperties',
-  'classPrivateMethods', 'asyncGenerators', 'optionalCatchBinding',
+  'jsx', 'typescript', 'decorators-legacy', 'exportDefaultFrom',
   ['optionalChainingAssign', { version: '2023-07' }],
 ];
 
