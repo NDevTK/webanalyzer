@@ -16445,12 +16445,12 @@
     "queueMicrotask",
     "structuredClone"
   ]);
-  function resolveCalleeIdentity(node, env, ctx, _depth) {
-    if (!node || (_depth || 0) > 6) {
-      if (globalThis._TAINT_DEBUG && node?.type === "ConditionalExpression") console.log(`[RCI] DEPTH LIMIT hit for ConditionalExpression depth=${_depth}`);
-      return null;
-    }
-    const depth = (_depth || 0) + 1;
+  function resolveCalleeIdentity(node, env, ctx, _visited) {
+    if (!node) return null;
+    if (!_visited) _visited = /* @__PURE__ */ new Set();
+    if (_visited.has(node)) return null;
+    _visited.add(node);
+    if (node.type === "ThisExpression") return "window";
     if (node.type === "Identifier") {
       const alias2 = env?.getAlias ? env.getAlias(node.name) : env?.aliases?.get(node.name);
       if (globalThis._TAINT_DEBUG && node.name === "$n") console.log(`[RCI-ID] $n alias=${alias2} depth=${depth}`);
@@ -16460,14 +16460,14 @@
       if (globalThis._TRACE_RESOLVE && (node.name === "Mn" || node.name === "Tn" || node.name === "$n" || node.name === "mn" || node.name === "Qu")) {
         console.log("[RESOLVE]", node.name, "init=", init?.type, "scopeInfo=", !!ctx?.scopeInfo);
       }
-      if (init) return resolveCalleeIdentity(init, env, ctx, depth);
+      if (init) return resolveCalleeIdentity(init, env, ctx, _visited);
       return null;
     }
     if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
       if (node.computed) return null;
       const propName = node.property?.name;
       if (!propName) return null;
-      const objIdentity = resolveCalleeIdentity(node.object, env, ctx, depth);
+      const objIdentity = resolveCalleeIdentity(node.object, env, ctx, _visited);
       if (objIdentity) {
         if (_GLOBAL_SCOPE_OBJECTS.has(objIdentity)) {
           if (_RUNTIME_GLOBALS.has(propName)) return propName;
@@ -16479,28 +16479,28 @@
     }
     if (node.type === "LogicalExpression" && node.operator === "||") {
       if (globalThis._TRACE_RESOLVE) console.log("[RCI-OR] depth=", depth, "left=", node.left.type, node.left.name || "", "right=", node.right.type);
-      const left = resolveCalleeIdentity(node.left, env, ctx, depth);
+      const left = resolveCalleeIdentity(node.left, env, ctx, _visited);
       if (left) return left;
-      return resolveCalleeIdentity(node.right, env, ctx, depth);
+      return resolveCalleeIdentity(node.right, env, ctx, _visited);
     }
     if (node.type === "LogicalExpression" && node.operator === "&&") {
       if (globalThis._TRACE_RESOLVE) console.log("[RCI-AND] depth=", depth, "right=", node.right.type, node.right.name || "");
-      return resolveCalleeIdentity(node.right, env, ctx, depth);
+      return resolveCalleeIdentity(node.right, env, ctx, _visited);
     }
     if (node.type === "ConditionalExpression") {
       const condBool = isConstantBool(node.test, ctx);
       if (globalThis._TAINT_DEBUG && (node.consequent?.name === "$n" || node.alternate?.name === "$n")) {
         console.log(`[RCI-COND] depth=${depth} condBool=${condBool} test=${node.test?.type}/${node.test?.operator || ""} cons=${node.consequent?.name || node.consequent?.type} alt=${node.alternate?.name || node.alternate?.type}`);
       }
-      if (condBool === true) return resolveCalleeIdentity(node.consequent, env, ctx, depth);
-      if (condBool === false) return resolveCalleeIdentity(node.alternate, env, ctx, depth);
-      return resolveCalleeIdentity(node.consequent, env, ctx, depth) || resolveCalleeIdentity(node.alternate, env, ctx, depth);
+      if (condBool === true) return resolveCalleeIdentity(node.consequent, env, ctx, _visited);
+      if (condBool === false) return resolveCalleeIdentity(node.alternate, env, ctx, _visited);
+      return resolveCalleeIdentity(node.consequent, env, ctx, _visited) || resolveCalleeIdentity(node.alternate, env, ctx, _visited);
     }
     if (node.type === "AssignmentExpression" && node.operator === "=") {
-      return resolveCalleeIdentity(node.right, env, ctx, depth);
+      return resolveCalleeIdentity(node.right, env, ctx, _visited);
     }
     if (node.type === "CallExpression" && node.callee?.type === "CallExpression") {
-      const innerCallee = resolveCalleeIdentity(node.callee.callee, env, ctx, depth);
+      const innerCallee = resolveCalleeIdentity(node.callee.callee, env, ctx, _visited);
       if (innerCallee === "Function" && node.callee.arguments?.length > 0) {
         const bodyArg = node.callee.arguments[node.callee.arguments.length - 1];
         if (isStringLiteral(bodyArg)) {
@@ -19387,14 +19387,14 @@
     if (callee.type === "Identifier" && env?.getAlias) {
       const alias2 = env.getAlias(callee.name);
       if (globalThis._TAINT_DEBUG && methodName === "defineProperty") {
-        let depth = 0;
+        let depth2 = 0;
         let cur = env;
         let chain2 = "";
-        while (cur && depth < 10) {
+        while (cur && depth2 < 10) {
           const a = cur.aliases?.get(callee.name);
-          chain2 += `[d${depth}:${a || "-"}] `;
+          chain2 += `[d${depth2}:${a || "-"}] `;
           cur = cur.parent;
-          depth++;
+          depth2++;
         }
         console.log(`[isCalleeMatch] callee=${callee.name} want=${objectName}.${methodName} alias=${alias2} chain=${chain2}`);
       }

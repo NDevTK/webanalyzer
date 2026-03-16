@@ -1500,12 +1500,17 @@ const _RUNTIME_GLOBALS = new Set([
 // Returns a canonical callee string (e.g., "Object", "Object.defineProperty") or null.
 // This traces through: Identifier → init expression → MemberExpression → object resolution
 // enabling interprocedural resolution of aliased builtins like Qu = mn.Object → "Object".
-function resolveCalleeIdentity(node, env, ctx, _depth) {
-  if (!node || (_depth || 0) > 6) {
-    if (globalThis._TAINT_DEBUG && node?.type === 'ConditionalExpression') console.log(`[RCI] DEPTH LIMIT hit for ConditionalExpression depth=${_depth}`);
-    return null;
-  }
-  const depth = (_depth || 0) + 1;
+function resolveCalleeIdentity(node, env, ctx, _visited) {
+  if (!node) return null;
+  // Cycle detection: track visited AST nodes to prevent infinite loops
+  // when alias chains form cycles (e.g., a = b, b = a).
+  if (!_visited) _visited = new Set();
+  if (_visited.has(node)) return null;
+  _visited.add(node);
+
+  // In sloppy mode (non-module scripts), top-level `this` IS the global object.
+  // UMD libraries use (function(root){...})(this) to pass the global context.
+  if (node.type === 'ThisExpression') return 'window';
 
   if (node.type === 'Identifier') {
     // Check alias first
@@ -1520,7 +1525,7 @@ function resolveCalleeIdentity(node, env, ctx, _depth) {
     if (globalThis._TRACE_RESOLVE && (node.name === 'Mn' || node.name === 'Tn' || node.name === '$n' || node.name === 'mn' || node.name === 'Qu')) {
       console.log('[RESOLVE]', node.name, 'init=', init?.type, 'scopeInfo=', !!ctx?.scopeInfo);
     }
-    if (init) return resolveCalleeIdentity(init, env, ctx, depth);
+    if (init) return resolveCalleeIdentity(init, env, ctx, _visited);
     return null;
   }
 
@@ -1529,7 +1534,7 @@ function resolveCalleeIdentity(node, env, ctx, _depth) {
     const propName = node.property?.name;
     if (!propName) return null;
     // Resolve the object to its identity
-    const objIdentity = resolveCalleeIdentity(node.object, env, ctx, depth);
+    const objIdentity = resolveCalleeIdentity(node.object, env, ctx, _visited);
     if (objIdentity) {
       // When the object is a global scope reference (window, self, globalThis, global),
       // accessing a property is the same as accessing the global directly.
@@ -1548,15 +1553,15 @@ function resolveCalleeIdentity(node, env, ctx, _depth) {
   // LogicalExpression ||: A || B — try resolving each branch
   if (node.type === 'LogicalExpression' && node.operator === '||') {
     if (globalThis._TRACE_RESOLVE) console.log('[RCI-OR] depth=', depth, 'left=', node.left.type, node.left.name||'', 'right=', node.right.type);
-    const left = resolveCalleeIdentity(node.left, env, ctx, depth);
+    const left = resolveCalleeIdentity(node.left, env, ctx, _visited);
     if (left) return left;
-    return resolveCalleeIdentity(node.right, env, ctx, depth);
+    return resolveCalleeIdentity(node.right, env, ctx, _visited);
   }
 
   // LogicalExpression &&: A && B — value is the RHS if LHS is truthy
   if (node.type === 'LogicalExpression' && node.operator === '&&') {
     if (globalThis._TRACE_RESOLVE) console.log('[RCI-AND] depth=', depth, 'right=', node.right.type, node.right.name||'');
-    return resolveCalleeIdentity(node.right, env, ctx, depth);
+    return resolveCalleeIdentity(node.right, env, ctx, _visited);
   }
 
   // ConditionalExpression: cond ? A : B — try to resolve condition, otherwise try both
@@ -1565,21 +1570,21 @@ function resolveCalleeIdentity(node, env, ctx, _depth) {
     if (globalThis._TAINT_DEBUG && (node.consequent?.name === '$n' || node.alternate?.name === '$n')) {
       console.log(`[RCI-COND] depth=${depth} condBool=${condBool} test=${node.test?.type}/${node.test?.operator||''} cons=${node.consequent?.name||node.consequent?.type} alt=${node.alternate?.name||node.alternate?.type}`);
     }
-    if (condBool === true) return resolveCalleeIdentity(node.consequent, env, ctx, depth);
-    if (condBool === false) return resolveCalleeIdentity(node.alternate, env, ctx, depth);
+    if (condBool === true) return resolveCalleeIdentity(node.consequent, env, ctx, _visited);
+    if (condBool === false) return resolveCalleeIdentity(node.alternate, env, ctx, _visited);
     // Unknown condition: try both, prefer consequent
-    return resolveCalleeIdentity(node.consequent, env, ctx, depth) ||
-           resolveCalleeIdentity(node.alternate, env, ctx, depth);
+    return resolveCalleeIdentity(node.consequent, env, ctx, _visited) ||
+           resolveCalleeIdentity(node.alternate, env, ctx, _visited);
   }
 
   // AssignmentExpression: a = expr — the value is the RHS
   if (node.type === 'AssignmentExpression' && node.operator === '=') {
-    return resolveCalleeIdentity(node.right, env, ctx, depth);
+    return resolveCalleeIdentity(node.right, env, ctx, _visited);
   }
 
   // CallExpression: Function("return this")() → global scope
   if (node.type === 'CallExpression' && node.callee?.type === 'CallExpression') {
-    const innerCallee = resolveCalleeIdentity(node.callee.callee, env, ctx, depth);
+    const innerCallee = resolveCalleeIdentity(node.callee.callee, env, ctx, _visited);
     if (innerCallee === 'Function' && node.callee.arguments?.length > 0) {
       const bodyArg = node.callee.arguments[node.callee.arguments.length - 1];
       if (isStringLiteral(bodyArg)) {

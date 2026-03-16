@@ -4,7 +4,9 @@
       "WebSearch",
       "WebFetch(domain:babel.dev)",
       "WebFetch(domain:babeljs.io)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:eslam.io)"
     ]
   }
 }
