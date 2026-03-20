@@ -22,7 +22,21 @@ export function buildScopeInfo(ast) {
     }
   }
 
+  let programScopeUid = null;
+  const programChildScopes = new Set();
+
   traverse(ast, {
+    // Capture the program scope UID and its direct child scopes
+    Program(path) {
+      programScopeUid = path.scope.uid;
+      // Collect scope UIDs of direct children of the program scope
+      // (class declarations, block scopes for let/const at top level)
+      for (const childPath of path.get('body')) {
+        if (childPath.scope && childPath.scope.uid !== programScopeUid) {
+          programChildScopes.add(childPath.scope.uid);
+        }
+      }
+    },
     // Capture all scope-creating nodes to register bindings
     Scope(path) {
       const scope = path.scope;
@@ -79,14 +93,28 @@ export function buildScopeInfo(ast) {
     },
   });
 
-  return new ScopeInfo(nodeBindingMap, bindingScopes, bindingNodes);
+  return new ScopeInfo(nodeBindingMap, bindingScopes, bindingNodes, programScopeUid, programChildScopes);
 }
 
 export class ScopeInfo {
-  constructor(nodeBindingMap, bindingScopes, bindingNodes) {
+  constructor(nodeBindingMap, bindingScopes, bindingNodes, programScopeUid, programChildScopes) {
     this.nodeBindingMap = nodeBindingMap;
     this.bindingScopes = bindingScopes;
     this.bindingNodes = bindingNodes;
+    this.programScopeUid = programScopeUid; // UID of the Program scope (outermost)
+    this._programChildScopes = programChildScopes || new Set();
+  }
+
+  // Check if a binding key belongs to the program (outermost) scope
+  // or a scope directly parented by it (e.g., class body scope for class declarations).
+  // Uses _programChildScopes populated during traversal.
+  isProgramScope(bindingKey) {
+    if (!bindingKey || this.programScopeUid === null) return false;
+    if (bindingKey.startsWith(`${this.programScopeUid}:`)) return true;
+    // Check if the binding's scope is a direct child of the program scope
+    const scopeUid = this.bindingScopes.get(bindingKey);
+    if (scopeUid === undefined) return false;
+    return this._programChildScopes?.has(scopeUid) || false;
   }
 
   // Resolve an Identifier AST node to its canonical binding key

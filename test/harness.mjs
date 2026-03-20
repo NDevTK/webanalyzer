@@ -5,7 +5,7 @@ import { parse } from '@babel/parser';
 import { buildCFG } from '../src/worker/cfg.js';
 import { analyzeCFG, TaintEnv, TaintSet, TaintLabel, generatePoC } from '../src/worker/taint.js';
 import { buildScopeInfo } from '../src/worker/scope.js';
-import { extractGlobalDeclarations } from '../src/worker/module-graph.js';
+import { extractGlobalDeclarations, propagateFuncMap } from '../src/worker/module-graph.js';
 import { nodeToString } from '../src/worker/sources-sinks.js';
 
 // Babel 8: most syntax plugins are now built-in. Only non-default syntax needs explicit plugins.
@@ -86,9 +86,8 @@ export function analyzeMultiple(scripts, { domCatalog = null } = {}) {
     const findings = analyzeCFG(cfg, env, file || 'test.js', funcMap, globalEnv, scopeInfo, false, domCatalog);
     allFindings.push(...findings);
 
-    globalEnv.replaceFrom(env);
-    // Propagate newly discovered functions (e.g. from factory calls) back to globalFuncMap
-    for (const [k, v] of funcMap) globalFuncMap.set(k, v);
+    globalEnv.replaceFromCrossFile(env);
+    propagateFuncMap(funcMap, env, globalFuncMap);
   }
 
   // Generate PoCs for all findings (same as single-file analyze)

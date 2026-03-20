@@ -1,0 +1,2002 @@
+{
+  "elements": {
+    "script": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerText": {
+        "type": "script",
+        "idlType": "([LegacyNullToEmptyString] DOMString or TrustedScript)"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "src": {
+        "type": "script-url",
+        "idlType": "(TrustedScriptURL or USVString)"
+      },
+      "text": {
+        "type": "script",
+        "idlType": "(TrustedScript or DOMString)"
+      }
+    },
+    "style": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerText": {
+        "type": "script",
+        "idlType": "([LegacyNullToEmptyString] DOMString or TrustedScript)"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "canvas": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "fencedframe": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "button": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "datalist": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "fieldset": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "form": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "input": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "label": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "legend": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "option": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "optgroup": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "output": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "selectedcontent": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "select": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "textarea": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "a": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "href": {
+        "type": "navigation",
+        "idlType": "USVString",
+        "source": "cpp-taint"
+      }
+    },
+    "area": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "base": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "body": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "br": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "credential": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "data": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "details": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "dialog": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "dir": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "div": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "dl": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "embed": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "src": {
+        "type": "script-url",
+        "idlType": "(TrustedScriptURL or USVString)"
+      }
+    },
+    "font": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "frame": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "src": {
+        "type": "navigation",
+        "idlType": "USVString"
+      },
+      "longDesc": {
+        "type": "navigation",
+        "idlType": "USVString"
+      }
+    },
+    "frameset": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "geolocation": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "h1": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "head": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "hr": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "html": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "iframe": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "src": {
+        "type": "navigation",
+        "idlType": "USVString"
+      },
+      "srcdoc": {
+        "type": "html",
+        "idlType": "(DOMString or TrustedHTML)"
+      },
+      "longDesc": {
+        "type": "navigation",
+        "idlType": "USVString"
+      }
+    },
+    "img": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "install": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "link": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "li": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "login": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "map": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "marquee": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "menubar": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "menu": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "menuitem": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "menulist": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "meta": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "meter": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "ins": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "object": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "data": {
+        "type": "script-url",
+        "idlType": "(TrustedScriptURL or USVString)"
+      },
+      "codeBase": {
+        "type": "script-url",
+        "idlType": "(TrustedScriptURL or USVString)"
+      }
+    },
+    "ol": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "p": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "param": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "picture": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "pre": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "progress": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "blockquote": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "slot": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "source": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "span": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "caption": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "td": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "col": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "table": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "tr": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "tbody": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "template": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "time": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "title": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "ul": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "unknown": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "usermedia": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "audio": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "video": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "track": {
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    }
+  },
+  "inherited": {
+    "innerHTML": {
+      "type": "html",
+      "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+    },
+    "outerHTML": {
+      "type": "html",
+      "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+    }
+  },
+  "apis": {
+    "Attr": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "CDATASection": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "CharacterData": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "Comment": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "ProcessingInstruction": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "Text": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "XMLDocument": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "HTMLDocument": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "HTMLMediaElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "innerText": {
+        "type": "script",
+        "idlType": "([LegacyNullToEmptyString] DOMString or TrustedScript)"
+      }
+    },
+    "MathMLElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGAnimatedString": {
+      "baseVal": {
+        "type": "script-url",
+        "idlType": "(DOMString or TrustedScriptURL)"
+      }
+    },
+    "SVGAnimateElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGAnimateMotionElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGAnimateTransformElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGAnimationElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGAElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGCircleElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGClipPathElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGComponentTransferFunctionElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGDefsElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGDescElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGEllipseElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEBlendElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEColorMatrixElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEComponentTransferElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFECompositeElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEConvolveMatrixElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEDiffuseLightingElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEDisplacementMapElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEDistantLightElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEDropShadowElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEFloodElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEFuncAElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEFuncBElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEFuncGElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEFuncRElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEGaussianBlurElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEImageElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEMergeElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEMergeNodeElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEMorphologyElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEOffsetElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFEPointLightElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFESpecularLightingElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFESpotLightElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFETileElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFETurbulenceElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGFilterElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGForeignObjectElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGGeometryElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGGradientElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGGraphicsElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGGElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGImageElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGLinearGradientElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGLineElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGMarkerElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGMaskElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGMetadataElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGMPathElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGPathElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGPatternElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGPolygonElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGPolylineElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGRadialGradientElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGRectElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGScriptElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGSetElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGStopElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGStyleElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGSVGElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGSwitchElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGSymbolElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGTextContentElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGTextElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGTextPathElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGTextPositioningElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGTitleElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGTSpanElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGUseElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "SVGViewElement": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      },
+      "outerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    },
+    "TrustedHTML": {
+      "fromLiteral": {
+        "type": "html",
+        "idlType": "TrustedHTML"
+      }
+    },
+    "TrustedScript": {
+      "fromLiteral": {
+        "type": "script",
+        "idlType": "TrustedScript"
+      }
+    },
+    "TrustedScriptURL": {
+      "fromLiteral": {
+        "type": "script-url",
+        "idlType": "TrustedScriptURL"
+      }
+    },
+    "TrustedTypePolicy": {
+      "createHTML": {
+        "type": "html",
+        "idlType": "TrustedHTML"
+      },
+      "createScript": {
+        "type": "script",
+        "idlType": "TrustedScript"
+      },
+      "createScriptURL": {
+        "type": "script-url",
+        "idlType": "TrustedScriptURL"
+      }
+    },
+    "Document": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "DocumentFragment": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "DocumentType": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      }
+    },
+    "ShadowRoot": {
+      "textContent": {
+        "type": "script",
+        "idlType": "(DOMString or TrustedScript)?"
+      },
+      "innerHTML": {
+        "type": "html",
+        "idlType": "(TrustedHTML or [LegacyNullToEmptyString] DOMString)"
+      }
+    }
+  },
+  "meta": {
+    "generated": "2026-03-17T22:12:10.281Z",
+    "sources": [
+      "chromium-idl",
+      "chromium-cpp-taint"
+    ],
+    "idlInterfaces": 1215,
+    "taintPaths": 3
+  }
+}

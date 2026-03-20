@@ -1,3 +1,4 @@
+'use strict';
 /* popup.js — Extension side panel UI.
    Shows enable/disable toggle and all findings across all tabs.
    Reads findings directly from IndexedDB (shared with offscreen worker).

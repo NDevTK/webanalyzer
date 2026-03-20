@@ -6,7 +6,8 @@
       "WebFetch(domain:babeljs.io)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:eslam.io)"
+      "WebFetch(domain:eslam.io)",
+      "Bash(node --input-type=module -e \":*)"
     ]
   }
 }

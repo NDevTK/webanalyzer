@@ -163,14 +163,14 @@ export function resolveImportTaint(pageCtx, importingUrl, imports) {
 export function extractGlobalDeclarations(ast, funcMap, file) {
   for (const node of ast.program.body) {
     if (node.type === 'FunctionDeclaration' && node.id) {
-      funcMap.set(node.id.name, node);
+      funcMap.set(`global:${node.id.name}`, node);
     }
     // Variable declarations at top level
     if (node.type === 'VariableDeclaration') {
       for (const decl of node.declarations) {
         if (decl.id.type === 'Identifier' && decl.init &&
             (decl.init.type === 'FunctionExpression' || decl.init.type === 'ArrowFunctionExpression')) {
-          funcMap.set(decl.id.name, decl.init);
+          funcMap.set(`global:${decl.id.name}`, decl.init);
         }
       }
     }
@@ -183,12 +183,12 @@ export function extractGlobalDeclarations(ast, funcMap, file) {
           left.object.type === 'Identifier' && left.object.name === 'window' &&
           left.property.type === 'Identifier' &&
           (right.type === 'FunctionExpression' || right.type === 'ArrowFunctionExpression')) {
-        funcMap.set(left.property.name, right);
+        funcMap.set(`global:${left.property.name}`, right);
       }
     }
     // Class declarations: extract methods into funcMap
     if (node.type === 'ClassDeclaration' && node.id) {
-      extractClassMethods(node, node.id.name, funcMap);
+      extractClassMethods(node, `global:${node.id.name}`, funcMap);
     }
   }
 }
@@ -202,15 +202,61 @@ function extractClassMethods(classNode, className, funcMap) {
     const name = member.key?.name || member.key?.value;
     if (!name) continue;
     if (member.static) {
-      // Static: Foo.bar()
       funcMap.set(`${className}.${name}`, member);
-      funcMap.set(name, member);
     } else if (name === 'constructor') {
-      // Constructor: new Foo()
       funcMap.set(className, member);
     } else {
-      // Instance method: registered by plain name for method-call resolution
-      funcMap.set(name, member);
+      // Instance method: className#method for scope-qualified lookup
+      funcMap.set(`${className}#${name}`, member);
+    }
+  }
+}
+
+// ── Cross-file funcMap propagation ──
+// After analyzing a script, propagate its funcMap entries back to the shared
+// globalFuncMap. Scope-qualified entries whose base variable is a known global
+// (e.g., `3:jQuery.extend` where `jQuery` is global) are promoted to `global:`
+// for cross-file visibility. Existing `global:` entries are NOT overwritten —
+// they were set authoritatively during analysis (e.g., `window.$ = ce`), and
+// scope-qualified entries may refer to local variables that shadow the global.
+export function propagateFuncMap(funcMap, env, globalFuncMap) {
+  // Collect base names that have global: declarations
+  const globalFuncBases = new Set();
+  for (const [k] of funcMap) {
+    if (k.startsWith('global:')) {
+      const bare = k.slice(7);
+      if (bare && !bare.includes('.') && !bare.includes('#')) globalFuncBases.add(bare);
+    }
+  }
+  // Also check env for global: base entries (var declarations at program scope)
+  if (env) {
+    for (const [k] of env.entries()) {
+      if (k.startsWith('global:')) {
+        const bare = k.slice(7);
+        if (bare && !bare.includes('.') && !bare.includes('#')) globalFuncBases.add(bare);
+      }
+    }
+  }
+  // Copy all entries and promote scope-qualified ones whose base is global
+  for (const [k, v] of funcMap) {
+    globalFuncMap.set(k, v);
+    if (k.includes(':') && !k.startsWith('global:') && !k.startsWith('this.')) {
+      const colonIdx = k.indexOf(':');
+      const bare = k.slice(colonIdx + 1);
+      const dotIdx = bare.indexOf('.');
+      const hashIdx = bare.indexOf('#');
+      const sepIdx = dotIdx === -1 ? hashIdx : (hashIdx === -1 ? dotIdx : Math.min(dotIdx, hashIdx));
+      const baseName = sepIdx === -1 ? bare : bare.slice(0, sepIdx);
+      if (globalFuncBases.has(baseName)) {
+        const globalKey = `global:${bare}`;
+        // Don't override existing global: entries — those were set authoritatively
+        // during analysis (e.g., window.$ = ce). Scope-qualified entries like 5:$
+        // may refer to local variables (e.g., jQuery's internal acceptData function)
+        // that shadow the global.
+        if (!globalFuncMap.has(globalKey)) {
+          globalFuncMap.set(globalKey, v);
+        }
+      }
     }
   }
 }

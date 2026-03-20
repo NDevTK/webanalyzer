@@ -1,3 +1,4 @@
+'use strict';
 /* background.js — MV3 service worker
    Lightweight coordinator: auto-attaches chrome.debugger on tab navigation,
    collects scripts via CDP, relays to offscreen worker, shows notifications.

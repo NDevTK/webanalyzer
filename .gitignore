@@ -1,2 +1,8 @@
 test/bundles/
 test/cve/
+chromium/
+chromium-src/
+codeql/
+chrome-codeql-db/
+chrome-codeql.zip
+node_modules/

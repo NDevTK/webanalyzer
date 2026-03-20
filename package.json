@@ -3,15 +3,22 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "sinks:idl": "node scripts/parse-chromium-idl.mjs",
+    "sinks:taint": "node scripts/chromium-taint.mjs",
+    "sinks:combine": "node scripts/build-sink-data.mjs",
+    "sinks:generate": "node scripts/generate-sink-module.mjs",
+    "sinks": "npm run sinks:idl && npm run sinks:taint && npm run sinks:combine && npm run sinks:generate",
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "test": "node test/test.mjs"
+    "test": "node test/run-chrome.mjs"
   },
   "dependencies": {
     "@babel/parser": "^8.0.0-rc.2",
     "@babel/traverse": "^8.0.0-rc.2"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
-  }
+    "esbuild": "^0.25.0",
+    "puppeteer": "^24.39.1"
+  },
+  "type": "module"
 }

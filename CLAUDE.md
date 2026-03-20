@@ -1,9 +1,8 @@
-Fix the engine instead of dumbing down tests
-Focus on the proper fix
-Make architectural changes when the current system is wrong
-Never hard code patterns do everything at a low AST level
-Never take shortcuts
-Do complex interproductual analysis thats the whole point of the project
-We do extremely deep interprocedural tracing
-Do proper conditional taint analysis
-if we can't prove through actual data flow that taint reaches a sink, we don't report it.
+Chrome headless POC or GTFO
+Research CVEs to understand what code path has the issue before adding tests
+Focus on the the proper low-level AST data-flow fix with conditional taint analysis instead of just the simplest correct fix
+Never take shortcuts, hard code patterns or use workarounds/hacks
+Everything must be fully scope-qualified and type tracked
+Never make assumptions everything is deterministic via native javascript calls or runtime variables emulation
+Don't be lazy always focus on making it better regardless of complexity
+Depth limits are not allowed

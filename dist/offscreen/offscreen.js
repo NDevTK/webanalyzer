@@ -1,3 +1,4 @@
+'use strict';
 /* offscreen.js — Relays messages between SW ↔ Worker.
    The worker runs Babel AST taint analysis (heavy CPU, off main thread).
    This document writes findings to IndexedDB for persistence

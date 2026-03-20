@@ -8,6 +8,7 @@ import { analyzeCFG, TaintEnv, generatePoC } from './taint.js';
 import {
   ModuleGraph, extractImports, extractExports,
   extractGlobalDeclarations, resolveImportTaint, checkPostMessageHandler,
+  propagateFuncMap,
 } from './module-graph.js';
 import { buildScopeInfo } from './scope.js';
 const moduleGraph = new ModuleGraph();
@@ -181,10 +182,6 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
   const funcMap = new Map(pageCtx.globalFuncMap);
   extractGlobalDeclarations(ast, funcMap, file);
 
-  for (const [name, node] of funcMap) {
-    pageCtx.globalFuncMap.set(name, node);
-  }
-
   // 3. For modules: extract imports/exports
   let importEnv = new TaintEnv();
   if (isModule) {
@@ -206,13 +203,12 @@ function analyzeAST(ast, file, isModule, pageCtx, isWorker) {
 
   // 7. For non-module scripts, propagate final env back to global
   if (!isModule) {
-    pageCtx.globalEnv.replaceFrom(env);
+    pageCtx.globalEnv.replaceFromCrossFile(env);
   }
 
   // 9b. Propagate newly discovered functions (e.g. from factory calls) back to globalFuncMap
-  for (const [name, node] of funcMap) {
-    pageCtx.globalFuncMap.set(name, node);
-  }
+  // Uses shared propagation logic with scope→global promotion and shadowing protection
+  propagateFuncMap(funcMap, env, pageCtx.globalFuncMap);
 
   // 10. For modules, store export taint
   if (isModule) {
@@ -318,7 +314,8 @@ async function runCrossFileAnalysis(tabId) {
     for (const f of scriptFindings) f.pageUrl = page.pageUrl;
     findings.push(...scriptFindings);
 
-    globalEnv.replaceFrom(env);
+    globalEnv.replaceFromCrossFile(env);
+    propagateFuncMap(funcMap, env, page.globalFuncMap);
   }
 
   if (findings.length > 0) {

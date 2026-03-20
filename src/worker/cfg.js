@@ -169,7 +169,20 @@ function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
             const bodyBlock = cfg.createBlock();
             const exitBlock = cfg.createBlock();
             f.cur.connect(headerBlock);
-            headerBlock.addNode({ type: '_Test', test: stmt.test, loc: stmt.loc });
+            const whileTest = { type: '_Test', test: stmt.test, loc: stmt.loc };
+            // Detect counter variable from prefix-increment test: while(++i < N)
+            // The counter init must be found from preceding code (not available in while syntax)
+            if (stmt.test.type === 'BinaryExpression' && (stmt.test.operator === '<' || stmt.test.operator === '<=')) {
+              const lhs = stmt.test.left;
+              if (lhs.type === 'UpdateExpression' && lhs.operator === '++' && lhs.prefix &&
+                  lhs.argument?.type === 'Identifier') {
+                whileTest._forLoopCounter = lhs.argument.name;
+                whileTest._forLoopCounterNode = lhs.argument;
+                // No init available from while syntax — the taint engine resolves from env
+                whileTest._forLoopInit = null;
+              }
+            }
+            headerBlock.addNode(whileTest);
             headerBlock.connect(bodyBlock);
             headerBlock.connect(exitBlock);
             ctx.pushLoop(exitBlock, headerBlock, null);
@@ -201,7 +214,53 @@ function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
             const exitBlock = cfg.createBlock();
             f.cur.connect(headerBlock);
             if (stmt.test) {
-              headerBlock.addNode({ type: '_Test', test: stmt.test, loc: stmt.loc });
+              // Annotate the _Test node with for-loop metadata for bounded loop unrolling.
+              // The taint engine uses this to determine loop bounds and counter binding.
+              const testNode = { type: '_Test', test: stmt.test, loc: stmt.loc };
+              // Extract loop counter from the test's prefix-increment variable: ++i < N
+              // Then find its init from the for-loop's init declaration or fall back to scope
+              {
+                let counterName = null, counterNode = null;
+                if (stmt.test?.type === 'BinaryExpression' &&
+                    (stmt.test.operator === '<' || stmt.test.operator === '<=')) {
+                  const lhs = stmt.test.left;
+                  if (lhs?.type === 'UpdateExpression' && lhs.operator === '++' && lhs.prefix &&
+                      lhs.argument?.type === 'Identifier') {
+                    counterName = lhs.argument.name;
+                    counterNode = lhs.argument;
+                  }
+                }
+                // Also detect counter from update expression: for(; s < u; s++)
+                // where test is `s < u` (Identifier) and update is `s++`
+                if (!counterName && stmt.test?.type === 'BinaryExpression' &&
+                    (stmt.test.operator === '<' || stmt.test.operator === '<=') &&
+                    stmt.test.left?.type === 'Identifier' &&
+                    stmt.update?.type === 'UpdateExpression' && stmt.update.operator === '++' &&
+                    stmt.update.argument?.type === 'Identifier' &&
+                    stmt.update.argument.name === stmt.test.left.name) {
+                  counterName = stmt.test.left.name;
+                  counterNode = stmt.test.left;
+                }
+                if (counterName) {
+                  testNode._forLoopCounter = counterName;
+                  testNode._forLoopCounterNode = counterNode;
+                  // Find the counter's init from the for-loop init declaration
+                  testNode._forLoopInit = null;
+                  if (stmt.init?.type === 'VariableDeclaration') {
+                    for (const decl of stmt.init.declarations) {
+                      if (decl.id?.type === 'Identifier' && decl.id.name === counterName) {
+                        testNode._forLoopInit = decl.init;
+                        testNode._forLoopCounterNode = decl.id;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+              if (stmt.update) {
+                testNode._forLoopUpdate = stmt.update;
+              }
+              headerBlock.addNode(testNode);
               headerBlock.connect(bodyBlock);
               headerBlock.connect(exitBlock);
             } else {
@@ -219,7 +278,7 @@ function buildStatements(rootStmts, rootCurrent, cfg, ctx) {
             const exitBlock = cfg.createBlock();
             f.cur.addNode(stmt.right);
             f.cur.connect(headerBlock);
-            headerBlock.addNode({ type: '_ForInOf', left: stmt.left, right: stmt.right, loc: stmt.loc, _isForIn: stmt.type === 'ForInStatement' });
+            headerBlock.addNode({ type: '_ForInOf', left: stmt.left, right: stmt.right, loc: stmt.loc, _isForIn: stmt.type === 'ForInStatement', _body: stmt.body });
             headerBlock.connect(bodyBlock);
             headerBlock.connect(exitBlock);
             ctx.pushLoop(exitBlock, headerBlock, null);

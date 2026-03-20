@@ -107,15 +107,15 @@ export const ASSIGNMENT_SINKS = {
 // Call sinks: function(taintedArg)
 // taintedArgs: which argument indices must be tainted to trigger
 export const CALL_SINKS = {
-  'eval': { type: 'XSS', taintedArgs: [0] },
-  'Function': { type: 'XSS', taintedArgs: [0] }, // new Function(code)
-  'setTimeout': { type: 'XSS', taintedArgs: [0], stringOnly: true },
-  'setInterval': { type: 'XSS', taintedArgs: [0], stringOnly: true },
-  'document.write': { type: 'XSS', taintedArgs: [0] },
-  'document.writeln': { type: 'XSS', taintedArgs: [0] },
-  'Element.prototype.insertAdjacentHTML': { type: 'XSS', taintedArgs: [1] },
-  'DOMParser.prototype.parseFromString': { type: 'XSS', taintedArgs: [0] },
-  'Range.prototype.createContextualFragment': { type: 'XSS', taintedArgs: [0] },
+  'eval': { type: 'XSS', taintedArgs: [0], sinkClass: 'TrustedScript' },
+  'Function': { type: 'XSS', taintedArgs: [0], sinkClass: 'TrustedScript' },
+  'setTimeout': { type: 'XSS', taintedArgs: [0], stringOnly: true, sinkClass: 'TrustedScript' },
+  'setInterval': { type: 'XSS', taintedArgs: [0], stringOnly: true, sinkClass: 'TrustedScript' },
+  'document.write': { type: 'XSS', taintedArgs: [0], sinkClass: 'TrustedHTML' },
+  'document.writeln': { type: 'XSS', taintedArgs: [0], sinkClass: 'TrustedHTML' },
+  'Element.prototype.insertAdjacentHTML': { type: 'XSS', taintedArgs: [1], sinkClass: 'TrustedHTML' },
+  'DOMParser.prototype.parseFromString': { type: 'XSS', taintedArgs: [0], sinkClass: 'TrustedHTML' },
+  'Range.prototype.createContextualFragment': { type: 'XSS', taintedArgs: [0], sinkClass: 'TrustedHTML' },
   // jQuery sinks removed — detected via interprocedural tracing through actual library code
   // Navigation sinks: XSS if javascript: possible, Open Redirect if scheme-checked
   'location.assign': { type: 'XSS', taintedArgs: [0], navigation: true },
@@ -215,25 +215,39 @@ const GLOBAL_ONLY_SINKS = new Set(['setTimeout', 'setInterval', 'eval', 'Functio
 // Methods that only match on location objects (not String.replace, Object.assign, etc.)
 const LOCATION_ONLY_SINKS = new Set(['replace', 'assign']);
 
+// Strip scope prefix from a key: "3:eval" → "eval", "global:document.write" → "document.write"
+function _stripScope(key) {
+  if (!key) return key;
+  const colon = key.indexOf(':');
+  if (colon === -1) return key;
+  const prefix = key.slice(0, colon);
+  // Scope prefixes are numeric UIDs or "global"
+  if (prefix === 'global' || /^\d+$/.test(prefix)) return key.slice(colon + 1);
+  // Not a scope prefix (e.g., "getter:obj.prop") — return as-is
+  return key;
+}
+
 export function checkCallSink(calleeStr, methodName) {
+  // Strip scope qualification for sink matching
+  const bareCallee = _stripScope(calleeStr);
   // Direct match
-  if (CALL_SINKS[calleeStr]) return CALL_SINKS[calleeStr];
+  if (CALL_SINKS[bareCallee]) return CALL_SINKS[bareCallee];
   // Method name match via pre-computed map
   const entries = CALL_SINKS_BY_METHOD.get(methodName);
   if (!entries) return null;
   for (const { info } of entries) {
     // For global-only sinks, only match if called as global or on window
     if (GLOBAL_ONLY_SINKS.has(methodName)) {
-      if (!calleeStr || calleeStr === methodName ||
-          calleeStr === `window.${methodName}` || calleeStr === `globalThis.${methodName}` ||
-          calleeStr === `self.${methodName}` || calleeStr === `this.${methodName}`) {
+      if (!bareCallee || bareCallee === methodName ||
+          bareCallee === `window.${methodName}` || bareCallee === `globalThis.${methodName}` ||
+          bareCallee === `self.${methodName}` || bareCallee === `this.${methodName}`) {
         return info;
       }
       continue;
     }
     // For location-only sinks, only match on location-like objects
     if (LOCATION_ONLY_SINKS.has(methodName)) {
-      if (calleeStr && (calleeStr.includes('location') || calleeStr.includes('Location'))) {
+      if (bareCallee && (bareCallee.includes('location') || bareCallee.includes('Location'))) {
         return info;
       }
       continue;
@@ -252,7 +266,8 @@ export function checkAssignmentSink(leftStr, propName) {
 
 // Check if callee is a sanitizer
 export function isSanitizer(calleeStr, methodName) {
-  if (SANITIZERS.has(calleeStr)) return true;
+  const bareCallee = _stripScope(calleeStr);
+  if (SANITIZERS.has(bareCallee)) return true;
   if (SANITIZERS.has(methodName)) return true;
   return false;
 }
